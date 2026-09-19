@@ -1,4 +1,4 @@
-package com.eventbreaker.consumer;
+package consumers;
 
 import com.eventbreaker.consumer.annotation.EventBreakerConsumer;
 import com.eventbreaker.event.OrderCreated;

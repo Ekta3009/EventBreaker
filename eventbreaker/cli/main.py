@@ -9,9 +9,11 @@ from rich import box
 
 from eventbreaker.analyzer.bridge import analyze
 from eventbreaker.agent.nemotron import identify_risks
+from eventbreaker.diagnosis.analyzer import diagnose
+from eventbreaker.models.observation import ObservationResult, ReliabilityFinding
+from eventbreaker.report import reporter
 from eventbreaker.scenarios.models import ChaosScenario, ScenarioType
 from eventbreaker.scenarios.executor import ScenarioExecutor
-from eventbreaker.models.observation import ObservationResult
 
 app = typer.Typer(
     name="eventbreaker",
@@ -140,9 +142,11 @@ def analyze_consumer(
         )
         raise typer.Exit(0)
 
+    in_sandbox = bool(os.environ.get("NEBIUS_PROJECT_ID"))
+    exec_mode = "[cyan]Nebius Sandbox[/cyan]" if in_sandbox else "[yellow]local JVM[/yellow]"
     with console.status(
         f"[bold green]Executing scenario: "
-        f"{executable.scenarioType.value}..."
+        f"{executable.scenarioType.value} ({exec_mode})..."
     ):
         try:
             result = ScenarioExecutor().execute(executable, analysis, file)
@@ -159,30 +163,47 @@ def analyze_consumer(
     )
     _print_observations(result)
 
-    if result.status == "REPRODUCED" and result.observations:
-        doubled = [o for o in result.observations if o.callCount > 1]
-        if doubled:
-            lines = "\n".join(
-                f"  [red]•[/red] [cyan]{o.target}[/cyan] "
-                f"called [bold red]{o.callCount}x[/bold red]"
-                for o in doubled
-            )
-            console.print(Panel(
-                f"[bold yellow]Scenario REPRODUCED:[/bold yellow] "
-                f"[cyan]{executable.scenarioType.value}[/cyan]\n\n"
-                + lines
-                + "\n\n[dim]Diagnosis coming in next step — "
-                "Nemotron will explain the risk and suggest a fix.[/dim]",
-                title="[bold]Reliability Finding[/bold]",
-                border_style="yellow",
-            ))
+    if result.status != "REPRODUCED" or not result.observations:
+        raise typer.Exit(0)
+
+    # ── Step 4: Nemotron diagnosis ────────────────────────────────────────────
+    with console.status("[bold green]Asking Nemotron to diagnose the finding..."):
+        try:
+            finding = diagnose(analysis, executable, result, source_code)
+        except EnvironmentError as e:
+            console.print(f"[bold red]Config error:[/bold red] {e}")
+            raise typer.Exit(1)
+        except ValueError as e:
+            console.print(f"[bold red]Diagnosis error:[/bold red] {e}")
+            raise typer.Exit(1)
+        except Exception as e:
+            console.print(f"[bold red]Unexpected error:[/bold red] {e}")
+            raise typer.Exit(1)
+
+    console.print("[bold green]✓ Diagnosis complete[/bold green]\n")
+    _print_finding(finding)
+
+    # ── Step 5: Save Markdown report ──────────────────────────────────────────
+    report_md = reporter.generate(
+        consumer_file=file,
+        analysis=analysis,
+        scenarios=scenarios,
+        result=result,
+        finding=finding,
+        sandbox=in_sandbox,
+    )
+    report_path = reporter.save(report_md)
+    console.print(
+        f"\n[bold green]✓ Report saved →[/bold green] "
+        f"[yellow]{report_path}[/yellow]\n"
+    )
 
 
 def _print_observations(result: ObservationResult) -> None:
     if result.executionError:
         console.print(
             Panel(
-                f"[red]{result.executionError}[/red]",
+                result.executionError,
                 title="[bold red]Execution Error[/bold red]",
                 border_style="red",
             )
@@ -204,6 +225,25 @@ def _print_observations(result: ObservationResult) -> None:
         obs_table,
         title=f"[bold]Observations — {result.scenario}[/bold]",
         border_style="yellow",
+    ))
+
+
+def _print_finding(finding: ReliabilityFinding) -> None:
+    _SEVERITY_COLOURS = {"HIGH": "red", "MEDIUM": "yellow", "LOW": "green"}
+    colour = _SEVERITY_COLOURS.get(finding.severity, "white")
+
+    body = (
+        f"[bold]Severity:[/bold]  [{colour}]{finding.severity}[/{colour}]\n"
+        f"[bold]Observed:[/bold]  {finding.summary}\n\n"
+        f"[bold]Why it matters:[/bold]\n{finding.explanation}\n\n"
+        f"[bold]Affected:[/bold]  [cyan]{finding.affectedMethod}[/cyan]\n\n"
+        f"[bold]Suggested fix:[/bold]\n[green]{finding.suggestedFix}[/green]"
+    )
+
+    console.print(Panel(
+        body,
+        title=f"[bold]Reliability Finding — {finding.scenario}[/bold]",
+        border_style=colour,
     ))
 
 

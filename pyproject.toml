@@ -12,6 +12,7 @@ dependencies = [
     "openai>=1.35",
     "rich>=13.7",
     "contree-sdk>=0.1",
+    "python-dotenv>=1.0",
 ]
 
 [project.scripts]

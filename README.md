@@ -2,7 +2,7 @@
 
 **Break your event consumers before production does.**
 
-EventBreaker is an AI-powered reliability analysis tool for Java event-driven applications. Point it at any `@EventBreakerConsumer`-annotated Java class and it will automatically identify reliability risks, simulate fault scenarios with real code execution, and generate a fix recommendation — all in a single command.
+EventBreaker is an AI-powered reliability analysis and fault-injection tool for Java event-driven applications. Point it at any `@EventBreakerConsumer`-annotated Java class and it automatically identifies reliability risks, proves them with real JVM execution, and generates grounded fix recommendations — all in a single command.
 
 Built for the **Nebius × NVIDIA Global AI Hackathon 2026**.
 
@@ -10,13 +10,13 @@ Built for the **Nebius × NVIDIA Global AI Hackathon 2026**.
 
 ## The Problem
 
-Event-driven systems using Kafka, SQS, or similar brokers deliver events **at least once**. That guarantee — which sounds safe — is one of the most common sources of bugs in production:
+Event-driven systems using Kafka, SQS, RabbitMQ, or similar brokers deliver events **at least once**. That guarantee is one of the most common sources of silent production bugs:
 
-- The same payment gets charged twice because the consumer wasn't idempotent
-- An email is sent on every retry because there is no deduplication check
-- An order is saved multiple times because duplicate event delivery was never tested
+- The same payment gets charged twice because the consumer was never tested for duplicate delivery
+- An inventory reservation fires on every retry with no deduplication check
+- An order is saved multiple times while a downstream publish silently fails — data is inconsistent and no exception was raised
 
-These bugs are invisible in unit tests, hard to reproduce locally, and catastrophic in production.
+These bugs are invisible in unit tests, hard to reproduce locally, and expensive in production. EventBreaker finds and proves them before you ship.
 
 ---
 
@@ -26,42 +26,83 @@ These bugs are invisible in unit tests, hard to reproduce locally, and catastrop
 eventbreaker analyze OrderConsumer.java
          │
          ▼
-  [Static Analysis]          JavaParser extracts dependencies,
-  Java AST → JSON            method calls, and event type
-
+  [Static Analyzer]             JavaParser reads the consumer AST.
+  Java JAR → ConsumerAnalysis   Extracts: dependencies, method calls,
+                                call order, event type, injection style.
+                                No LLM involved — deterministic.
          │
          ▼
-  [AI Risk Identification]   NVIDIA Nemotron-3-Nano-30B identifies
-  Nemotron via Nebius        the highest-severity reliability risks
-
+  [Agent 1: Risk Identifier]    NVIDIA Nemotron-3-Ultra-550B via
+  Nemotron Ultra 550B           Nebius Token Factory reasons about
+                                the consumer's specific code and returns
+                                risks WITH a structured TestConfig:
+                                callPattern + faultInjections[].
+                                The LLM decides WHAT to test.
+                                It never writes Java.
          │
          ▼
-  [Scenario Execution]       EventBreaker generates a Java harness,
-  Local JVM or               compiles it, delivers the event twice
-  Nebius Sandbox             with mocked dependencies, and counts
-                             every call to every service
-
+  [Python Feasibility Check]    Pure Python validates TestConfig
+  No LLM — deterministic        against ConsumerAnalysis.
+                                Flags theoretical risks (no harness
+                                support) without an LLM call.
          │
          ▼
-  [AI Diagnosis]             Nemotron explains the observed failure
-  Nemotron via Nebius        and suggests a concrete fix
-
+  [Executor]                    Assembles a Java harness from
+  Parameter-driven assembly     ConsumerAnalysis + TestConfig.
+                                All dep/method names come from
+                                static analysis — always compiles.
+                                Runs in local JVM or Nebius Sandbox.
          │
          ▼
-  [Report]                   Terminal output + eventbreaker-report.md
+  [Observations]                call counts per dep.method
+  Richer signal                 + call sequence (ordering)
+                                + consumerThrew (swallowing detection)
+         │
+         ▼
+  [Agent 2: Diagnostician]      NVIDIA Nemotron-3-Super-120B via
+  Nemotron Super 120B           Nebius Token Factory diagnoses
+                                observed signals — grounded in
+                                evidence, not speculation.
+         │
+         ▼
+  [Report]                      Rich terminal output
+                                + eventbreaker-report.md
 ```
 
 ---
 
-## Powered By
+## Why This Architecture
 
-| Component | Technology |
-|-----------|-----------|
-| Risk identification | NVIDIA Nemotron-3-Nano-30B-A3B via Nebius Token Factory |
-| Fault diagnosis | NVIDIA Nemotron-3-Nano-30B-A3B via Nebius Token Factory |
-| Sandbox execution | Nebius ConTree SDK — isolated Alpine + JDK container |
-| Static analysis | JavaParser (AST-based, language-level) |
-| Dependency mocking | Mockito 5 (subclass mock maker, no JVM agent) |
+The key insight: **the LLM should decide what to test, not how to implement the test in Java.**
+
+Previous approaches asked the LLM to generate raw Java code injected into a harness it couldn't see — producing compile errors, wrong variable names, and hallucinated Mockito API calls that required constant prompt patching.
+
+EventBreaker's vocabulary-based architecture separates concerns:
+
+| Concern | Who handles it |
+|---|---|
+| What risks exist in this consumer? | Nemotron Ultra (reasoning) |
+| How to test each risk? | Structured TestConfig vocabulary |
+| Translating TestConfig to Java? | Python executor (deterministic) |
+| What do the observations mean? | Nemotron Super (diagnosis) |
+
+The TestConfig vocabulary has three **call patterns** and three **fault types** that compose into hundreds of specific test configurations — without the LLM writing a single line of Java.
+
+---
+
+## NVIDIA + Nebius Integration
+
+| Role | Model / Service |
+|---|---|
+| Risk identification + test planning | NVIDIA Nemotron-3-Ultra-550B via Nebius Token Factory |
+| Reliability diagnosis | NVIDIA Nemotron-3-Super-120B via Nebius Token Factory |
+| Sandboxed Java execution | Nebius ConTree SDK — isolated Alpine + JDK container |
+| Inference API | Nebius Token Factory (`api.tokenfactory.nebius.com`) |
+
+**Why multiple Nemotron tiers?**
+Ultra (550B total / 55B active) is used for risk identification — it reasons about unfamiliar consumer code it has never seen and produces structured TestConfig output. Super (120B total / 12B active) handles diagnosis — faster, sufficient for interpreting structured observation data. Nano remains available for any lightweight pre-screening.
+
+This directly follows the Nebius best practice: reach for Ultra when serious reasoning is required, let Super handle the faster everyday calls.
 
 ---
 
@@ -69,8 +110,8 @@ eventbreaker analyze OrderConsumer.java
 
 - Python 3.12+
 - Java 21+ and Maven 3.8+ (on your `PATH`)
-- A Nebius API key ([nebius.com](https://nebius.com))
-- A Nebius Project ID (for sandbox execution — optional, falls back to local JVM)
+- A Nebius API key with access to Nebius Token Factory
+- A Nebius Project ID (optional — enables sandboxed execution via Nebius ConTree)
 
 ---
 
@@ -80,7 +121,7 @@ eventbreaker analyze OrderConsumer.java
 git clone https://github.com/Ekta3009/EventBreaker
 cd EventBreaker
 
-# Build the Java static analyzer
+# Build the Java static analyzer fat JAR
 mvn package -q
 
 # Install the Python CLI
@@ -97,13 +138,12 @@ pip install -e .
 cp .env.example .env
 ```
 
-Edit `.env`:
-
 ```bash
+# .env
 NEBIUS_API_KEY=your_nebius_api_key_here
 
-# Optional — set this to run executions in an isolated Nebius Sandbox
-# instead of the local JVM. Recommended for production use.
+# Optional — runs Java harnesses in an isolated Nebius Sandbox
+# instead of the local JVM. Strongly recommended for untrusted consumers.
 NEBIUS_PROJECT_ID=your_project_id_here
 ```
 
@@ -123,91 +163,48 @@ eventbreaker analyze path/to/YourConsumer.java
 eventbreaker analyze src/test/resources/consumers/OrderConsumer.java
 ```
 
-**What happens:**
+**Pipeline steps:**
 
-1. Static analysis extracts the consumer's dependencies and call graph
-2. Nemotron identifies 2–4 reliability risks specific to this consumer's code
-3. The highest-priority `DUPLICATE_EVENT` scenario is executed — the same event is delivered twice against mocked dependencies
-4. Invocation counts for every dependency method are collected and shown
-5. Nemotron diagnoses the observed failure and suggests a fix
-6. A Markdown report is saved to `eventbreaker-report.md`
+1. Static analysis — extracts consumer structure (no LLM, instant)
+2. Risk identification — Nemotron Ultra identifies risks + TestConfig for each
+3. Feasibility check — Python validates TestConfig against analysis (no LLM, instant)
+4. Execution — harness assembled from TestConfig, built with Maven, run in JVM or sandbox
+5. Diagnosis — Nemotron Super interprets observations and produces grounded findings
+6. Report — saved to `eventbreaker-report.md`
 
 ---
 
-## Example Output
+## What It Detects
 
-### Consumer analysed: `OrderConsumer`
+EventBreaker identifies risks specific to each consumer's code — not from a fixed checklist. Example scenarios Nemotron has identified in practice:
 
-```java
-@EventBreakerConsumer(eventType = "OrderCreated")
-public void consume(OrderCreated event) {
-    Order order = orderRepository.get(event.getOrderId());
-    paymentClient.charge(order.getId());   // ← no idempotency guard
-    order.markPaid();
-    orderRepository.save(order);
-    eventPublisher.publish(new OrderProcessed(order.getId()));
-}
-```
+| Scenario type | What it proves |
+|---|---|
+| `IDEMPOTENCY_VIOLATION` | All dep methods called 2× on duplicate delivery — double charging, double publishing |
+| `PARTIAL_PROCESSING` | Make dep X throw → observe which downstream deps were skipped entirely |
+| `SILENT_DATA_LOSS` | Make a terminal dep throw → check if consumer propagates or swallows |
+| `DOWNSTREAM_FAILURE` | Inject fault mid-execution → observe partial commit + skipped steps |
+| `RACE_CONDITION` | Two threads deliver simultaneously → observe interleaved execution counts |
+| `MISSING_TRANSACTION_BOUNDARY` | Observe call ordering — is begin always followed by commit? |
 
-### Identified risks (Nemotron)
-
-```
-Risk #1  DUPLICATE_EVENT
-  Reason:  paymentClient.charge has no idempotency guard — duplicate
-           delivery will charge the customer twice.
-  Target:  paymentClient.charge
-  Concern: Verify payment is not processed more than once per order.
-
-Risk #2  DOWNSTREAM_FAILURE
-  ...
-```
-
-### Scenario executed: DUPLICATE_EVENT
-
-```
-Observations
-────────────────────────────────────
-paymentClient.charge      2   ← DUPLICATE
-orderRepository.get       2   ← DUPLICATE
-orderRepository.save      2   ← DUPLICATE
-eventPublisher.publish    2   ← DUPLICATE
-```
-
-### Reliability finding (Nemotron)
-
-```
-Severity:  HIGH
-Observed:  paymentClient.charge was called 2 times on duplicate event delivery
-
-Why it matters:
-  The consumer charges the customer on every event delivery with no
-  idempotency check. At-least-once delivery guarantees this will happen
-  in production, resulting in double charges.
-
-Suggested fix:
-  Check whether this order has already been charged before calling
-  paymentClient.charge, e.g. by storing a processed event ID in a
-  deduplication store and returning early if it is already present.
-```
+Risks that require return-value control (null checks, specific values) or real infrastructure (network partitions, OS faults) are correctly classified as **theoretical** with a clear explanation — not silently skipped.
 
 ---
 
 ## Consumer Compatibility
 
-EventBreaker works with any Java consumer annotated with `@EventBreakerConsumer`. It auto-generates stub classes for any types not on the classpath, so it does not require access to your full Maven dependency tree.
+EventBreaker works with any Java consumer annotated with `@EventBreakerConsumer`. It auto-generates stub classes for unknown types and patches them iteratively on compiler errors.
 
-Tested patterns:
-
-| Pattern | Example |
-|---------|---------|
-| Constructor injection | `OrderConsumer(OrderRepository r, PaymentClient p)` |
-| Field injection (Spring-style) | `private OrderRepository orderRepository;` |
-| Package-private fields | `UserRepository userRepository;` |
-| 4+ dependencies | `MultiDepConsumer` |
-| Generic typed dependencies | `ProductRepository<Product> productRepository` |
-| Deep method chains | `event.getOrder().withCustomer(...)` |
-| Conditional logic | `if (event.isPriority()) { ... }` |
-| Safe / idempotent consumers | Detected and correctly reported as no-risk |
+| Pattern | Supported |
+|---|---|
+| Constructor injection | ✅ |
+| Field injection (Spring `@Autowired` style) | ✅ via reflection |
+| Package-private fields | ✅ via `setAccessible` |
+| 4+ dependencies | ✅ |
+| Generic typed dependencies (`Repository<Product>`) | ✅ |
+| Deep event method chains (`event.getOrder().getId()`) | ✅ |
+| Conditional logic, early returns | ✅ |
+| Safe / idempotent consumers | ✅ correctly reported as no risk |
 
 ---
 
@@ -215,38 +212,32 @@ Tested patterns:
 
 ```
 EventBreaker/
-├── src/main/java/com/eventbreaker/    Java: @EventBreakerConsumer annotation +
-│                                      JavaParser-based static analyzer
-├── src/test/resources/consumers/     12 example consumers (safe, risky, adversarial)
-├── target/eventbreaker-analyzer.jar  Pre-built fat JAR (mvn package)
-├── eventbreaker/                     Python package
-│   ├── cli/main.py                   Typer CLI — 5-step pipeline
-│   ├── analyzer/bridge.py            Java JAR → Python bridge
-│   ├── agent/nemotron.py             Nemotron risk identification
-│   ├── scenarios/executor.py         Java harness generation + Maven build + execution
-│   ├── sandbox/executor.py           Nebius ConTree SDK wrapper
-│   ├── diagnosis/analyzer.py         Nemotron diagnosis
-│   ├── report/reporter.py            Markdown report generator
-│   └── models/                       Pydantic models (ConsumerAnalysis, ChaosScenario, …)
-├── .env.example                      Environment variable template
-└── pyproject.toml                    Python package config
+├── src/main/java/com/eventbreaker/    Java: @EventBreakerConsumer annotation
+│   ├── annotation/                    + JavaParser-based static analyzer
+│   └── analyzer/                      fat JAR built by mvn package
+├── src/test/resources/consumers/      12 example consumers (safe, risky, adversarial)
+├── target/eventbreaker-analyzer.jar   Pre-built static analyzer JAR
+├── eventbreaker/                      Python package
+│   ├── cli/main.py                    Typer CLI — 6-step pipeline
+│   ├── analyzer/bridge.py             Java JAR → Python bridge
+│   ├── agent/nemotron.py              Nemotron Ultra risk identification + TestConfig
+│   ├── scenarios/
+│   │   ├── models.py                  ChaosScenario, TestConfig, FaultInjection
+│   │   ├── executor.py                Parameter-driven Java harness assembly + Maven build
+│   │   ├── experiment.py              Pure Python feasibility validator
+│   │   └── validator.py               Schema validation for LLM output
+│   ├── sandbox/executor.py            Nebius ConTree SDK wrapper
+│   ├── diagnosis/analyzer.py          Nemotron Super diagnosis
+│   ├── report/reporter.py             Markdown report generator
+│   └── models/                        Pydantic models
+│       ├── consumer.py                ConsumerAnalysis + sub-models
+│       └── observation.py             ObservationEntry, ObservationResult, ReliabilityFinding
+├── .env.example                       Environment variable template
+└── pyproject.toml                     Python package config + dependencies
 ```
 
 ---
 
-## Scenario Types
+## Hackathon Track
 
-| Scenario | Description | Status |
-|----------|-------------|--------|
-| `DUPLICATE_EVENT` | Same event delivered twice (at-least-once delivery) | Implemented |
-| `DOWNSTREAM_FAILURE` | Dependency throws mid-execution | Planned |
-| `CRASH_AFTER_SIDE_EFFECT` | JVM crash after a side effect completes | Planned |
-| `OUT_OF_ORDER` | Events arrive in the wrong sequence | Planned |
-
----
-
-## Limitations
-
-- Consumer must be annotated with `@EventBreakerConsumer` (the annotation ships with this tool and is a one-line import)
-- Java 21 required for compilation of the generated execution harness
-- `DUPLICATE_EVENT` is the only fully executed scenario in this release; the others are identified by Nemotron but not yet run
+**Coding and Agentic Engineering** — a developer tool that uses multiple NVIDIA Nemotron agents to write, execute, and diagnose reliability tests for Java event consumers, powered end-to-end by Nebius Token Factory.

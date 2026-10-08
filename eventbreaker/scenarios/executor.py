@@ -10,7 +10,7 @@ from pathlib import Path
 from eventbreaker.models.consumer import ConsumerAnalysis
 from eventbreaker.models.observation import ObservationEntry, ObservationResult
 from eventbreaker.sandbox.executor import SandboxExecutor
-from eventbreaker.scenarios.models import ChaosScenario, ScenarioType
+from eventbreaker.scenarios.models import ChaosScenario, TestConfig
 
 
 # ── Temp Maven project pom.xml ────────────────────────────────────────────────
@@ -80,12 +80,16 @@ _POM = """\
 
 # ── Generated execution class template ───────────────────────────────────────
 #
-# Plain Java main class — no test framework.
+# Single unified Java main class — no test framework.
 # Uses plain string replacement (UPPER_CASE markers) to avoid
 # escaping conflicts between Python f-strings and Java braces.
-# Mockito is used purely as an invocation recorder, not a test helper.
+# Mockito is used purely as an invocation recorder.
+#
+# Marker ordering rules (to avoid substring replacement bugs):
+#   CHAIN_STUBS must be replaced before STUBS (CHAIN_STUBS contains "STUBS")
+#   FAULT_INJECTIONS and CALL_PATTERN carry the scenario-specific code.
 
-_DUPLICATE_EVENT_EXECUTION = """\
+_EXECUTION_TEMPLATE = """\
 package eventbreaker.generated;
 
 import org.mockito.Mockito;
@@ -95,19 +99,18 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
 
 CONSUMER_IMPORT
 EXTRA_IMPORTS
 
 /**
  * EventBreaker generated execution harness.
+ * Scenario: SCENARIO_TYPE
  *
- * Runs the consumer under a DUPLICATE_EVENT scenario:
- * delivers the same event twice with instrumented dependencies,
- * then reports how many times each dependency method was called.
- *
- * This is NOT a test — it is a controlled execution of the consumer
- * with dependency recorders in place of real services.
+ * Mocks all consumer dependencies as recorders, runs the consumer
+ * under a controlled scenario, and reports invocation counts as JSON.
  */
 public class EventBreakerExecution {
 
@@ -124,40 +127,37 @@ public class EventBreakerExecution {
 
         // ── Instrumented dependencies (recorders, not simulators) ──────────
         //
-        // Each dependency is replaced with a recorder that:
-        //   - Does nothing when void methods are called
-        //   - Returns null / default values for return-type methods
-        //   - Counts every invocation made to it
-        //
-        // We are NOT simulating real service behaviour.
-        // We are observing HOW MANY TIMES the consumer calls each service.
+        // Each dependency is replaced with a Mockito recorder that counts
+        // every invocation, tracks call ordering, and whether each call threw.
+        List<String> callSequence = Collections.synchronizedList(new ArrayList<>());
 MOCK_DECLARATIONS
 
         // ── Stub methods that return objects (prevents NullPointerException)
-        //
-        // The consumer assigns the return value of some dependency calls
-        // to local variables and calls further methods on them.
-        // We provide a recorder for those too.
 STUBS
 
         // ── Instantiate the real consumer with recorder dependencies ───────
 CONSUMER_INSTANTIATION
 
         // ── Create the event ───────────────────────────────────────────────
-        //
-        // Mocked so we don't need to know its constructor arguments.
-        // The consumer reads fields from it via getters — those return
-        // null / default, which is fine since all downstream calls
-        // go to recorders anyway.
         EVENT_CLASS event = mock(EVENT_CLASS.class);
 CHAIN_STUBS
 
-        // ── DUPLICATE_EVENT: deliver the same event twice ──────────────────
-        //
-        // Simulates Kafka / SQS at-least-once delivery redelivering
-        // the same message. The consumer must handle this safely.
-        try { consumer.CONSUMER_METHOD(event); } catch (Exception ignored) {}
-        try { consumer.CONSUMER_METHOD(event); } catch (Exception ignored) {}
+        // ── Reset counters — exclude stubbing-phase invocations ────────────
+        // when(...).thenReturn(...) triggers one invocation on the stub target.
+        // Clear Mockito log, threwCounts, and callSequence so only scenario-time
+        // calls appear in the final report.
+RESET_INVOCATIONS
+
+        // ── Fault injections ───────────────────────────────────────────────
+FAULT_INJECTIONS
+
+        // doThrow/doAnswer setup above fires invocation listeners — clear so
+        // callSequence only contains actual scenario-time calls.
+        callSequence.clear();
+
+        // ── Execute scenario ───────────────────────────────────────────────
+        AtomicBoolean consumerThrew = new AtomicBoolean(false);
+CALL_PATTERN
 
         // ── Collect invocation counts from every recorder ──────────────────
         Map<String, Object> deps = new LinkedHashMap<>();
@@ -177,12 +177,17 @@ DEP_MAP_ENTRIES
                 ObjectNode obs = mapper.createObjectNode();
                 obs.put("target", entry.getKey() + "." + mc.getKey());
                 obs.put("callCount", mc.getValue());
+                obs.put("threw", threwCounts.getOrDefault(entry.getKey() + "." + mc.getKey(), 0) > 0);
                 observations.add(obs);
             }
         }
 
         ObjectNode result = mapper.createObjectNode();
-        result.put("scenario", "DUPLICATE_EVENT");
+        result.put("scenario", "SCENARIO_TYPE");
+        result.put("consumerThrew", consumerThrew.get());
+        ArrayNode seqNode = mapper.createArrayNode();
+        callSequence.forEach(seqNode::add);
+        result.set("callSequence", seqNode);
         result.set("observations", observations);
 
         System.out.println(
@@ -203,15 +208,11 @@ class ScenarioExecutor:
         analysis: ConsumerAnalysis,
         consumer_file: Path,
     ) -> ObservationResult:
-        if scenario.scenarioType != ScenarioType.DUPLICATE_EVENT:
-            raise NotImplementedError(
-                f"Scenario {scenario.scenarioType.value} is not yet supported. "
-                "Only DUPLICATE_EVENT is implemented in this version."
-            )
-
         # Use a stable cache directory keyed by a hash of the generated code.
-        # If the consumer hasn't changed, Maven won't rebuild — just re-run the JAR.
-        execution_code = _generate_execution(analysis, consumer_file)
+        # Different scenarios (different testConfig) → different cache keys.
+        execution_code = _generate_execution(
+            analysis, consumer_file, scenario.testConfig, scenario.scenarioType
+        )
         cache_key = hashlib.sha256(
             (execution_code + consumer_file.read_text(errors="replace")).encode()
         ).hexdigest()[:16]
@@ -223,18 +224,24 @@ class ScenarioExecutor:
             self._create_project(project_dir, consumer_file)
 
         # Always overwrite execution class and stubs in case analysis changed
-        self._write_execution(project_dir, analysis, consumer_file)
+        self._write_execution(
+            project_dir, analysis, consumer_file, scenario.testConfig, scenario.scenarioType
+        )
         _generate_stubs(project_dir, analysis, consumer_file)
         _generate_chain_stubs(project_dir, analysis, consumer_file)
 
-        result = self._run(project_dir, scenario, analysis, consumer_file, cached=_jar_exists(project_dir))
+        result = self._run(
+            project_dir, scenario, analysis, consumer_file, cached=_jar_exists(project_dir)
+        )
 
         # Stale cache recovery: if the build failed on an inherited project dir,
         # the stubs may be corrupted from a previous session. Delete and retry once.
         if result.status == "ERROR" and not freshly_created and not _jar_exists(project_dir):
             shutil.rmtree(project_dir, ignore_errors=True)
             self._create_project(project_dir, consumer_file)
-            self._write_execution(project_dir, analysis, consumer_file)
+            self._write_execution(
+                project_dir, analysis, consumer_file, scenario.testConfig, scenario.scenarioType
+            )
             _generate_stubs(project_dir, analysis, consumer_file)
             _generate_chain_stubs(project_dir, analysis, consumer_file)
             result = self._run(project_dir, scenario, analysis, consumer_file, cached=False)
@@ -288,6 +295,8 @@ class ScenarioExecutor:
         project_dir: Path,
         analysis: ConsumerAnalysis,
         consumer_file: Path,
+        test_config: "TestConfig | None",
+        scenario_type: str = "UNKNOWN",
     ) -> None:
         exec_dir = (
             project_dir
@@ -295,7 +304,7 @@ class ScenarioExecutor:
             / "eventbreaker" / "generated"
         )
         exec_dir.mkdir(parents=True, exist_ok=True)
-        code = _generate_execution(analysis, consumer_file)
+        code = _generate_execution(analysis, consumer_file, test_config, scenario_type)
         (exec_dir / "EventBreakerExecution.java").write_text(code)
 
     # ── Build + run ───────────────────────────────────────────────────────────
@@ -339,7 +348,7 @@ class ScenarioExecutor:
 
             if not built:
                 return ObservationResult(
-                    scenario=scenario.scenarioType.value,
+                    scenario=scenario.scenarioType,
                     status="ERROR",
                     rawOutput=last_output,
                     executionError=_extract_build_error(last_output),
@@ -355,7 +364,7 @@ class ScenarioExecutor:
                 output = stdout + "\n" + stderr
             except (RuntimeError, EnvironmentError) as e:
                 return ObservationResult(
-                    scenario=scenario.scenarioType.value,
+                    scenario=scenario.scenarioType,
                     status="ERROR",
                     executionError=f"Sandbox execution failed: {e}",
                 )
@@ -376,6 +385,8 @@ class ScenarioExecutor:
 def _generate_execution(
     analysis: ConsumerAnalysis,
     consumer_file: Path,
+    test_config: "TestConfig | None",
+    scenario_type: str = "UNKNOWN",
 ) -> str:
     consumer_pkg = _read_package(consumer_file) or ""
     consumer_import = (
@@ -419,10 +430,18 @@ def _generate_execution(
 
     extra_imports = "\n".join(consumer_imports + extra_pkg_imports)
 
-    mock_declarations = "\n".join(
-        f"        {d.type} {d.name} = mock({d.type.split('<')[0].strip()}.class);"
-        for d in analysis.dependencies
-    )
+    mock_decl_lines = ["        Map<String, Integer> threwCounts = new LinkedHashMap<>();"]
+    for d in analysis.dependencies:
+        dtype = d.type.split("<")[0].strip()
+        mock_decl_lines.append(
+            f"        {d.type} {d.name} = mock({dtype}.class, withSettings()\n"
+            f'            .invocationListeners(report -> {{\n'
+            f'                String __ebMn = ((org.mockito.invocation.Invocation) report.getInvocation()).getMethod().getName();\n'
+            f'                callSequence.add("{d.name}." + __ebMn);\n'
+            f'                if (report.threwException()) threwCounts.merge("{d.name}." + __ebMn, 1, Integer::sum);\n'
+            f"            }}));"
+        )
+    mock_declarations = "\n".join(mock_decl_lines)
 
     # Final JDK types that Mockito cannot subclass — skip mock() for these.
     # The dependency mock already returns null for them by default, which is fine
@@ -470,6 +489,15 @@ def _generate_execution(
         for d in analysis.dependencies
     )
 
+    dep_names_csv = ", ".join(d.name for d in analysis.dependencies)
+    reset_invocations = (
+        f"        threwCounts.clear();\n"
+        f"        callSequence.clear();\n"
+        f"        clearInvocations({dep_names_csv});"
+        if analysis.dependencies else
+        "        threwCounts.clear();\n        callSequence.clear();"
+    )
+
     # Choose constructor injection vs. reflection field injection.
     # If the consumer source contains an explicit constructor that accepts the
     # dependencies, use it directly.  Otherwise (e.g. Spring field injection),
@@ -495,19 +523,94 @@ def _generate_execution(
             ]
         consumer_instantiation = "\n".join(lines)
 
+    fault_injections = _build_fault_injections(test_config) if test_config else ""
+    call_pattern = _build_call_pattern(analysis, test_config) if test_config else (
+        f"        try {{\n"
+        f"            consumer.{analysis.methodName}(event);\n"
+        f"        }} catch (Exception __eb_ex) {{\n"
+        f"            consumerThrew.set(true);\n"
+        f"        }}"
+    )
+
     return (
-        _DUPLICATE_EVENT_EXECUTION
+        _EXECUTION_TEMPLATE
         .replace("CONSUMER_IMPORT", consumer_import)
         .replace("EXTRA_IMPORTS", extra_imports)
         .replace("MOCK_DECLARATIONS", mock_declarations)
         .replace("CHAIN_STUBS", event_stubs)
         .replace("STUBS", stubs)
-        .replace("CONSUMER_CLASS", analysis.className)
         .replace("CONSUMER_INSTANTIATION", consumer_instantiation)
         .replace("EVENT_CLASS", analysis.eventType)
-        .replace("CONSUMER_METHOD", analysis.methodName)
         .replace("DEP_MAP_ENTRIES", dep_map_entries)
+        .replace("RESET_INVOCATIONS", reset_invocations)
+        .replace("FAULT_INJECTIONS", fault_injections)
+        .replace("CALL_PATTERN", call_pattern)
+        .replace("SCENARIO_TYPE", scenario_type)
     )
+
+
+# ── TestConfig → Java builders ────────────────────────────────────────────────
+
+def _build_fault_injections(test_config: TestConfig) -> str:
+    """Build Mockito stub lines that inject faults declared in the TestConfig.
+
+    Uses doThrow/doAnswer/doNothing syntax instead of when().thenX() so that
+    void-returning dependency methods compile correctly ('void' type not allowed
+    in when() expressions).
+    """
+    if not test_config.faultInjections:
+        return ""
+    lines: list[str] = []
+    for fi in test_config.faultInjections:
+        target = f"{fi.dep}.{fi.method}"
+        if fi.fault == "THROW":
+            lines.append(
+                f'        doThrow(new RuntimeException("EventBreaker: THROW on {target}"))'
+                f'.when({fi.dep}).{fi.method}(any());'
+            )
+        elif fi.fault == "THROW_ONCE":
+            lines.append(
+                f'        doThrow(new RuntimeException("EventBreaker: THROW_ONCE on {target}"))'
+                f'.doNothing().when({fi.dep}).{fi.method}(any());'
+            )
+        elif fi.fault == "DELAY":
+            delay_ms = fi.delayMs or 500
+            lines.append(
+                f'        doAnswer(inv -> {{ Thread.sleep({delay_ms}); return null; }}'
+                f').when({fi.dep}).{fi.method}(any());'
+            )
+    return "\n".join(lines)
+
+
+def _build_call_pattern(analysis: ConsumerAnalysis, test_config: TestConfig) -> str:
+    """Build the consumer invocation block matching the requested callPattern."""
+    call = f"consumer.{analysis.methodName}(event)"
+    if test_config.callPattern == "SINGLE":
+        return (
+            f"        try {{\n"
+            f"            {call};\n"
+            f"        }} catch (Exception __eb_ex) {{\n"
+            f"            consumerThrew.set(true);\n"
+            f"        }}"
+        )
+    if test_config.callPattern == "DUPLICATE":
+        return (
+            f"        try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); }}\n"
+            f"        try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); }}"
+        )
+    if test_config.callPattern == "CONCURRENT":
+        return (
+            f"        Thread __eb_t1 = new Thread(() -> {{\n"
+            f"            try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); }}\n"
+            f"        }});\n"
+            f"        Thread __eb_t2 = new Thread(() -> {{\n"
+            f"            try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); }}\n"
+            f"        }});\n"
+            f"        __eb_t1.start(); __eb_t2.start();\n"
+            f"        __eb_t1.join(); __eb_t2.join();"
+        )
+    # fallback — should not happen (feasibility check guards against unknown patterns)
+    return f"        {call};"
 
 
 # ── Output parser ─────────────────────────────────────────────────────────────
@@ -518,18 +621,24 @@ def _parse_output(output: str, scenario: ChaosScenario) -> ObservationResult:
         if stripped.startswith("EVENTBREAKER_RESULT:"):
             data = json.loads(stripped[len("EVENTBREAKER_RESULT:"):])
             entries = [
-                ObservationEntry(target=o["target"], callCount=o["callCount"])
+                ObservationEntry(
+                    target=o["target"],
+                    callCount=o["callCount"],
+                    threw=o.get("threw", False),
+                )
                 for o in data.get("observations", [])
             ]
             return ObservationResult(
-                scenario=scenario.scenarioType.value,
+                scenario=scenario.scenarioType,
                 status="REPRODUCED",
                 observations=entries,
                 rawOutput=output,
+                consumerThrew=data.get("consumerThrew", False),
+                callSequence=data.get("callSequence", []),
             )
 
     return ObservationResult(
-        scenario=scenario.scenarioType.value,
+        scenario=scenario.scenarioType,
         status="ERROR",
         observations=[],
         rawOutput=output,
@@ -538,6 +647,7 @@ def _parse_output(output: str, scenario: ChaosScenario) -> ObservationResult:
             "The build or execution may have failed — check rawOutput."
         ),
     )
+
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

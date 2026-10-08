@@ -3,6 +3,7 @@ from pathlib import Path
 
 from eventbreaker.models.consumer import ConsumerAnalysis
 from eventbreaker.models.observation import ObservationResult, ReliabilityFinding
+from eventbreaker.scenarios.experiment import ExperimentPlan
 from eventbreaker.scenarios.models import ChaosScenario
 
 
@@ -10,8 +11,9 @@ def generate(
     consumer_file: Path,
     analysis: ConsumerAnalysis,
     scenarios: list[ChaosScenario],
-    result: ObservationResult,
-    finding: ReliabilityFinding,
+    executions: list[tuple[ChaosScenario, ObservationResult]],
+    findings: list[ReliabilityFinding],
+    theoretical: list[tuple[ChaosScenario, ExperimentPlan]],
     sandbox: bool,
 ) -> str:
     """Render a Markdown reliability report and return it as a string."""
@@ -51,32 +53,81 @@ def generate(
             if scenario.targetMethod:
                 target += f".{scenario.targetMethod}"
         sections.append(
-            f"\n### Risk {i} — {scenario.scenarioType.value}\n"
+            f"\n### Risk {i} — {scenario.scenarioType}\n"
             f"**Reason:** {scenario.reason}  \n"
             + (f"**Target:** `{target}`  \n" if target else "")
             + f"**Concern:** {scenario.expectedConcern}\n"
         )
 
-    # ── Scenario execution ────────────────────────────────────────────────────
-    sections.append(f"\n---\n\n## Scenario Executed: {result.scenario}\n")
-    sections.append(f"**Execution mode:** {exec_mode}  \n**Status:** {result.status}\n")
+    # ── Scenario executions ───────────────────────────────────────────────────
+    sections.append(f"\n---\n\n## Scenario Executions\n")
+    sections.append(f"**Execution mode:** {exec_mode}\n")
+    dep_names = {d.name for d in analysis.dependencies}
+    expected_dep_calls: list[str] = []
+    seen_calls: set[str] = set()
+    for c in analysis.methodCalls:
+        if c.scope in dep_names:
+            key = f"{c.scope}.{c.methodName}"
+            if key not in seen_calls:
+                seen_calls.add(key)
+                expected_dep_calls.append(key)
 
-    if result.observations:
-        sections.append("\n### Observations\n")
-        sections.append("| Dependency.Method | Call Count |\n|-------------------|------------|\n")
-        for obs in result.observations:
-            flag = " ⚠" if obs.callCount > 1 else ""
-            sections.append(f"| `{obs.target}` | {obs.callCount}{flag} |\n")
+    for scenario, result in executions:
+        sections.append(f"\n### {scenario.scenarioType}  \n")
+        sections.append(f"**Status:** {result.status}  \n**Reason:** {scenario.reason}\n")
+        if result.executionError:
+            sections.append(f"\n**Error:** {result.executionError}\n")
+        else:
+            if result.consumerThrew:
+                sections.append("**Consumer threw:** YES  \n")
+            if result.callSequence:
+                seq_str = " → ".join(f"`{s}`" for s in result.callSequence)
+                sections.append(f"**Call sequence:** {seq_str}  \n")
+            observed = {o.target: o.callCount for o in result.observations}
+            all_targets = expected_dep_calls + [
+                t for t in observed if t not in expected_dep_calls
+            ]
+            sections.append(
+                "\n| Dependency.Method | Calls | Status |\n"
+                "|-------------------|-------|--------|\n"
+            )
+            for target in all_targets:
+                count = observed.get(target)
+                if count is None:
+                    sections.append(f"| `{target}` | 0 | SKIPPED |\n")
+                elif count > 1:
+                    sections.append(f"| `{target}` | {count} | ⚠ called {count}× |\n")
+                else:
+                    sections.append(f"| `{target}` | {count} | ✓ |\n")
 
-    # ── Reliability finding ───────────────────────────────────────────────────
-    sections.append("\n---\n\n## Reliability Finding\n")
-    sections.append(
-        f"**Severity:** {finding.severity}  \n"
-        f"**Observed:** {finding.summary}\n"
-    )
-    sections.append(f"\n### Why it matters\n{finding.explanation}\n")
-    sections.append(f"\n### Affected method\n`{finding.affectedMethod}`\n")
-    sections.append(f"\n### Suggested fix\n{finding.suggestedFix}\n")
+    # ── Reliability findings (one per concern) ────────────────────────────────
+    sections.append(f"\n---\n\n## Reliability Findings ({len(findings)})\n")
+    _SEVERITY_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    for i, finding in enumerate(
+        sorted(findings, key=lambda f: _SEVERITY_RANK.get(f.severity, 9)), 1
+    ):
+        sections.append(
+            f"\n### Finding {i} — `{finding.affectedMethod}`\n"
+            f"**Severity:** {finding.severity}  \n"
+            f"**Observed:** {finding.summary}\n"
+        )
+        sections.append(f"\n**Why it matters:** {finding.explanation}\n")
+        sections.append(f"\n**Suggested fix:** {finding.suggestedFix}\n")
+
+    # ── Theoretical risks ─────────────────────────────────────────────────────
+    if theoretical:
+        sections.append(f"\n---\n\n## Theoretical Risks ({len(theoretical)})\n")
+        sections.append(
+            "_These risks were identified by Nemotron but cannot be reproduced "
+            "inside a single JVM harness. They should be reviewed manually._\n"
+        )
+        for i, (scenario, plan) in enumerate(theoretical, 1):
+            sections.append(
+                f"\n### Theoretical Risk {i} — {scenario.scenarioType}\n"
+                f"**Reason:** {scenario.reason}  \n"
+                f"**Concern:** {scenario.expectedConcern}  \n"
+                f"**Why not reproducible:** {plan.reason or 'No reason provided'}\n"
+            )
 
     # ── Footer ────────────────────────────────────────────────────────────────
     sections.append(

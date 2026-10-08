@@ -4,6 +4,7 @@ from pydantic import BaseModel
 class ObservationEntry(BaseModel):
     target: str       # e.g., "paymentClient.charge"
     callCount: int
+    threw: bool = False  # True if the method threw an exception when called
 
 
 class ObservationResult(BaseModel):
@@ -12,10 +13,12 @@ class ObservationResult(BaseModel):
     observations: list[ObservationEntry] = []
     rawOutput: str | None = None
     executionError: str | None = None
+    consumerThrew: bool = False
+    callSequence: list[str] = []
 
 
 class ReliabilityFinding(BaseModel):
-    scenario: str                  # e.g., "DUPLICATE_EVENT"
+    scenario: str                  # scenario type label from Nemotron
     summary: str                   # one-line: what was observed
     explanation: str               # why this is a production risk
     affectedMethod: str            # e.g., "paymentClient.charge"

@@ -454,12 +454,18 @@ def _generate_execution(
 
     dep_names = {d.name for d in analysis.dependencies}
     stubs_lines: list[str] = []
+
+    # local_mocks: varName -> mockVarName for intermediate objects
+    # e.g. "order" -> "mockOrder" when order = orderRepository.find(...)
+    local_mocks: dict[str, str] = {}
+
     for vi in analysis.variableInitializations:
         call = vi.initializerMethodCall
         if call and call.scope in dep_names:
             if vi.variableType in _FINAL_JDK:
                 continue  # can't mock final JDK types; null return is acceptable
             mock_var = f"mock{vi.variableType}"
+            local_mocks[vi.variableName] = mock_var
             stubs_lines.append(
                 f"        {vi.variableType} {mock_var} = mock({vi.variableType}.class);"
             )
@@ -467,6 +473,40 @@ def _generate_execution(
                 f"        when({call.scope}.{call.methodName}(any()))"
                 f".thenReturn({mock_var});"
             )
+
+    # Stub non-void methods called on intermediate mocks so consumers with
+    # conditional branches (e.g. if (order.getStatus().equals("READY")))
+    # don't NPE.  We only stub methods that are assigned to a variable
+    # (i.e. they appear in variableInitializations), which guarantees
+    # they are non-void.  No argument matchers — varargs stubs called with
+    # zero args match the no-matcher form correctly.
+    #
+    # Return value strategy: use the first string literal found in any
+    # .equals() call in the consumer, so conditions evaluate to true and
+    # all branches execute.  Falls back to "" if none found.
+    equals_literals: list[str] = []
+    for mc in analysis.methodCalls:
+        if mc.methodName == "equals" and mc.arguments:
+            lit = mc.arguments[0].strip('"').strip("'")
+            if lit:
+                equals_literals.append(lit)
+
+    for vi in analysis.variableInitializations:
+        call = vi.initializerMethodCall
+        if not call or call.scope not in local_mocks:
+            continue
+        if vi.variableType in _FINAL_JDK:
+            # String/Integer etc — can't return a mock, return a literal
+            ret_val = f'"{equals_literals[0]}"' if equals_literals else '""'
+        else:
+            continue  # non-void object types already handled by their own mock
+        mock_var = local_mocks[call.scope]
+        stub_line = (
+            f"        when({mock_var}.{call.methodName}())"
+            f".thenReturn({ret_val});"
+        )
+        if stub_line not in stubs_lines:
+            stubs_lines.append(stub_line)
 
     stubs = "\n".join(stubs_lines)
 
@@ -482,6 +522,24 @@ def _generate_execution(
             event_stub_lines.append(
                 f"        when(event.{method}()).thenReturn(__ebChain);"
             )
+
+    # Stub boolean methods called directly on the event (e.g. event.isPriority()).
+    # Mockito defaults all booleans to false, which locks conditional consumers into
+    # the else-branch.  Return true so all branches execute and all risks are tested.
+    _BOOL_PREFIX = re.compile(r'^(is|has|was|can|should|will)[A-Z_]')
+    event_var = _get_event_var_name(analysis)
+    seen_bool_stubs: set[str] = set()
+    for mc in analysis.methodCalls:
+        if (
+            mc.scope == event_var
+            and (_BOOL_PREFIX.match(mc.methodName) or mc.methodName in _KNOWN_BOOLEAN_METHODS)
+            and mc.methodName not in seen_bool_stubs
+        ):
+            seen_bool_stubs.add(mc.methodName)
+            event_stub_lines.append(
+                f"        when(event.{mc.methodName}()).thenReturn(true);"
+            )
+
     event_stubs = "\n".join(event_stub_lines)
 
     dep_map_entries = "\n".join(
@@ -569,9 +627,12 @@ def _build_fault_injections(test_config: TestConfig) -> str:
                 f'.when({fi.dep}).{fi.method}(any());'
             )
         elif fi.fault == "THROW_ONCE":
+            # doAnswer(inv -> null) is safe for both void and non-void methods.
+            # doNothing() is only valid for void methods and causes a runtime error
+            # on Object-returning methods like findById, find, etc.
             lines.append(
                 f'        doThrow(new RuntimeException("EventBreaker: THROW_ONCE on {target}"))'
-                f'.doNothing().when({fi.dep}).{fi.method}(any());'
+                f'.doAnswer(inv -> null).when({fi.dep}).{fi.method}(any());'
             )
         elif fi.fault == "DELAY":
             delay_ms = fi.delayMs or 500
@@ -1012,18 +1073,21 @@ def _patch_stubs_from_errors(
 
         # Pattern: "[ERROR] /path/File.java:[L,C] incompatible types: Object cannot be converted to T"
         # Happens when _patch_stubs_from_errors() previously added a method returning Object
-        # but the call site requires a specific type (most often boolean for if-conditions).
+        # but the call site requires a specific type (boolean, String, etc.).
+        # NOTE: javac reports FQNs like "java.lang.String" — capture ([\w.]+) then strip package.
         incompat = re.match(
             r"\[ERROR\]\s+(.+?\.java):\[(\d+),\d+\]\s+incompatible types.*"
-            r"java\.lang\.Object cannot be converted to (\w+)",
+            r"java\.lang\.Object cannot be converted to ([\w.]+)",
             stripped,
         )
         if incompat:
             error_file_path = Path(incompat.group(1))
             error_line_no = int(incompat.group(2))
-            target_type = incompat.group(3)
-            # Only fix non-Object primitive-ish targets (boolean, int, etc.)
-            if target_type not in {"Object", "String"} and error_file_path.exists():
+            target_type_raw = incompat.group(3)
+            # Strip FQN package prefix: "java.lang.String" → "String", "boolean" → "boolean"
+            target_type = target_type_raw.rsplit(".", 1)[-1]
+            # Only fix non-Object targets; skip Object→Object (no-op)
+            if target_type not in {"Object"} and error_file_path.exists():
                 try:
                     src_lines = error_file_path.read_text().splitlines()
                     bad_line = src_lines[error_line_no - 1] if error_line_no <= len(src_lines) else ""

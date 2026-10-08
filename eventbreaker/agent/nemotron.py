@@ -92,7 +92,7 @@ def identify_risks(
             {"role": "user", "content": _build_prompt(analysis, source_code)},
         ],
         temperature=0.2,
-        max_tokens=4096,
+        max_tokens=8192,
     )
 
     message = response.choices[0].message

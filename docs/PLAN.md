@@ -538,7 +538,12 @@ For each consumer check:
 
 ---
 
-### [ ] STEP 9 — Real-world consumer validation (4 new consumers)
+### [x] STEP 9 — Real-world consumer validation (4 new consumers)
+> Done 2026-10-10. 4 consumers added; 16/16 run with 0 ERROR (59 scenarios). Fixed: arity-aware
+> matchers (single `any()` silently never matched multi-arg varargs stubs — faults were no-ops),
+> primitive/generic/collection return stubs, event numeric getters (default answer → 1/true),
+> `bad operand types` patcher, dependency method chains via __EBChain, report labels/✗/always-save.
+> Exposed precision issue → STEP 9b.
 
 Write 4 consumers in `src/test/resources/consumers/` that test patterns not currently covered.
 Each must be written BEFORE running the tool — not tuned to match the tool's output.
@@ -563,13 +568,113 @@ Each must be written BEFORE running the tool — not tuned to match the tool's o
 
 ---
 
-### [ ] STEP 10 — Demo polish + submission prep
+### [ ] STEP 9b — Diagnosis precision (false positives on safe consumers)
+
+Found in STEP 9 regression: ReadOnly / CacheRefresh / IdempotentGuard produce 5–7 findings each
+(mostly HIGH), e.g. "orderRepository.findById invoked twice — HIGH". Causes:
+1. Diagnosis treats any callCount > 1 as risk, including reads and idempotent writes.
+2. Exception propagated before any write is flagged — that is the safe outcome (broker retries).
+3. Stateless mocks: guard methods (`contains`) always return false, so DUPLICATE can't exercise guards.
+
+Options (decide with user before implementing):
+- A. Prompt calibration in `diagnosis/analyzer.py` (reads benign, HIGH only for duplicated/partial writes)
+- B. Deterministic read/write classification by method name; drop read-only "called 2×" findings
+- C. Stateful guard mocks for DUPLICATE (`thenReturn(false, true)` on guard-style booleans)
+
+**Test:** safe consumers → 0 HIGH findings (concurrent check-then-act race on IdempotentGuard is valid
+and may stay); OrderConsumer / TryCatch / Transactional findings unchanged.
+
+---
+
+### [ ] STEP 10 — Real-world consumer validation
+
+**Goal:** prove EventBreaker works on consumers we did not write. Judges will ask
+"does this work on real code?" — this step produces the answer, with numbers.
+
+**Principle — measure before fixing.** Do not speculatively fix every gap listed
+below. Collect real consumers first, run them unmodified, and build a failure
+inventory. Only then fix — in one pass, ordered by how many consumers each fix
+unblocks. This avoids reworking the analyzer/executor multiple times.
+
+**Principle — files stay unmodified.** Real-world files are copied byte-for-byte
+(plus a source/license header comment). Any adaptation (stripping framework
+annotations, etc.) happens inside the tool, never by hand-editing the file.
+If we hand-edit, the result does not count as "real-world".
+
+#### Known gaps (from reading `ConsumerAnalyzer.java` + `executor.py`, 2026-10-10)
+
+Expected to break on real code — confirm with the inventory before fixing:
+
+| # | Gap | Where | Real-world trigger |
+|---|---|---|---|
+| G1 | Only `@EventBreakerConsumer` recognised | `ConsumerAnalyzer.isConsumerMethod` | `@KafkaListener`, `@RabbitListener`, `@JmsListener`, `@SqsListener`, `@StreamListener`, `@EventListener` |
+| G2 | `eventType` read from annotation string | `ConsumerAnalyzer.extractEventType` | Real listeners have no such attr — derive from parameter type; unwrap `ConsumerRecord<K,V>`, `Message<T>`, `List<T>` (batch) |
+| G3 | Every field becomes a dependency | `ConsumerAnalyzer.extractDependencies` | `static final Logger log`, constants, `ObjectMapper`, `@Value String topic` — pollutes mocks + constructor args |
+| G4 | Harness calls `consumer.m(event)` with 1 arg | `executor._build_call_pattern` | `(@Payload T, @Header String key, Acknowledgment ack)` |
+| G5 | Only first listener method analysed | `ConsumerAnalyzer.analyze` | Classes with several `@KafkaListener` methods |
+| G6 | Framework annotations/imports don't compile | stub generation | `@Service`, `@KafkaListener`, `@Slf4j`, `@Transactional` — not on classpath, not stubbed |
+| G7 | Lombok | consumer instantiation | `@RequiredArgsConstructor` + `final` fields (no constructor in source → won't compile); `@Slf4j` → `log` field doesn't exist |
+| G8 | Dep calls inside private helpers invisible | analysis scope = listener method only | `handle(e) { validate(e); process(e); }` — feasibility check rejects faults on helper-only calls |
+| G9 | Thin listeners | — | `listener → orderService.handle(event)` — only one dep call, little to test. **Selection criterion, not a fix.** |
+| G10 | Collection returns are empty → loop bodies never run | `_COLLECTION_STUB_VALUES` | `for (f : friendService.getFriends(id)) { ws.send(f) }` (ruoyi AdminUserProfileUpdateConsumer) |
+| G11 | Dep calls inside lambdas passed to static utils never execute | stubs | `TenantUtils.execute(id, () -> { deviceService... })` (ruoyi IotDeviceMessageSubscriber) |
+| G12 | Listener found by interface, not annotation | analyzer | `implements ApplicationListener<E>` (fineract BulkImportEventListener), custom bus interfaces |
+
+#### Phase A — Source selection (no code changes)
+
+- [ ] **A1. Shortlist 8–10 candidate consumers** from public repos. Criteria:
+  - Permissive license (Apache-2.0 / MIT) — record license per file
+  - Reputable / recognisable source (Spring samples, Eventuate, Confluent examples, well-starred demo shops)
+  - Listener does real work: **≥2 side-effecting dep calls in the listener body** (G9 — skip thin listeners)
+  - Spread across frameworks: Kafka, RabbitMQ, at least one other (JMS/SQS/Spring events)
+  - At least one with a known reliability smell (no idempotency, dual write, swallowed exception)
+- [ ] **A2. Pick final 4–6**, maximising framework + pattern variety.
+- [ ] **A3. Copy into `src/test/resources/real-world/<repo-name>/`**, unmodified, with header:
+  `// Source: <url @ commit sha>  License: <license>`. Add `real-world/SOURCES.md` table.
+- [ ] **A4. Write expected risks BEFORE running the tool** — `real-world/EXPECTED.md`,
+  one section per consumer: hand-identified risks (type + dep.method + one-line reason).
+  This is the ground truth used for scoring in Phase D.
+
+#### Phase B — Failure inventory (no code changes)
+
+- [ ] **B1. Run every real-world consumer through the pipeline as-is.**
+- [ ] **B2. Record per consumer, per stage** (analyze / risk ID / feasibility / build / run / diagnose):
+  pass or the exact failure → `real-world/INVENTORY.md`. Map each failure to a gap (G1–G9) or a new G#.
+- [ ] **B3. Rank gaps** by number of consumers each blocks. Decide fix vs documented limitation
+  (confirm with user before implementing — see working rules).
+
+#### Phase C — Fix in one pass
+
+Expected shape (finalise after B3):
+- Analyzer: recognise listener annotations (G1), derive event type from param type with wrapper
+  unwrapping (G2), skip `static`/constant/logger fields (G3), `--method` option or analyse all
+  listener methods (G5), optionally inline same-class private helper calls (G8).
+- Executor: pass mocks for extra listener params (G4), strip framework annotations from the
+  copied consumer + inject `log` field / synthesise constructor for Lombok (G6, G7).
+- [ ] **C1. Implement agreed fixes.**
+- [ ] **C2. Regression: all 16 synthetic consumers still pass** (same checks as STEP 8).
+
+#### Phase D — Score + results
+
+- [ ] **D1. Re-run all real-world consumers.** Every run REPRODUCED or THEORETICAL with a reason — never ERROR
+  (or ERROR documented as a known limitation in INVENTORY.md).
+- [ ] **D2. Score against EXPECTED.md:** per consumer — expected risks found / missed / extra findings
+  (extras reviewed by hand: valid or false positive).
+- [ ] **D3. Write `real-world/RESULTS.md`** — the table used in README + demo:
+  "N consumers from M open-source repos, X/Y expected risks reproduced, Z new valid findings, K false positives."
+- [ ] **D4. Pick the demo consumer** — the real-world one with the clearest, most visual finding.
+
+**Done when:** RESULTS.md exists with honest numbers, no unexplained ERRORs, synthetic suite still green.
+
+---
+
+### [ ] STEP 11 — Demo polish + submission prep
 
 1. Capture terminal screenshots of full pipeline on OrderConsumer
 2. Record 3-minute demo video:
    - 0:00–0:30 — problem statement (duplicate payment bug)
    - 0:30–1:30 — full pipeline run on OrderConsumer (live terminal)
-   - 1:30–2:30 — run on an unfamiliar consumer (one of the 4 new ones)
+   - 1:30–2:30 — run on a real-world open-source consumer (picked in STEP 10 D4)
    - 2:30–3:00 — Nebius Token Factory + Nemotron model tier callouts
 3. Verify no secrets in repo: `git log --all -S "NEBIUS" --oneline`
 4. Test clean install from scratch: `rm -rf ~/.eventbreaker .venv && python -m venv .venv && ...`

@@ -173,9 +173,10 @@ def analyze_consumer(
                 )
                 continue
 
-        colour = "green" if result.status == "REPRODUCED" else "red"
+        ok = result.status == "REPRODUCED"
+        colour, mark = ("green", "✓") if ok else ("red", "✗")
         console.print(
-            f"[bold {colour}]✓ {scenario.scenarioType} — {result.status}[/bold {colour}]"
+            f"[bold {colour}]{mark} {scenario.scenarioType} — {result.status}[/bold {colour}]"
         )
         _print_observations(result, analysis)
         executions.append((scenario, result))
@@ -213,13 +214,13 @@ def analyze_consumer(
                     f"[yellow]  Diagnosis skipped for {scenario.scenarioType}: {e}[/yellow]"
                 )
 
-    if not all_findings:
-        raise typer.Exit(0)
-
-    console.print(
-        f"[bold green]✓ Diagnosis complete — {len(all_findings)} finding(s) total[/bold green]\n"
-    )
-    _print_findings(all_findings)
+    if all_findings:
+        console.print(
+            f"[bold green]✓ Diagnosis complete — {len(all_findings)} finding(s) total[/bold green]\n"
+        )
+        _print_findings(all_findings)
+    else:
+        console.print("[dim]No reliability findings.[/dim]\n")
 
     # ── Step 6: Save Markdown report ──────────────────────────────────────────
     report_md = reporter.generate(

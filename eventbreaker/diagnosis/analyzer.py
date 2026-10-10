@@ -270,6 +270,14 @@ def _parse(
         if not item.get("affectedMethod") and result.observations:
             top = max(result.observations, key=lambda o: o.callCount)
             item["affectedMethod"] = top.target
+        # The model sometimes copies the scenario's target into every finding.
+        # When the summary names exactly one observed dep.method, trust the summary.
+        mentioned = [
+            o.target for o in result.observations
+            if o.target in str(item.get("summary", ""))
+        ]
+        if len(mentioned) == 1 and item.get("affectedMethod") != mentioned[0]:
+            item["affectedMethod"] = mentioned[0]
         try:
             findings.append(ReliabilityFinding.model_validate(item))
         except ValidationError:

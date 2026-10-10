@@ -198,8 +198,7 @@ def analyze_consumer(
                 scenario_findings = diagnose(analysis, scenario, result, source_code)
                 if not scenario_findings:
                     console.print(
-                        f"[dim]  {scenario.scenarioType}: no anomaly signal — "
-                        f"scenario likely requires return-value control (theoretical)[/dim]"
+                        f"[dim]  {scenario.scenarioType}: no production risk observed[/dim]"
                     )
                 all_findings.extend(scenario_findings)
             except EnvironmentError as e:

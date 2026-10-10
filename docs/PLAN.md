@@ -581,6 +581,14 @@ Options (decide with user before implementing):
 - B. Deterministic read/write classification by method name; drop read-only "called 2×" findings
 - C. Stateful guard mocks for DUPLICATE (`thenReturn(false, true)` on guard-style booleans)
 
+**Decision (2026-10-10): A + a call-order rule. B and C deferred** — both guess from method names,
+which may not hold for real-world code. Revisit only if STEP 10's failure inventory shows they're needed.
+- A: diagnosis prompt classifies each call from source (READ / IDEMPOTENT WRITE / NON-IDEMPOTENT
+  SIDE EFFECT) with explicit severity rules; model returns `NONE` for benign observations, `_parse` drops them.
+- Call-order rule (deterministic, name-free): consumer threw AND no dep call completed without
+  throwing → no finding (nothing changed; redelivery is clean). Swallowed exceptions are NOT exempt.
+- Known limitation until C: IdempotentGuard's DUPLICATE finding (stateless `contains` always false).
+
 **Test:** safe consumers → 0 HIGH findings (concurrent check-then-act race on IdempotentGuard is valid
 and may stay); OrderConsumer / TryCatch / Transactional findings unchanged.
 
@@ -628,7 +636,12 @@ Expected to break on real code — confirm with the inventory before fixing:
   - Listener does real work: **≥2 side-effecting dep calls in the listener body** (G9 — skip thin listeners)
   - Spread across frameworks: Kafka, RabbitMQ, at least one other (JMS/SQS/Spring events)
   - At least one with a known reliability smell (no idempotency, dual write, swallowed exception)
-- [ ] **A2. Pick final 4–6**, maximising framework + pattern variety.
+- [x] **A2. Pick final 4–6**, maximising framework + pattern variety.
+  Picked (2026-10-10), one distinct insight each: fineract `KafkaRemoteMessageListener` (swallow + ack),
+  ruoyi `AdminUserProfileUpdateConsumer` (@TransactionalEventListener + @Async, per-item swallow),
+  ddd-library `SheetsReadModel` (negative control), killbill `OverdueListener` (@AllowConcurrentEvents),
+  mall `CancelOrderReceiver` (class-level @RabbitListener + @RabbitHandler, thin). fineract
+  `BulkImportEventListener` dropped (overlaps #1) — so G12 is not covered by this set.
 - [ ] **A3. Copy into `src/test/resources/real-world/<repo-name>/`**, unmodified, with header:
   `// Source: <url @ commit sha>  License: <license>`. Add `real-world/SOURCES.md` table.
 - [ ] **A4. Write expected risks BEFORE running the tool** — `real-world/EXPECTED.md`,
@@ -653,6 +666,7 @@ Expected shape (finalise after B3):
   copied consumer + inject `log` field / synthesise constructor for Lombok (G6, G7).
 - [ ] **C1. Implement agreed fixes.**
 - [ ] **C2. Regression: all 16 synthetic consumers still pass** (same checks as STEP 8).
+  Run `.venv/bin/python -m pytest` after every fix (offline, ~4s) before the full pipeline run.
 
 #### Phase D — Score + results
 

@@ -15,9 +15,17 @@ dependencies = [
     "python-dotenv>=1.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.scripts]
 eventbreaker = "eventbreaker.cli.main:app"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["eventbreaker*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# TestConfig is a Pydantic model, not a test class.
+filterwarnings = ["ignore:cannot collect test class 'TestConfig':pytest.PytestCollectionWarning"]

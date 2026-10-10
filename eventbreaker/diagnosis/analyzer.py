@@ -36,8 +36,23 @@ Each finding must use this exact format:
   "explanation": "<2-3 sentences: why this specific method being called N times or being skipped is a production risk>",
   "affectedMethod": "<dependency.method for this finding, e.g. paymentClient.charge>",
   "suggestedFix": "<concrete fix referencing the actual code for this specific method>",
-  "severity": "<HIGH | MEDIUM | LOW>"
+  "severity": "<HIGH | MEDIUM | LOW | NONE>"
 }
+
+Judge whether each observation is a real production risk. Decide from the consumer's source code what each dependency call does to external state — do not assume a risk just because a method ran more than once or an exception occurred:
+- READ: returns data and changes nothing (a lookup or query). Running it again is harmless.
+- IDEMPOTENT WRITE: repeating it with the same input leaves the same state (overwriting a value under the same key, setting a field, an upsert).
+- NON-IDEMPOTENT SIDE EFFECT: repeating it changes state again or is visible externally (charging, sending a message or email, publishing an event, inserting a row, incrementing, reserving, appending).
+
+Severity rules:
+- A READ called more than once → severity NONE.
+- An IDEMPOTENT WRITE repeated with the same input → severity NONE. Under concurrency, at most LOW, and only if the code shows two deliveries could write different values in the wrong order.
+- A NON-IDEMPOTENT SIDE EFFECT executed more than once → HIGH (money, inventory, external messages) or MEDIUM.
+- The consumer threw (the exception propagated, so the broker will redeliver) and the only calls that completed before the failure were READs or IDEMPOTENT WRITEs → severity NONE. This is the safe outcome: nothing was left half-done and the retry repeats it cleanly.
+- A NON-IDEMPOTENT SIDE EFFECT completed before a failure → HIGH or MEDIUM: the retry repeats it, or state is left partially committed.
+- The consumer did NOT throw (it completed or swallowed the exception), but a call failed or was skipped → the message is acknowledged and that work is lost: HIGH or MEDIUM, unless the skipped work is only a READ.
+- LOW is for real but minor risks (extra latency, a harmless log line written twice).
+- Use NONE whenever the observation is the expected, safe behaviour. A finding with severity NONE is discarded and not shown to the user, so do not inflate severity to make it count.
 
 Rules:
 - Produce one finding per concerning method — do not merge multiple methods into one finding.
@@ -57,6 +72,16 @@ def _has_observation_signal(result: ObservationResult) -> bool:
     Without a signal, diagnosis would be speculative rather than evidence-based.
     """
     return any(o.callCount > 1 or o.threw for o in result.observations) or result.consumerThrew
+
+
+def _failed_before_any_completed_call(result: ObservationResult) -> bool:
+    """Return True if the consumer threw and no dependency call completed without throwing.
+
+    Uses only the observed calls, never method names: if every call that ran threw,
+    no external state was changed before the exception propagated.
+    """
+    completed = [o for o in result.observations if o.callCount > 0 and not o.threw]
+    return result.consumerThrew and not completed
 
 
 def diagnose(
@@ -89,6 +114,11 @@ def diagnose(
         )
     ]
     if not _has_observation_signal(result) and not skipped:
+        return []
+
+    # The exception reached the broker before any dependency call completed:
+    # nothing was changed, so redelivery repeats the work cleanly. Not a finding.
+    if _failed_before_any_completed_call(result):
         return []
 
     api_key = os.environ.get("NEBIUS_API_KEY")
@@ -138,8 +168,10 @@ def _build_prompt(
         ", ".join(f"{o.target} ({o.callCount}x)" for o in doubled) or "none"
     )
     consumer_threw_line = (
-        "Consumer threw an exception: YES" if result.consumerThrew
-        else "Consumer threw an exception: NO"
+        "Consumer threw an exception: YES (it propagated — the broker will redeliver the event)"
+        if result.consumerThrew
+        else "Consumer threw an exception: NO (the handler completed or swallowed the exception "
+        "— the event is acknowledged)"
     )
     call_seq_line = (
         "Call sequence (in order): " + " → ".join(result.callSequence)
@@ -224,6 +256,7 @@ These dependency methods were {concern_description} and each needs its own findi
 {target_list}
 
 Produce exactly {len(concern_targets)} ReliabilityFinding objects — one per method listed above.
+Apply the severity rules: use NONE for any method whose observation is not a production risk.
 Return a JSON array of exactly {len(concern_targets)} findings."""
 
 
@@ -265,7 +298,11 @@ def _parse(
         )
 
     findings: list[ReliabilityFinding] = []
+    benign = 0
     for item in items:
+        if str(item.get("severity", "")).upper() == "NONE":
+            benign += 1
+            continue
         item.setdefault("scenario", scenario.scenarioType)
         if not item.get("affectedMethod") and result.observations:
             top = max(result.observations, key=lambda o: o.callCount)
@@ -283,7 +320,7 @@ def _parse(
         except ValidationError:
             continue
 
-    if not findings:
+    if not findings and not benign:
         raise ValueError(
             f"No valid ReliabilityFinding objects in Nemotron response.\n"
             f"Raw response:\n{raw}"

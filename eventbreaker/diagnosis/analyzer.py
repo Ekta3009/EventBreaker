@@ -327,3 +327,28 @@ def _parse(
         )
 
     return findings
+
+
+_SEVERITY_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+
+
+def merge_findings(findings: list[ReliabilityFinding]) -> list[ReliabilityFinding]:
+    """Collapse findings to one per affectedMethod.
+
+    diagnose() runs per scenario, so a method hit by several scenarios is reported
+    several times. Keep the most severe finding (first one on ties) and record the
+    other scenarios in alsoSeenIn. Method order follows first appearance.
+    """
+    groups: dict[str, list[ReliabilityFinding]] = {}
+    for f in findings:
+        groups.setdefault(f.affectedMethod, []).append(f)
+
+    merged: list[ReliabilityFinding] = []
+    for group in groups.values():
+        best = min(group, key=lambda f: _SEVERITY_RANK.get(f.severity, 9))
+        others = [
+            f.scenario for f in group
+            if f is not best and f.scenario != best.scenario
+        ]
+        merged.append(best.model_copy(update={"alsoSeenIn": list(dict.fromkeys(others))}))
+    return merged

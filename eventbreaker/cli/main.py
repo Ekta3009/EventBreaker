@@ -12,7 +12,7 @@ from rich import box
 
 from eventbreaker.analyzer.bridge import analyze
 from eventbreaker.agent.nemotron import identify_risks
-from eventbreaker.diagnosis.analyzer import diagnose
+from eventbreaker.diagnosis.analyzer import diagnose, merge_findings
 from eventbreaker.models.observation import ObservationResult, ReliabilityFinding
 from eventbreaker.report import reporter
 from eventbreaker.scenarios.models import ChaosScenario
@@ -40,6 +40,9 @@ def analyze_consumer(
         help="Path to the Java consumer file to analyze.",
         exists=True,
         readable=True,
+    ),
+    fresh: bool = typer.Option(
+        False, "--fresh", help="Ignore the cached risk-identification response and call Nemotron Ultra again.",
     ),
 ) -> None:
     """Analyze an event consumer and identify reliability risks."""
@@ -116,7 +119,7 @@ def analyze_consumer(
         "[bold green]Asking Nemotron to identify reliability risks..."
     ):
         try:
-            scenarios = identify_risks(analysis, source_code)
+            scenarios, from_cache = identify_risks(analysis, source_code, fresh=fresh)
         except EnvironmentError as e:
             console.print(f"[bold red]Config error:[/bold red] {e}")
             raise typer.Exit(1)
@@ -129,7 +132,9 @@ def analyze_consumer(
 
     console.print(
         f"[bold green]✓ {len(scenarios)} reliability risk(s) identified"
-        f"[/bold green]\n"
+        f"[/bold green]"
+        + (" [dim](cached response — use --fresh to re-ask Nemotron)[/dim]" if from_cache else "")
+        + "\n"
     )
 
     _print_scenarios(scenarios)
@@ -213,6 +218,7 @@ def analyze_consumer(
                     f"[yellow]  Diagnosis skipped for {scenario.scenarioType}: {e}[/yellow]"
                 )
 
+    all_findings = merge_findings(all_findings)
     if all_findings:
         console.print(
             f"[bold green]✓ Diagnosis complete — {len(all_findings)} finding(s) total[/bold green]\n"
@@ -349,6 +355,7 @@ def _print_findings(findings: list[ReliabilityFinding]) -> None:
                 f"  {f.summary}\n"
                 f"  [dim]{f.explanation}[/dim]\n"
                 f"  [green]Fix: {f.suggestedFix}[/green]"
+                + (f"\n  [dim]Also seen in: {', '.join(f.alsoSeenIn)}[/dim]" if f.alsoSeenIn else "")
             )
 
         console.print(Panel(

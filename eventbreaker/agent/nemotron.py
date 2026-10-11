@@ -1,6 +1,8 @@
+import hashlib
 import json
 import os
 import re
+from pathlib import Path
 
 from openai import OpenAI
 from pydantic import ValidationError
@@ -10,6 +12,7 @@ from eventbreaker.scenarios.models import ChaosScenario, FaultInjection, TestCon
 
 _MODEL = "nvidia/Nemotron-3-Ultra-550b-a55b"
 _BASE_URL = "https://api.tokenfactory.nebius.com/v1/"
+_CACHE_DIR = Path.home() / ".eventbreaker" / "cache" / "risks"
 
 _SYSTEM_PROMPT = """\
 You are an expert in distributed systems reliability and event-driven architecture.
@@ -69,10 +72,13 @@ STRICT RULES:
 def identify_risks(
     analysis: ConsumerAnalysis,
     source_code: str,
-) -> list[ChaosScenario]:
+    fresh: bool = False,
+) -> tuple[list[ChaosScenario], bool]:
     """Send consumer analysis to Nemotron Ultra and return validated ChaosScenarios.
 
-    Each returned scenario has testConfig populated.
+    Each returned scenario has testConfig populated. The raw response is cached,
+    keyed by model + full prompt (so any change to source, analysis or prompt
+    misses); fresh=True bypasses the cache. Returns (scenarios, from_cache).
     Raises EnvironmentError if NEBIUS_API_KEY is not set.
     Raises ValueError if Nemotron returns nothing usable.
     """
@@ -83,13 +89,21 @@ def identify_risks(
             "Export it before running: export NEBIUS_API_KEY=<your-key>"
         )
 
+    user_prompt = _build_prompt(analysis, source_code)
+    cache_key = hashlib.sha256(
+        f"{_MODEL}\0{_SYSTEM_PROMPT}\0{user_prompt}".encode()
+    ).hexdigest()[:16]
+    cache_file = _CACHE_DIR / f"{cache_key}.txt"
+    if not fresh and cache_file.exists():
+        return _parse(cache_file.read_text(), analysis), True
+
     client = OpenAI(base_url=_BASE_URL, api_key=api_key)
 
     response = client.chat.completions.create(
         model=_MODEL,
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": _build_prompt(analysis, source_code)},
+            {"role": "user", "content": user_prompt},
         ],
         temperature=0.2,
         max_tokens=8192,
@@ -107,7 +121,11 @@ def identify_risks(
             "Check that the model endpoint is reachable and the prompt is valid."
         )
 
-    return _parse(raw.strip(), analysis)
+    scenarios = _parse(raw.strip(), analysis)
+    # Cache only usable responses, so a bad response is retried on the next run.
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file.write_text(raw.strip())
+    return scenarios, False
 
 
 def _build_prompt(analysis: ConsumerAnalysis, source_code: str) -> str:

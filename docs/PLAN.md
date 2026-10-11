@@ -568,7 +568,7 @@ Each must be written BEFORE running the tool — not tuned to match the tool's o
 
 ---
 
-### [ ] STEP 9b — Diagnosis precision (false positives on safe consumers)
+### [x] STEP 9b — Diagnosis precision (false positives on safe consumers)
 
 Found in STEP 9 regression: ReadOnly / CacheRefresh / IdempotentGuard produce 5–7 findings each
 (mostly HIGH), e.g. "orderRepository.findById invoked twice — HIGH". Causes:
@@ -591,6 +591,23 @@ which may not hold for real-world code. Revisit only if STEP 10's failure invent
 
 **Test:** safe consumers → 0 HIGH findings (concurrent check-then-act race on IdempotentGuard is valid
 and may stay); OrderConsumer / TryCatch / Transactional findings unchanged.
+
+**Result (2× full 16-consumer run):** ReadOnly 0 findings both runs; CacheRefresh 0 HIGH (1–3 MEDIUM on
+idempotent `put` — prompt only partly followed); real bugs still HIGH (OrderConsumer charge, Transactional
+debit/credit, TryCatch swallowed `book`, EarlyReturn issueRefund); audit logs now LOW. Left for STEP 10
+inventory: residual MEDIUM on idempotent writes, run-to-run severity variance, IdempotentGuard `contains` (needs C).
+
+---
+
+### [x] STEP 9c — Merge repeated findings across scenarios
+
+Same method is reported once per scenario (Transactional: `ledgerRepository.credit` 4–5×), inflating counts
+(8 vs 13 HIGH between runs). Merge deterministically before printing/reporting.
+
+**Done 2026-10-11.** Key = `affectedMethod` only: keep most severe finding (first on ties), other scenario
+labels go to `alsoSeenIn` ("Also seen in" in terminal + report). `merge_findings()` in `diagnosis/analyzer.py`,
+tests in `tests/test_merge_findings.py`. Offline check on saved TryCatch report: 15 findings → 4 (8 HIGH → 2).
+Live 16-consumer run deliberately skipped (API budget) — covered by STEP 10 C2 regression.
 
 ---
 

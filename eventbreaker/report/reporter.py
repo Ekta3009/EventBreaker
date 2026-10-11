@@ -113,6 +113,8 @@ def generate(
         )
         sections.append(f"\n**Why it matters:** {finding.explanation}\n")
         sections.append(f"\n**Suggested fix:** {finding.suggestedFix}\n")
+        if finding.alsoSeenIn:
+            sections.append(f"\n**Also seen in:** {', '.join(finding.alsoSeenIn)}\n")
 
     # ── Theoretical risks ─────────────────────────────────────────────────────
     if theoretical:

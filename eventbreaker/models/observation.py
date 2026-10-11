@@ -24,3 +24,4 @@ class ReliabilityFinding(BaseModel):
     affectedMethod: str            # e.g., "paymentClient.charge"
     suggestedFix: str              # concrete fix advice referencing the actual code
     severity: str = "HIGH"        # HIGH | MEDIUM | LOW
+    alsoSeenIn: list[str] = []     # other scenarios that reported this method (set by merge_findings)

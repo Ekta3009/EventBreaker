@@ -349,4 +349,97 @@ class ConsumerAnalyzerTest {
                         )
         );
     }
+
+    // ── Real listener annotations (G1 / G2 / G5) ─────────────────────────────
+
+    @Test
+    void detectsKafkaListenerAndSkipsAcknowledgmentParam() throws Exception {
+        ConsumerAnalysis analysis = analyzer.analyze(
+                Path.of("src/test/resources/real-world/fineract/KafkaRemoteMessageListener.java"));
+
+        assertEquals("onMessage", analysis.methodName());
+        assertEquals("ContextualMessage", analysis.eventType());
+        assertEquals(java.util.List.of(), analysis.otherListenerMethods());
+    }
+
+    @Test
+    void defaultsToFirstSubscribeMethodAndListsTheOthers() throws Exception {
+        ConsumerAnalysis analysis = analyzer.analyze(
+                Path.of("src/test/resources/real-world/killbill/OverdueListener.java"));
+
+        assertEquals("handleTagInsert", analysis.methodName());
+        assertEquals("ControlTagCreationInternalEvent", analysis.eventType());
+        assertEquals(5, analysis.otherListenerMethods().size());
+        assertFalse(analysis.otherListenerMethods().contains("handleTagInsert"));
+    }
+
+    @Test
+    void selectsListenerMethodByName() throws Exception {
+        ConsumerAnalysis analysis = analyzer.analyze(
+                Path.of("src/test/resources/real-world/killbill/OverdueListener.java"),
+                "handlePaymentInfoEvent");
+
+        assertEquals("handlePaymentInfoEvent", analysis.methodName());
+        assertEquals("InvoicePaymentInfoInternalEvent", analysis.eventType());
+        assertTrue(analysis.otherListenerMethods().contains("handleTagInsert"));
+    }
+
+    @Test
+    void unknownMethodNameListsAvailableListeners() {
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class, () ->
+                analyzer.analyze(
+                        Path.of("src/test/resources/real-world/killbill/OverdueListener.java"),
+                        "nope"));
+
+        assertTrue(e.getMessage().contains("handleInvoiceCreation"));
+    }
+
+    @Test
+    void unwrapsConsumerRecordAndSkipsHeaderParam() throws Exception {
+        ConsumerAnalysis analysis = analyzer.analyze(
+                Path.of("src/test/resources/analyzer/WrappedPayloadListener.java"));
+
+        assertEquals("onRecord", analysis.methodName());
+        assertEquals("AuditEvent", analysis.eventType());
+    }
+
+    @Test
+    void matchesFullyQualifiedAnnotation() throws Exception {
+        ConsumerAnalysis analysis = analyzer.analyze(
+                Path.of("src/test/resources/analyzer/WrappedPayloadListener.java"),
+                "onQualified");
+
+        assertEquals("SettingsChanged", analysis.eventType());
+    }
+
+    @Test
+    void staticFieldsAreNotDependencies() throws Exception {
+        ConsumerAnalysis analysis = analyzer.analyze(
+                Path.of("src/test/resources/real-world/killbill/OverdueListener.java"));
+
+        assertTrue(analysis.dependencies().stream().noneMatch(d -> d.name().equals("log")));
+        assertTrue(analysis.dependencies().stream().anyMatch(d -> d.name().equals("asyncPoster")));
+    }
+
+    @Test
+    void inlinesCallsFromSameClassHelpers() throws Exception {
+        ConsumerAnalysis analysis = analyzer.analyze(
+                Path.of("src/test/resources/real-world/killbill/OverdueListener.java"),
+                "handlePaymentInfoEvent");
+
+        assertTrue(analysis.methodCalls().stream().anyMatch(c ->
+                "asyncPoster".equals(c.scope()) && c.methodName().equals("insertOverdueNotification")));
+        assertTrue(analysis.methodCalls().stream().anyMatch(c ->
+                "accountApi".equals(c.scope()) && c.methodName().equals("getChildrenAccounts")));
+    }
+
+    @Test
+    void scanFindsEveryListenerMethodUnderADirectory() throws Exception {
+        var found = analyzer.scan(Path.of("src/test/resources/real-world"));
+
+        assertTrue(found.stream().anyMatch(l ->
+                l.className().equals("KafkaRemoteMessageListener") && l.methodName().equals("onMessage")
+                        && l.eventType().equals("ContextualMessage")));
+        assertEquals(6, found.stream().filter(l -> l.className().equals("OverdueListener")).count());
+    }
 }

@@ -5,9 +5,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import zipfile
 from pathlib import Path
 
-from eventbreaker.models.consumer import ConsumerAnalysis
+from eventbreaker.models.consumer import ConsumerAnalysis, DependencyInfo
 from eventbreaker.models.observation import ObservationEntry, ObservationResult
 from eventbreaker.sandbox.executor import SandboxExecutor
 from eventbreaker.scenarios.models import ChaosScenario, TestConfig
@@ -48,6 +49,7 @@ _POM = """\
             <artifactId>jackson-databind</artifactId>
             <version>2.17.1</version>
         </dependency>
+CLASSPATH_DEPENDENCIES
     </dependencies>
 
     <build>
@@ -215,7 +217,426 @@ DEP_MAP_ENTRIES
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+_INSTANTIATE_HELPER = """\
+package eventbreaker.generated;
+
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import org.mockito.invocation.InvocationOnMock;
+import org.mockito.stubbing.Answer;
+import static org.mockito.Mockito.*;
+
+/**
+ * Real-classpath support: builds the consumer without knowing its constructor at
+ * generation time, and drives every fake through one name-based answer.
+ *
+ * Fakes are addressed by path: "dep.method" for a dependency call, and
+ * "dep.getA.getB" / "event.getA.getB" for objects returned from them.
+ * FAULTS and RETURNS are filled by the scenario before the consumer runs.
+ */
+public final class __EBInstantiate {
+
+    /** path -> THROW | THROW_ONCE | DELAY:<ms> */
+    public static final Map<String, String> FAULTS = new ConcurrentHashMap<>();
+    /** path -> spec string (true, 3, STRING:x, ENUM:X, NULL) or a Class to mock */
+    public static final Map<String, Object> RETURNS = new ConcurrentHashMap<>();
+    private static final Map<String, AtomicInteger> CALLS = new ConcurrentHashMap<>();
+
+    private __EBInstantiate() {}
+
+    /** Calls the constructor with the most parameters, passing a fake (or default) for each. */
+    public static <T> T create(Class<T> cls) throws Exception {
+        Constructor<?> best = null;
+        for (Constructor<?> c : cls.getDeclaredConstructors()) {
+            if (best == null || c.getParameterCount() > best.getParameterCount()) best = c;
+        }
+        best.setAccessible(true);
+        Class<?>[] types = best.getParameterTypes();
+        Object[] args = new Object[types.length];
+        for (int i = 0; i < types.length; i++) args[i] = valueFor(types[i], "ctor" + i);
+        return cls.cast(best.newInstance(args));
+    }
+
+    /**
+     * Calls the listener method by name — works for package-private classes and methods,
+     * which generated code in another package cannot reference directly.
+     */
+    public static void call(Object target, String method, Object... args) throws Exception {
+        for (Class<?> c = target.getClass(); c != null; c = c.getSuperclass()) {
+            for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
+                if (m.getName().equals(method) && m.getParameterCount() == args.length) {
+                    m.setAccessible(true);
+                    try {
+                        m.invoke(target, args);
+                        return;
+                    } catch (java.lang.reflect.InvocationTargetException e) {
+                        Throwable cause = e.getCause();
+                        if (cause instanceof Exception ex) throw ex;
+                        throw new RuntimeException(cause);
+                    }
+                }
+            }
+        }
+        throw new NoSuchMethodException(method + " with " + args.length + " argument(s)");
+    }
+
+    /** Replaces an instance field with the recorder mock; static fields (loggers, constants) are left alone. */
+    public static void inject(Object target, String field, Object value) throws Exception {
+        for (Class<?> c = target.getClass(); c != null; c = c.getSuperclass()) {
+            try {
+                Field f = c.getDeclaredField(field);
+                if (Modifier.isStatic(f.getModifiers())) return;
+                f.setAccessible(true);
+                f.set(target, value);
+                return;
+            } catch (NoSuchFieldException ignored) {
+                // keep walking up the hierarchy
+            }
+        }
+    }
+
+    /**
+     * Mock settings for a fake of type t at this path. Interfaces are faked without
+     * their annotations (copying them can need classes referenced only from annotation
+     * values, which the sandbox JAR leaves out); the inline mock maker rejects that
+     * setting for classes, which it instruments in place instead of copying.
+     */
+    public static org.mockito.MockSettings settings(Class<?> t, String path) {
+        org.mockito.MockSettings s = withSettings().defaultAnswer(answerFor(path));
+        return t.isInterface() ? s.withoutAnnotations() : s;
+    }
+
+    /** The default answer for the fake reachable at this path. */
+    public static Answer<Object> answerFor(String path) {
+        return inv -> answer(inv, path + "." + inv.getMethod().getName());
+    }
+
+    private static Object answer(InvocationOnMock inv, String path) throws Throwable {
+        String fault = FAULTS.get(path);
+        if (fault != null) {
+            int n = CALLS.computeIfAbsent(path, k -> new AtomicInteger()).incrementAndGet();
+            if (fault.equals("THROW") || (fault.equals("THROW_ONCE") && n == 1)) {
+                throw new RuntimeException("EventBreaker: " + fault + " on " + path);
+            }
+            if (fault.startsWith("DELAY:")) {
+                Thread.sleep(Long.parseLong(fault.substring(6)));
+            }
+        }
+        java.lang.reflect.Method m = inv.getMethod();
+        Class<?> rt = returnType(inv);
+        if (rt == void.class) return null;
+        if (RETURNS.containsKey(path)) return convert(RETURNS.get(path), rt, path);
+        if (rt == boolean.class || rt == Boolean.class) return true;
+        if (rt == int.class || rt == Integer.class) return 1;
+        if (rt == long.class || rt == Long.class) return 1L;
+        if (rt == double.class || rt == Double.class) return 1.0;
+        if (rt == float.class || rt == Float.class) return 1.0f;
+        if (rt == short.class || rt == Short.class) return (short) 1;
+        if (rt == byte.class || rt == Byte.class) return (byte) 1;
+        if (rt.isArray() && !rt.getComponentType().isPrimitive()) {
+            Object arr = java.lang.reflect.Array.newInstance(rt.getComponentType(), 1);
+            java.lang.reflect.Array.set(arr, 0, valueFor(rt.getComponentType(), path));
+            return arr;
+        }
+        if (rt == java.util.List.class || rt == java.util.Collection.class
+                || rt == Iterable.class || rt == java.util.Set.class) {
+            Object element = valueFor(elementType(inv), path);
+            java.util.List<Object> one = new java.util.ArrayList<>();
+            if (element != null) one.add(element);
+            return rt == java.util.Set.class ? new java.util.HashSet<>(one) : one;
+        }
+        if (rt == java.util.Optional.class) {
+            return java.util.Optional.ofNullable(valueFor(elementType(inv), path));
+        }
+        return valueFor(rt, path);
+    }
+
+    /**
+     * The most specific return type of the invoked method on the faked type.
+     * Mockito may report an inherited / bridge declaration (a covariant override in a
+     * sub-interface, or a generic JpaRepository method) whose erased type is just Object;
+     * returning an Object fake there fails the consumer's cast.
+     */
+    private static Class<?> returnType(InvocationOnMock inv) {
+        java.lang.reflect.Method m = inv.getMethod();
+        Class<?> best = m.getReturnType();
+        for (java.lang.reflect.Method c : inv.getMock().getClass().getMethods()) {
+            if (c.getName().equals(m.getName())
+                    && java.util.Arrays.equals(c.getParameterTypes(), m.getParameterTypes())
+                    && best.isAssignableFrom(c.getReturnType())) {
+                best = c.getReturnType();
+            }
+        }
+        // A type-variable return (bounded or not) is resolved against the faked type:
+        // JpaRepository<AppUser, Long>.getById(ID) -> AppUser; an entity extending
+        // AbstractPersistable<Long> has getId() declared as <ID extends Serializable> -> Long.
+        if (m.getGenericReturnType() instanceof java.lang.reflect.TypeVariable<?>) {
+            try {
+                Class<?> mocked = org.mockito.Mockito.mockingDetails(inv.getMock())
+                        .getMockCreationSettings().getTypeToMock();
+                Class<?> resolved = org.mockito.internal.util.reflection.GenericMetadataSupport
+                        .inferFrom(mocked).resolveGenericReturnType(m).rawType();
+                if (resolved != null && best.isAssignableFrom(resolved)) best = resolved;
+            } catch (RuntimeException ignored) {
+                // keep Object
+            }
+        }
+        return best;
+    }
+
+    private static Object convert(Object spec, Class<?> rt, String path) {
+        if (spec instanceof Class<?> c) return valueFor(c, path);
+        String s = (String) spec;
+        if (s.equals("NULL")) return null;
+        if (s.startsWith("STRING:")) return s.substring(7);
+        if (s.startsWith("ENUM:")) {
+            String name = s.substring(5);
+            for (Object c : rt.getEnumConstants()) if (((Enum<?>) c).name().equals(name)) return c;
+            throw new IllegalArgumentException("No constant " + name + " in " + rt.getName());
+        }
+        if (rt == boolean.class || rt == Boolean.class) return Boolean.parseBoolean(s);
+        if (rt == int.class || rt == Integer.class) return Integer.parseInt(s);
+        if (rt == long.class || rt == Long.class) return Long.parseLong(s);
+        if (rt == double.class || rt == Double.class) return Double.parseDouble(s);
+        if (rt == java.math.BigDecimal.class) return new java.math.BigDecimal(s);
+        return s;
+    }
+
+    /**
+     * Element type of a List/Set/Optional return, with type variables resolved against
+     * the faked type — e.g. CalendarRepository extends JpaRepository<Calendar, Long>:
+     * findById(...) returns Optional<T> with T = Calendar.
+     */
+    private static Class<?> elementType(InvocationOnMock inv) {
+        try {
+            Class<?> mocked = org.mockito.Mockito.mockingDetails(inv.getMock())
+                    .getMockCreationSettings().getTypeToMock();
+            var ret = org.mockito.internal.util.reflection.GenericMetadataSupport
+                    .inferFrom(mocked).resolveGenericReturnType(inv.getMethod());
+            for (java.lang.reflect.Type t : ret.actualTypeArguments().values()) {
+                if (t instanceof Class<?> c && c != Object.class) return c;
+                if (t instanceof java.lang.reflect.ParameterizedType pt) return (Class<?>) pt.getRawType();
+            }
+        } catch (RuntimeException ignored) {
+            // fall back to the declared generic type
+        }
+        return elementType(inv.getMethod().getGenericReturnType());
+    }
+
+    private static Class<?> elementType(java.lang.reflect.Type generic) {
+        if (generic instanceof java.lang.reflect.ParameterizedType pt) {
+            java.lang.reflect.Type arg = pt.getActualTypeArguments()[0];
+            if (arg instanceof Class<?> c) return c;
+            if (arg instanceof java.lang.reflect.ParameterizedType p2) return (Class<?>) p2.getRawType();
+        }
+        return Object.class;
+    }
+
+    private static Object valueFor(Class<?> t, String path) {
+        if (t == boolean.class) return false;
+        if (t == char.class) return (char) 0;
+        if (t == byte.class) return (byte) 0;
+        if (t == short.class) return (short) 0;
+        if (t == int.class) return 0;
+        if (t == long.class) return 0L;
+        if (t == float.class) return 0f;
+        if (t == double.class) return 0d;
+        if (t == String.class) return "";
+        if (t == java.util.UUID.class) return java.util.UUID.nameUUIDFromBytes(path.getBytes());
+        if (t.isEnum()) {
+            Object[] constants = t.getEnumConstants();
+            return constants.length > 0 ? constants[0] : null;
+        }
+        try {
+            return mock(t, settings(t, path));
+        } catch (RuntimeException e) {
+            return null;  // final / unmockable type
+        }
+    }
+}
+"""
+
+
+def _import_available(import_line: str, available: set[str]) -> bool:
+    """True if an import resolves to a JDK type or a class/package on the classpath."""
+    m = re.match(r"import\s+(static\s+)?([\w.]+?)(\.\*)?\s*;", import_line.strip())
+    if not m:
+        return True
+    name = m.group(2)
+    if name.startswith(("java.", "javax.", "jdk.")):
+        return True
+    parts = name.split(".")
+    # Class (or a static member / nested type of one): try successively shorter prefixes.
+    for i in range(len(parts), 0, -1):
+        if "/".join(parts[:i]) in available:
+            return True
+    return False
+
+
+def _class_index(classpath: list[Path]) -> set[str]:
+    """Every class ("a/b/C") and package ("a/b") available on the classpath."""
+    index: set[str] = set()
+    for jar in classpath:
+        if not jar.is_file():
+            continue
+        try:
+            with zipfile.ZipFile(jar) as z:
+                for n in z.namelist():
+                    if n.endswith(".class"):
+                        cls = n[:-6].replace("$", "/")
+                        index.add(cls)
+                        index.add(cls.rsplit("/", 1)[0])
+        except zipfile.BadZipFile:
+            continue
+    return index
+
+
+def _classpath_contains(classpath: list[Path], entry_name: str) -> bool:
+    for jar in classpath:
+        if jar.is_file():
+            try:
+                with zipfile.ZipFile(jar) as z:
+                    if entry_name in z.namelist():
+                        return True
+            except zipfile.BadZipFile:
+                continue
+    return False
+
+
+def _as_jar(entry: Path) -> Path:
+    """A classpath directory packed into a cached jar (rebuilt when its contents change)."""
+    if not entry.is_dir():
+        return entry
+    files = sorted(f for f in entry.rglob("*") if f.is_file())
+    stamp = hashlib.sha256(
+        "\0".join(f"{f.relative_to(entry)}:{f.stat().st_mtime_ns}" for f in files).encode()
+    ).hexdigest()[:12]
+    key = hashlib.sha256(str(entry.resolve()).encode()).hexdigest()[:12]
+    out = Path.home() / ".eventbreaker" / "cache" / "classpath-jars" / f"{key}-{stamp}.jar"
+    if not out.exists():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_suffix(".tmp")
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as jar:
+            for f in files:
+                jar.write(f, f.relative_to(entry).as_posix())
+        tmp.rename(out)
+    return out
+
+
+# Bump when _sandbox_jar's selection logic changes, so cached jars are rebuilt.
+_SANDBOX_JAR_VERSION = 2
+
+
+def _sandbox_jar(fat_jar: Path, classpath: list[Path], roots: tuple[str, ...] = ()) -> Path:
+    """Fat JAR + the classpath classes reachable from it (static closure via jdeps).
+
+    Reflection-only references are not seen by jdeps; the consumer's real code
+    paths are, because they are ordinary bytecode references.
+    """
+    # Name carries everything that changes the contents, so a cached jar is never stale.
+    key = hashlib.sha256(
+        f"{_SANDBOX_JAR_VERSION}\0{fat_jar.stat().st_mtime_ns}\0{','.join(roots)}".encode()
+    ).hexdigest()[:12]
+    out = fat_jar.with_name(f"eventbreaker-sandbox-{key}.jar")
+    if out.exists():
+        return out
+
+    # Classes loaded only by name are not reachable from the fat JAR's bytecode, so
+    # copy their class files (plus nested classes) next to it as extra jdeps targets.
+    roots_dir = Path(tempfile.mkdtemp(prefix="eb-roots-"))
+    prefixes = tuple(r.replace(".", "/") for r in roots)
+    for jar in classpath:
+        if not prefixes or not jar.is_file():
+            continue
+        with zipfile.ZipFile(jar) as src:
+            for name in src.namelist():
+                if name.endswith(".class") and any(
+                    name == f"{pre}.class" or name.startswith(f"{pre}$") for pre in prefixes
+                ):
+                    target = roots_dir / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(src.read(name))
+
+    scan = subprocess.run(
+        ["jdeps", "-verbose:class", "-R", "--multi-release", "21", "--ignore-missing-deps",
+         "-cp", os.pathsep.join(map(str, classpath)), str(fat_jar), str(roots_dir)],
+        capture_output=True, text=True,
+    )
+    shutil.rmtree(roots_dir, ignore_errors=True)
+    edges: dict[str, set[str]] = {}
+    for line in scan.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == "->" and line.startswith("   "):
+            edges.setdefault(parts[0], set()).add(parts[2])
+
+    with zipfile.ZipFile(fat_jar) as fat:
+        bundled = {
+            n[:-6].replace("/", ".") for n in fat.namelist() if n.endswith(".class")
+        }
+
+    # Walk from everything already in the fat JAR — plus classes the harness only
+    # loads by name (the consumer, via Class.forName) — to the classes they need.
+    needed: set[str] = {r for r in roots if r not in bundled}
+    frontier = list(bundled) + list(needed)
+    while frontier:
+        cls = frontier.pop()
+        for dep in edges.get(cls, ()):
+            if dep not in bundled and dep not in needed:
+                needed.add(dep)
+                frontier.append(dep)
+
+    wanted = {c.replace(".", "/") + ".class" for c in needed}
+    with zipfile.ZipFile(fat_jar) as fat, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
+        for item in fat.infolist():
+            dst.writestr(item, fat.read(item.filename))
+        written = set(fat.namelist())
+        for jar in classpath:
+            if not jar.is_file():
+                continue
+            with zipfile.ZipFile(jar) as src:
+                for name in src.namelist():
+                    if name in wanted and name not in written:
+                        dst.writestr(name, src.read(name))
+                        written.add(name)
+    return out
+
+
+def _classpath_dependencies(classpath: list[Path]) -> str:
+    """POM <dependency> entries for user-supplied classpath jars (system scope).
+
+    System scope = on the compile classpath, never shaded into the fat JAR.
+    The jars are put on the runtime classpath next to the JAR instead (see _run).
+    """
+    return "".join(
+        f"""        <dependency>
+            <groupId>eventbreaker.classpath</groupId>
+            <artifactId>cp{i}</artifactId>
+            <version>0</version>
+            <scope>system</scope>
+            <systemPath>{jar.resolve()}</systemPath>
+        </dependency>
+"""
+        for i, jar in enumerate(classpath)
+    )
+
+
 class ScenarioExecutor:
+    """Builds and runs one scenario harness per call.
+
+    classpath: the consumer project's dependency jars. When given, the consumer
+    compiles against its real types and no stub classes are generated; when
+    omitted, missing types are stubbed (works for self-contained consumers).
+    """
+
+    def __init__(self, classpath: list[Path] | None = None) -> None:
+        # Directories (e.g. Gradle build/classes of sibling modules) become jars:
+        # Maven system-scope dependencies and the sandbox bundler both need files.
+        self.classpath = [_as_jar(Path(p)) for p in classpath or []]
+        self._classes: set[str] | None = _class_index(self.classpath) if self.classpath else None
 
     def execute(
         self,
@@ -226,10 +647,17 @@ class ScenarioExecutor:
         # Use a stable cache directory keyed by a hash of the generated code.
         # Different scenarios (different testConfig) → different cache keys.
         execution_code = _generate_execution(
-            analysis, consumer_file, scenario.testConfig, scenario.scenarioType
+            analysis, consumer_file, scenario.testConfig, scenario.scenarioType,
+            real_types=bool(self.classpath), available_classes=self._classes,
         )
         cache_key = hashlib.sha256(
-            (execution_code + consumer_file.read_text(errors="replace")).encode()
+            (
+                execution_code
+                + consumer_file.read_text(errors="replace")
+                + "\0".join(str(p) for p in self.classpath)
+                # Support code compiled into the harness: a change must rebuild cached jars.
+                + (_INSTANTIATE_HELPER if self.classpath else "")
+            ).encode()
         ).hexdigest()[:16]
         cache_dir = Path.home() / ".eventbreaker" / "cache" / cache_key
         project_dir = cache_dir / "scenario"
@@ -242,8 +670,7 @@ class ScenarioExecutor:
         self._write_execution(
             project_dir, analysis, consumer_file, scenario.testConfig, scenario.scenarioType
         )
-        _generate_stubs(project_dir, analysis, consumer_file)
-        _generate_chain_stubs(project_dir, analysis, consumer_file)
+        self._generate_support(project_dir, analysis, consumer_file)
 
         result = self._run(
             project_dir, scenario, analysis, consumer_file, cached=_jar_exists(project_dir)
@@ -257,17 +684,31 @@ class ScenarioExecutor:
             self._write_execution(
                 project_dir, analysis, consumer_file, scenario.testConfig, scenario.scenarioType
             )
-            _generate_stubs(project_dir, analysis, consumer_file)
-            _generate_chain_stubs(project_dir, analysis, consumer_file)
+            self._generate_support(project_dir, analysis, consumer_file)
             result = self._run(project_dir, scenario, analysis, consumer_file, cached=False)
 
         return result
 
     # ── Project setup ─────────────────────────────────────────────────────────
 
+    def _generate_support(
+        self, project_dir: Path, analysis: ConsumerAnalysis, consumer_file: Path
+    ) -> None:
+        # With a real classpath every type the consumer uses exists: no stubs,
+        # only the reflective instantiation helper.
+        if self.classpath:
+            gen = project_dir / "src" / "main" / "java" / "eventbreaker" / "generated"
+            gen.mkdir(parents=True, exist_ok=True)
+            (gen / "__EBInstantiate.java").write_text(_INSTANTIATE_HELPER)
+            return
+        _generate_stubs(project_dir, analysis, consumer_file)
+        _generate_chain_stubs(project_dir, analysis, consumer_file)
+
     def _create_project(self, project_dir: Path, consumer_file: Path) -> None:
         project_dir.mkdir(parents=True)
-        (project_dir / "pom.xml").write_text(_POM)
+        (project_dir / "pom.xml").write_text(
+            _POM.replace("CLASSPATH_DEPENDENCIES\n", _classpath_dependencies(self.classpath))
+        )
 
         main_src = project_dir / "src" / "main" / "java"
         main_src.mkdir(parents=True)
@@ -281,7 +722,10 @@ class ScenarioExecutor:
         )
         mockito_ext.mkdir(parents=True)
         (mockito_ext / "org.mockito.plugins.MockMaker").write_text(
-            "mock-maker-subclass\n"
+            # Real classpath: real code uses final classes (value objects, records,
+            # Fineract's JsonCommand) that only the inline mock maker can fake. It
+            # self-attaches an agent at startup — verified to work in the sandbox JRE.
+            "mock-maker-inline\n" if self.classpath else "mock-maker-subclass\n"
         )
 
         maven_root = _find_maven_root(consumer_file)
@@ -294,6 +738,13 @@ class ScenarioExecutor:
                         dest = main_src / java_file.relative_to(origin_src)
                         dest.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(java_file, dest)
+
+        # Real classpath that already contains the compiled consumer: use it as
+        # built by the project (Lombok and other annotation processors applied).
+        pkg = _read_package(consumer_file) or ""
+        fqn_path = "/".join([*pkg.split("."), consumer_file.stem]) + ".class" if pkg else consumer_file.stem + ".class"
+        if self.classpath and _classpath_contains(self.classpath, fqn_path):
+            return
 
         # If the consumer file lives outside src/main/java (e.g. test resources),
         # copy it to the correct package directory in the temp project.
@@ -319,7 +770,10 @@ class ScenarioExecutor:
             / "eventbreaker" / "generated"
         )
         exec_dir.mkdir(parents=True, exist_ok=True)
-        code = _generate_execution(analysis, consumer_file, test_config, scenario_type)
+        code = _generate_execution(
+            analysis, consumer_file, test_config, scenario_type,
+            real_types=bool(self.classpath), available_classes=self._classes,
+        )
         (exec_dir / "EventBreakerExecution.java").write_text(code)
 
     # ── Build + run ───────────────────────────────────────────────────────────
@@ -357,7 +811,7 @@ class ScenarioExecutor:
                     or "actual and formal argument lists differ in length" in last_output
                     or "incompatible types" in last_output
                 )
-                if fixable and _patch_stubs_from_errors(project_dir, last_output, analysis, consumer_file):
+                if fixable and not self.classpath and _patch_stubs_from_errors(project_dir, last_output, analysis, consumer_file):
                     continue  # stubs were patched — retry
                 break  # genuine error, stop
 
@@ -375,7 +829,12 @@ class ScenarioExecutor:
 
         if os.environ.get("NEBIUS_PROJECT_ID"):
             try:
-                stdout, stderr = SandboxExecutor().execute(jar)
+                # One self-contained JAR: the fat JAR plus only the classpath
+                # classes it can reach (uploading every dependency jar times out).
+                pkg = _read_package(consumer_file)
+                consumer_fqn = f"{pkg}.{analysis.className}" if pkg else analysis.className
+                upload = _sandbox_jar(jar, self.classpath, (consumer_fqn,)) if self.classpath else jar
+                stdout, stderr = SandboxExecutor().execute(upload)
                 output = stdout + "\n" + stderr
             except (RuntimeError, EnvironmentError) as e:
                 return ObservationResult(
@@ -385,7 +844,8 @@ class ScenarioExecutor:
                 )
         else:
             run = subprocess.run(
-                ["java", "-jar", str(jar)],
+                ["java", "-cp", os.pathsep.join([str(jar), *map(str, self.classpath)]),
+                 "eventbreaker.generated.EventBreakerExecution"],
                 capture_output=True,
                 text=True,
                 cwd=project_dir,
@@ -402,7 +862,16 @@ def _generate_execution(
     consumer_file: Path,
     test_config: "TestConfig | None",
     scenario_type: str = "UNKNOWN",
+    real_types: bool = False,
+    available_classes: "set[str] | None" = None,
 ) -> str:
+    """Generate the harness main class.
+
+    real_types: the consumer compiles against its project's real classpath.
+    Recorder mocks then return mocks by default (no stub return types needed),
+    the consumer is built through its real constructor by reflection, and the
+    recorders are injected into its dependency fields afterwards.
+    """
     consumer_pkg = _read_package(consumer_file) or ""
     consumer_import = (
         f"import {consumer_pkg}.{analysis.className};"
@@ -411,6 +880,12 @@ def _generate_execution(
 
     # Start with whatever the consumer itself imports.
     consumer_imports = _read_imports(consumer_file)
+    if available_classes is not None:
+        # Real classpath: drop imports that only the compiled consumer needed
+        # (Lombok and other compile-only annotations are not on the runtime classpath).
+        consumer_imports = [
+            imp for imp in consumer_imports if _import_available(imp, available_classes)
+        ]
 
     # The generated class lives in eventbreaker.generated — it cannot see the
     # consumer's package implicitly. Any type that the consumer uses without an
@@ -445,11 +920,20 @@ def _generate_execution(
 
     extra_imports = "\n".join(consumer_imports + extra_pkg_imports)
 
+    # Real-types mode: listener parameters other than the event (e.g. Kafka's
+    # Acknowledgment) get recorder fakes too, so calls on them are observed.
+    extra_params, call_args = _listener_arguments(analysis) if real_types else ([], "event")
+    recorders = list(analysis.dependencies) + extra_params
+
     mock_decl_lines = ["        Map<String, Integer> threwCounts = new LinkedHashMap<>();"]
-    for d in analysis.dependencies:
+    for d in recorders:
         dtype = d.type.split("<")[0].strip()
+        settings = (
+            f'eventbreaker.generated.__EBInstantiate.settings({dtype}.class, "{d.name}")'
+            if real_types else "withSettings()"
+        )
         mock_decl_lines.append(
-            f"        {d.type} {d.name} = mock({dtype}.class, withSettings()\n"
+            f"        {d.type} {d.name} = mock({dtype}.class, {settings}\n"
             f'            .invocationListeners(report -> {{\n'
             f'                String __ebMn = ((org.mockito.invocation.Invocation) report.getInvocation()).getMethod().getName();\n'
             f'                callSequence.add("{d.name}." + __ebMn);\n'
@@ -553,6 +1037,11 @@ def _generate_execution(
                     f"        when({root}.{method}({matchers})).thenReturn(__ebChain);"
                 )
 
+    if real_types:
+        # Real return types + RETURNS_MOCKS: no return-value or chain stubs needed.
+        stubs_lines = []
+        chain_roots = {}
+
     stubs = "\n".join(stubs_lines)
 
     # Stub event method chains — must come AFTER 'event' is declared in the harness.
@@ -582,15 +1071,15 @@ def _generate_execution(
 
     dep_map_entries = "\n".join(
         f'        deps.put("{d.name}", {d.name});'
-        for d in analysis.dependencies
+        for d in recorders
     )
 
-    dep_names_csv = ", ".join(d.name for d in analysis.dependencies)
+    dep_names_csv = ", ".join(d.name for d in recorders)
     reset_invocations = (
         f"        threwCounts.clear();\n"
         f"        callSequence.clear();\n"
         f"        clearInvocations({dep_names_csv});"
-        if analysis.dependencies else
+        if recorders else
         "        threwCounts.clear();\n        callSequence.clear();"
     )
 
@@ -599,7 +1088,19 @@ def _generate_execution(
     # dependencies, use it directly.  Otherwise (e.g. Spring field injection),
     # create the consumer with its default no-arg constructor and inject fields
     # via reflection — this avoids a compile error on a non-existent constructor.
-    if _has_explicit_constructor(consumer_file, analysis.className):
+    if real_types:
+        # Object + Class.forName: the consumer class may be package-private.
+        fqn = f"{consumer_pkg}.{analysis.className}" if consumer_pkg else analysis.className
+        lines = [
+            f"        Object consumer = "
+            f'eventbreaker.generated.__EBInstantiate.create(Class.forName("{fqn}"));'
+        ]
+        lines += [
+            f'        eventbreaker.generated.__EBInstantiate.inject(consumer, "{d.name}", {d.name});'
+            for d in analysis.dependencies
+        ]
+        consumer_instantiation = "\n".join(lines)
+    elif _has_explicit_constructor(consumer_file, analysis.className):
         constructor_args = ", ".join(d.name for d in analysis.dependencies)
         consumer_instantiation = (
             f"        {analysis.className} consumer = "
@@ -619,23 +1120,31 @@ def _generate_execution(
             ]
         consumer_instantiation = "\n".join(lines)
 
-    fault_injections = _build_fault_injections(test_config, analysis) if test_config else ""
-    call_pattern = _build_call_pattern(analysis, test_config) if test_config else (
+    if real_types:
+        fault_injections = _build_named_faults(test_config, consumer_file) if test_config else ""
+    else:
+        fault_injections = _build_fault_injections(test_config, analysis) if test_config else ""
+    call_pattern = _build_call_pattern(analysis, test_config, call_args, real_types) if test_config else (
         f"        try {{\n"
-        f"            consumer.{analysis.methodName}(event);\n"
+        f"            {_consumer_call(analysis, call_args, real_types)};\n"
         f"        }} catch (Exception __eb_ex) {{\n"
-        f"            consumerThrew.set(true);\n"
+        f"            consumerThrew.set(true);\n            System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex);\n"
         f"        }}"
     )
 
     return (
         _EXECUTION_TEMPLATE
-        .replace("CONSUMER_IMPORT", consumer_import)
+        .replace("CONSUMER_IMPORT", "" if real_types else consumer_import)
         .replace("EXTRA_IMPORTS", extra_imports)
         .replace("MOCK_DECLARATIONS", mock_declarations)
         .replace("CHAIN_STUBS", event_stubs)
         .replace("STUBS", stubs)
         .replace("CONSUMER_INSTANTIATION", consumer_instantiation)
+        .replace(
+            "withSettings().defaultAnswer(EventBreakerExecution::eventAnswer)",
+            'eventbreaker.generated.__EBInstantiate.settings(EVENT_CLASS.class, "event")'
+            if real_types else "withSettings().defaultAnswer(EventBreakerExecution::eventAnswer)",
+        )
         .replace("EVENT_CLASS", analysis.eventType)
         .replace("DEP_MAP_ENTRIES", dep_map_entries)
         .replace("RESET_INVOCATIONS", reset_invocations)
@@ -685,6 +1194,73 @@ def _build_fault_injections(test_config: TestConfig, analysis: ConsumerAnalysis)
     return "\n".join(lines)
 
 
+def _listener_arguments(analysis: ConsumerAnalysis) -> tuple[list[DependencyInfo], str]:
+    """Recorder fakes for non-event listener parameters, and the call's argument list.
+
+    "(@Payload ContextualMessage msg, Acknowledgment ack)" → ([ack: Acknowledgment], "event, ack").
+    The event goes to the parameter whose type is the event type; every other
+    parameter gets a recorder named after it (prefixed if it clashes with a field).
+    """
+    taken = {d.name for d in analysis.dependencies} | {"event", "consumer", "deps"}
+    extra: list[DependencyInfo] = []
+    args: list[str] = []
+    event_used = False
+    for raw in analysis.parameters:
+        # Drop annotations (with their arguments) and modifiers; keep "Type name".
+        cleaned = re.sub(r"@[\w.]+(\([^)]*\))?", " ", raw).replace("final ", " ").split()
+        if len(cleaned) < 2:
+            continue
+        ptype, pname = " ".join(cleaned[:-1]), cleaned[-1]
+        if not event_used and ptype.split("<")[0].strip() == analysis.eventType.split("<")[0].strip():
+            args.append("event")
+            event_used = True
+            continue
+        name = pname if pname not in taken else f"param_{pname}"
+        taken.add(name)
+        extra.append(DependencyInfo(name=name, type=ptype))
+        args.append(name)
+    if not event_used:  # e.g. ConsumerRecord<K, V>: not yet supported, fall back
+        return [], "event"
+    return extra, ", ".join(args)
+
+
+def _build_named_faults(test_config: TestConfig, consumer_file: Path) -> str:
+    """Real-classpath mode: register faults and return values by path on __EBInstantiate.
+
+    Applied inside each fake's default answer, so no argument matchers are needed
+    and calls made from private helpers are covered too.
+    """
+    lines: list[str] = []
+    for fi in test_config.faultInjections:
+        spec = f"DELAY:{fi.delayMs or 500}" if fi.fault == "DELAY" else fi.fault
+        lines.append(
+            f'        eventbreaker.generated.__EBInstantiate.FAULTS.put("{fi.dep}.{fi.method}", "{spec}");'
+        )
+    for rv in test_config.returnValues:
+        target = rv.target.replace("()", "").replace("\\", "").replace('"', "")
+        if rv.returns.startswith("MOCK:"):
+            # Class literal: compile-checked against the consumer's imports/package.
+            value = f"{_qualify(rv.returns[5:].strip(), consumer_file)}.class"
+        else:
+            value = '"' + rv.returns.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        lines.append(
+            f'        eventbreaker.generated.__EBInstantiate.RETURNS.put("{target}", {value});'
+        )
+    return "\n".join(lines)
+
+
+def _qualify(type_name: str, consumer_file: Path) -> str:
+    """Fully-qualified name for a simple type name used by the consumer (imports, then its package)."""
+    if "." in type_name:
+        return type_name
+    for imp in _read_imports(consumer_file):
+        m = re.match(r"import\s+([\w.]+)\.(\w+)\s*;", imp)
+        if m and m.group(2) == type_name:
+            return f"{m.group(1)}.{type_name}"
+    pkg = _read_package(consumer_file)
+    return f"{pkg}.{type_name}" if pkg else type_name
+
+
 def _matcher_lists(analysis: ConsumerAnalysis, scope: str, method: str) -> list[str]:
     """Return one argument-matcher list per distinct arity of scope.method(...).
 
@@ -709,29 +1285,40 @@ def _matcher_lists(analysis: ConsumerAnalysis, scope: str, method: str) -> list[
     return [", ".join(["any()"] * n) for n in sorted(arities)]
 
 
-def _build_call_pattern(analysis: ConsumerAnalysis, test_config: TestConfig) -> str:
+def _consumer_call(analysis: ConsumerAnalysis, call_args: str, real_types: bool) -> str:
+    """The Java expression that invokes the listener method once."""
+    if real_types:
+        return (f'eventbreaker.generated.__EBInstantiate.call(consumer, "{analysis.methodName}", '
+                f"{call_args})")
+    return f"consumer.{analysis.methodName}({call_args})"
+
+
+def _build_call_pattern(
+    analysis: ConsumerAnalysis, test_config: TestConfig, call_args: str = "event",
+    real_types: bool = False,
+) -> str:
     """Build the consumer invocation block matching the requested callPattern."""
-    call = f"consumer.{analysis.methodName}(event)"
+    call = _consumer_call(analysis, call_args, real_types)
     if test_config.callPattern == "SINGLE":
         return (
             f"        try {{\n"
             f"            {call};\n"
             f"        }} catch (Exception __eb_ex) {{\n"
-            f"            consumerThrew.set(true);\n"
+            f"            consumerThrew.set(true);\n            System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex);\n"
             f"        }}"
         )
     if test_config.callPattern == "DUPLICATE":
         return (
-            f"        try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); }}\n"
-            f"        try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); }}"
+            f"        try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex); }}\n"
+            f"        try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex); }}"
         )
     if test_config.callPattern == "CONCURRENT":
         return (
             f"        Thread __eb_t1 = new Thread(() -> {{\n"
-            f"            try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); }}\n"
+            f"            try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex); }}\n"
             f"        }});\n"
             f"        Thread __eb_t2 = new Thread(() -> {{\n"
-            f"            try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); }}\n"
+            f"            try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex); }}\n"
             f"        }});\n"
             f"        __eb_t1.start(); __eb_t2.start();\n"
             f"        __eb_t1.join(); __eb_t2.join();"
@@ -762,6 +1349,11 @@ def _parse_output(output: str, scenario: ChaosScenario) -> ObservationResult:
                 rawOutput=output,
                 consumerThrew=data.get("consumerThrew", False),
                 callSequence=data.get("callSequence", []),
+                consumerException=next(
+                    (l.strip()[len("EB_CONSUMER_EXCEPTION "):] for l in output.splitlines()
+                     if l.strip().startswith("EB_CONSUMER_EXCEPTION ")),
+                    None,
+                ),
             )
 
     return ObservationResult(

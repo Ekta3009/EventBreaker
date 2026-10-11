@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 
 from openai import OpenAI
+
+from eventbreaker.agent import usage
 from pydantic import ValidationError
 
 from eventbreaker.models.consumer import ConsumerAnalysis
@@ -108,6 +110,7 @@ def identify_risks(
         temperature=0.2,
         max_tokens=8192,
     )
+    usage.record(_MODEL, getattr(response, "usage", None), "risk_identification")
 
     message = response.choices[0].message
     raw = message.content

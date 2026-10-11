@@ -40,30 +40,43 @@ Consumer.java
   Splits scenarios into: feasible (executor can run) vs theoretical (explain why not).
      │
      ▼
+[Agent 2: Path Setup — Nemotron Super 120B]   (real-classpath mode only)
+  Input:  source + scenario target call
+  Output: ReturnValue[] (true/false/number/STRING:/ENUM:/MOCK:<ConcreteType>/NULL)
+  What each fake must return so execution reaches the risky call (string checks, casts, guards).
+  If the fault-free baseline does not reach the target: ONE retry with feedback
+  (calls that happened + the exception that stopped it).
+     │
+     ▼
 [Executor — Parameter-driven Java Assembly]
-  Input:  ConsumerAnalysis + TestConfig
-  Output: Java harness that always compiles
-  dep/method names come from static analysis — no hallucination possible.
-  Fault injection and call pattern assembled from TestConfig vocabulary.
-  Runs in local JVM or Nebius Sandbox (ConTree SDK).
+  Real-classpath mode (`--classpath`, the product path): compiles against the project's real jars,
+  uses the project's own compiled consumer class, inline mock maker, reflective construct/inject/call
+  (package-private listeners), name-based faults + return values in the fakes' default answer,
+  generic return types resolved (JpaRepository<T,ID>, Optional<T>, entity getId()).
+  Stand-in mode (no classpath, legacy — to be removed in STEP 12): generated stub classes.
+  Every scenario runs next to a FAULT-FREE BASELINE of the same setup.
+  Runs in Nebius Sandbox (one minimized JAR: fat JAR + jdeps-reachable classpath classes) or local JVM.
      │
      ▼
 [Observations]
-  Per dep.method: call count + threw
-  Call sequence (ordering)
-  consumerThrew (swallowing detection)
+  Per dep.method: call count + threw; call sequence; consumerThrew + exception;
+  notReached (target never called → status NOT_REACHED, never diagnosed)
      │
      ▼
-[Agent 2: Diagnostician — Nemotron Super 120B]
-  Input:  risk description + richer observations
-  Output: ReliabilityFinding[] grounded in evidence
-  Returns [] early if no anomaly signal (no speculative findings).
+[Agent 3: Diagnostician — Nemotron Super 120B]
+  Input:  source + scenario + observations DIFFED AGAINST THE BASELINE (missing / extra calls)
+  Output: ReliabilityFinding[] with severity + kind (failure | repeated | other)
+  Duplicate/concurrent scenarios get explicit "repetition alone is not a problem" guidance.
+  Findings merged per (method, kind).
      │
      ▼
-[Report — Terminal + eventbreaker-report.md]
+[Report — terminal + eventbreaker-reports/<Class>.<method>-<timestamp>.md]
+  What we did, path setup, consumer outcome, without-fault vs this-scenario table, NOT REACHED notes.
 ```
 
-**LLM:** Nemotron Ultra (risk ID) + Nemotron Super (diagnosis) via Nebius Token Factory
+**LLM:** Nemotron Ultra (risk ID) + Nemotron Super (path setup, diagnosis) via Nebius Token Factory.
+Ultra risk-ID and Super path-setup responses are cached (`~/.eventbreaker/cache/`), `--fresh` re-asks.
+Every call is logged with tokens + estimated cost in `~/.eventbreaker/usage.csv`.
 **Sandbox:** Nebius ConTree SDK — `alpine:3.20` + `openjdk21-jre-headless`
 **Env vars:** `NEBIUS_API_KEY` (required), `NEBIUS_PROJECT_ID` (optional, enables sandbox)
 
@@ -611,105 +624,123 @@ Live 16-consumer run deliberately skipped (API budget) — covered by STEP 10 C2
 
 ---
 
-### [ ] STEP 10 — Real-world consumer validation
+### [x] STEP 10 — Real-world consumer validation (first pass)
 
-**Goal:** prove EventBreaker works on consumers we did not write. Judges will ask
-"does this work on real code?" — this step produces the answer, with numbers.
+**Done 2026-10-11.** Details: `src/test/resources/real-world/` → `SOURCES.md`, `EXPECTED.md` (written before
+running), `INVENTORY.md` (runs 1–5, every failure and fix). Real products only (no course/demo repos),
+English, Apache/MIT/EPL/BSD. User does all git; GitHub token is in `.env` (revoke after use).
 
-**Principle — measure before fixing.** Do not speculatively fix every gap listed
-below. Collect real consumers first, run them unmodified, and build a failure
-inventory. Only then fix — in one pass, ordered by how many consumers each fix
-unblocks. This avoids reworking the analyzer/executor multiple times.
+**Results — 9 listener methods from 2 products, 8 end to end in the Nebius sandbox:**
 
-**Principle — files stay unmodified.** Real-world files are copied byte-for-byte
-(plus a source/license header comment). Any adaptation (stripping framework
-annotations, etc.) happens inside the tool, never by hand-editing the file.
-If we hand-edit, the result does not count as "real-world".
-
-#### Known gaps (from reading `ConsumerAnalyzer.java` + `executor.py`, 2026-10-10)
-
-Expected to break on real code — confirm with the inventory before fixing:
-
-| # | Gap | Where | Real-world trigger |
+| Product | Listener | Status | Expected risks |
 |---|---|---|---|
-| G1 | Only `@EventBreakerConsumer` recognised | `ConsumerAnalyzer.isConsumerMethod` | `@KafkaListener`, `@RabbitListener`, `@JmsListener`, `@SqsListener`, `@StreamListener`, `@EventListener` |
-| G2 | `eventType` read from annotation string | `ConsumerAnalyzer.extractEventType` | Real listeners have no such attr — derive from parameter type; unwrap `ConsumerRecord<K,V>`, `Message<T>`, `List<T>` (batch) |
-| G3 | Every field becomes a dependency | `ConsumerAnalyzer.extractDependencies` | `static final Logger log`, constants, `ObjectMapper`, `@Value String topic` — pollutes mocks + constructor args |
-| G4 | Harness calls `consumer.m(event)` with 1 arg | `executor._build_call_pattern` | `(@Payload T, @Header String key, Acknowledgment ack)` |
-| G5 | Only first listener method analysed | `ConsumerAnalyzer.analyze` | Classes with several `@KafkaListener` methods |
-| G6 | Framework annotations/imports don't compile | stub generation | `@Service`, `@KafkaListener`, `@Slf4j`, `@Transactional` — not on classpath, not stubbed |
-| G7 | Lombok | consumer instantiation | `@RequiredArgsConstructor` + `final` fields (no constructor in source → won't compile); `@Slf4j` → `log` field doesn't exist |
-| G8 | Dep calls inside private helpers invisible | analysis scope = listener method only | `handle(e) { validate(e); process(e); }` — feasibility check rejects faults on helper-only calls |
-| G9 | Thin listeners | — | `listener → orderService.handle(event)` — only one dep call, little to test. **Selection criterion, not a fix.** |
-| G10 | Collection returns are empty → loop bodies never run | `_COLLECTION_STUB_VALUES` | `for (f : friendService.getFriends(id)) { ws.send(f) }` (ruoyi AdminUserProfileUpdateConsumer) |
-| G11 | Dep calls inside lambdas passed to static utils never execute | stubs | `TenantUtils.execute(id, () -> { deviceService... })` (ruoyi IotDeviceMessageSubscriber) |
-| G12 | Listener found by interface, not annotation | analyzer | `implements ApplicationListener<E>` (fineract BulkImportEventListener), custom bus interfaces |
+| Kill Bill 0.25.4 | `OverdueListener.handlePaymentInfoEvent` | ✅ full CLI, sandbox | K1 ✅, K3 ✅ (over-rated), K4 ✅ (over-rated), K2 ❌ (needs checked exception type) |
+| Kill Bill | `OverdueListener.handleTagInsert` | ⚠ proven by hand-run proof only | — (re-run through CLI in STEP 13) |
+| Fineract 1.15.0 | `KafkaRemoteMessageListener.onMessage` | ✅ | F1 ✅ F2 ✅ F3 ✅, F4 ❌ |
+| Fineract | `LoginAttemptEventListener.onAuthenticationFailure` | ✅ | L1 ✅ (security: lockout counter lost update) |
+| Fineract | `LoginAttemptEventListener.onAuthenticationSuccess` | ✅ | correctly no finding |
+| Fineract | `NoteListener.onCreate/onUpdate/onDelete` | ✅ | N1 ✅ (over-rated); Ultra flagged update/delete calling createNote; N2 (class-level) ❌ — needs cross-method analysis (G16) |
+| Fineract | `LegacyMeetingAttendanceListener.onUpdate` | ✅ 2/3 (1 NOT REACHED) | M1 ✅ (meeting create race) |
 
-#### Phase A — Source selection (no code changes)
+**Score: 11 / 14 expected risks found.** Cost of all real-world work: ~$0.55 measured.
 
-- [ ] **A1. Shortlist 8–10 candidate consumers** from public repos. Criteria:
-  - Permissive license (Apache-2.0 / MIT) — record license per file
-  - Reputable / recognisable source (Spring samples, Eventuate, Confluent examples, well-starred demo shops)
-  - Listener does real work: **≥2 side-effecting dep calls in the listener body** (G9 — skip thin listeners)
-  - Spread across frameworks: Kafka, RabbitMQ, at least one other (JMS/SQS/Spring events)
-  - At least one with a known reliability smell (no idempotency, dual write, swallowed exception)
-- [x] **A2. Pick final 4–6**, maximising framework + pattern variety.
-  Picked (2026-10-10), one distinct insight each: fineract `KafkaRemoteMessageListener` (swallow + ack),
-  ruoyi `AdminUserProfileUpdateConsumer` (@TransactionalEventListener + @Async, per-item swallow),
-  ddd-library `SheetsReadModel` (negative control), killbill `OverdueListener` (@AllowConcurrentEvents),
-  mall `CancelOrderReceiver` (class-level @RabbitListener + @RabbitHandler, thin). fineract
-  `BulkImportEventListener` dropped (overlaps #1) — so G12 is not covered by this set.
-- [ ] **A3. Copy into `src/test/resources/real-world/<repo-name>/`**, unmodified, with header:
-  `// Source: <url @ commit sha>  License: <license>`. Add `real-world/SOURCES.md` table.
-- [ ] **A4. Write expected risks BEFORE running the tool** — `real-world/EXPECTED.md`,
-  one section per consumer: hand-identified risks (type + dep.method + one-line reason).
-  This is the ground truth used for scoring in Phase D.
+**How it got there (all general fixes, see INVENTORY.md):** analyzer — real listener annotations,
+`--method`, event type from parameter, static fields not deps, same-class helper calls inlined, Java 21
+parser level, lifecycle hooks skipped, `--scan` mode; executor — `--classpath` real-types mode, project's own
+compiled consumer class (Lombok etc. already applied), extra listener params as recorders (Kafka
+`Acknowledgment`), inline mock maker (final classes), interfaces faked `withoutAnnotations`, reflective
+create/inject/call (package-private), generic return-type resolution, minimized sandbox JAR via jdeps
+(+ consumer as root), SDK transport timeout 120s, content-keyed caches; agents — Super path setup + 1 retry
+with feedback, baseline diff in diagnosis, kind-aware merge, duplicate guidance; CLI — `scan`, usage log,
+timestamped reports, NOT REACHED status.
 
-#### Phase B — Failure inventory (no code changes)
+**Classpaths (in `~/eb-classpaths/`):** `killbill-0.25.4.txt` (Maven Central, `killbill-0.25.4.pom.xml`);
+`fineract-1.15.0.txt` (Gradle build of `~/fineract-1.15.0` source archive via `print-classpath.init.gradle`;
+Fineract is not on Maven Central; develop needs Java 25, 1.15.0 needs 21).
 
-- [ ] **B1. Run every real-world consumer through the pipeline as-is.**
-- [ ] **B2. Record per consumer, per stage** (analyze / risk ID / feasibility / build / run / diagnose):
-  pass or the exact failure → `real-world/INVENTORY.md`. Map each failure to a gap (G1–G9) or a new G#.
-- [ ] **B3. Rank gaps** by number of consumers each blocks. Decide fix vs documented limitation
-  (confirm with user before implementing — see working rules).
-
-#### Phase C — Fix in one pass
-
-Expected shape (finalise after B3):
-- Analyzer: recognise listener annotations (G1), derive event type from param type with wrapper
-  unwrapping (G2), skip `static`/constant/logger fields (G3), `--method` option or analyse all
-  listener methods (G5), optionally inline same-class private helper calls (G8).
-- Executor: pass mocks for extra listener params (G4), strip framework annotations from the
-  copied consumer + inject `log` field / synthesise constructor for Lombok (G6, G7).
-- [ ] **C1. Implement agreed fixes.**
-- [ ] **C2. Regression: all 16 synthetic consumers still pass** (same checks as STEP 8).
-  Run `.venv/bin/python -m pytest` after every fix (offline, ~4s) before the full pipeline run.
-
-#### Phase D — Score + results
-
-- [ ] **D1. Re-run all real-world consumers.** Every run REPRODUCED or THEORETICAL with a reason — never ERROR
-  (or ERROR documented as a known limitation in INVENTORY.md).
-- [ ] **D2. Score against EXPECTED.md:** per consumer — expected risks found / missed / extra findings
-  (extras reviewed by hand: valid or false positive).
-- [ ] **D3. Write `real-world/RESULTS.md`** — the table used in README + demo:
-  "N consumers from M open-source repos, X/Y expected risks reproduced, Z new valid findings, K false positives."
-- [ ] **D4. Pick the demo consumer** — the real-world one with the clearest, most visual finding.
-
-**Done when:** RESULTS.md exists with honest numbers, no unexplained ERRORs, synthetic suite still green.
+**Known open issues (carried into steps below):** severity one notch high on duplicate/concurrent and
+in-process (Spring) events; several findings per root cause (e.g. the read that threw + the lost write);
+a fault hits every call of a method (can't fail only the Nth); THROW is always RuntimeException (K2);
+per-method analysis misses class-level bugs (G16); path-setup retry reuses a cached answer when its
+prompt is identical.
 
 ---
 
-### [ ] STEP 11 — Demo polish + submission prep
+### [ ] STEP 10b — Quick wins + bookkeeping (Oct 12)
 
-1. Capture terminal screenshots of full pipeline on OrderConsumer
-2. Record 3-minute demo video:
-   - 0:00–0:30 — problem statement (duplicate payment bug)
-   - 0:30–1:30 — full pipeline run on OrderConsumer (live terminal)
-   - 1:30–2:30 — run on a real-world open-source consumer (picked in STEP 10 D4)
-   - 2:30–3:00 — Nebius Token Factory + Nemotron model tier callouts
-3. Verify no secrets in repo: `git log --all -S "NEBIUS" --oneline`
-4. Test clean install from scratch: `rm -rf ~/.eventbreaker .venv && python -m venv .venv && ...`
-5. Push final code, add open-source license (MIT), verify README renders on GitHub
+- [ ] Path setup: before asking Super, **reuse a setup from another scenario whose baseline already reached
+  this scenario's target** (fixes Legacy scenario 1); don't cache a retry answer that didn't help.
+- [ ] Re-run `LegacyMeetingAttendanceListener` and Kill Bill `handleTagInsert` through the CLI.
+- [ ] INVENTORY.md run 6 (Fineract scan) + per-listener score table; keep EXPECTED.md untouched except notes.
+- [ ] User commits today's work (see session notes for the file list).
+
+**Test:** `.venv/bin/python -m pytest` green; Legacy 3/3 reached.
+
+---
+
+### [ ] STEP 11 — "Run it in your repo" (Oct 13–15)
+
+Goal: a Fineract/Kill Bill developer runs `eventbreaker analyze <Listener.java>` (or `scan .`) inside their
+own checkout with **no `--classpath` flag** and gets a report in `<repo>/eventbreaker-reports/`.
+
+- [ ] **Auto classpath:** walk up from the listener to its module; `pom.xml` → `mvn -q dependency:build-classpath`
+  (+ `target/classes`); `build.gradle(.kts)` → bundled init script (`ebClasspath` task, as in
+  `~/eb-classpaths/print-classpath.init.gradle`). Cache per module keyed by build-file mtimes. `scan` resolves
+  a classpath per module. Clear message if the module isn't built ("run ./gradlew classes / mvn compile first").
+- [ ] `--classpath` stays as an override.
+- [ ] **Packaging:** `pipx install` works; analyzer JAR shipped as package data (bridge must not assume our
+  repo layout); `eventbreaker --version`.
+- [ ] Docs: one-paragraph "run it in your repo" in README.
+
+**Test:** from `~/fineract-1.15.0`: `eventbreaker scan . --only LoginAttemptEventListener.onAuthenticationFailure`
+with no classpath flag; same for a Kill Bill module (requires a Kill Bill checkout that builds — use release jars
+if source build stays broken).
+
+---
+
+### [ ] STEP 12 — Cleanup: remove stand-in mode (after STEP 11)
+
+Decided 2026-10-11 (option 2): once auto-classpath works, real-classpath is the only mode.
+- [ ] Delete stand-in code in `executor.py` (`_generate_stubs`, `_stub_source`, `_generate_chain_stubs`,
+  `_retype_to_chain`, `_analyze_chains`, `_patch_stubs_from_errors`, return-type guessing, `__EBChain`,
+  subclass mock maker, non-real_types branches) — ~530 lines.
+- [ ] Delete `src/test/resources/consumers/` (16 synthetic), `src/main/java/com/eventbreaker/{consumer,event,model,service}`
+  (`@EventBreakerConsumer` + Order sample classes), `@EventBreakerConsumer` support in the analyzer
+  (keep listener detection for real annotations), tests that only cover stand-in mode.
+- [ ] Regression suite = real-world listeners (Fineract 7 + Kill Bill) via `scan`; keep offline pytest.
+
+**Test:** pytest + Java tests green; Fineract + Kill Bill scan results unchanged.
+
+---
+
+### [ ] STEP 13 — Accuracy (Oct 16–17)
+
+- [ ] Severity calibration: in-process events (Spring `@EventListener`) have no redelivery → duplicate risks LOW
+  unless money/messages; duplicate of recompute/refresh work LOW; tell diagnosis the transport.
+- [ ] One finding per root cause per scenario (the swallowed failure), not one per affected call.
+- [ ] Optional: THROW with a declared checked exception type (K2); fail only the Nth call (parent insert).
+- [ ] Stability: run Fineract + Kill Bill 2× each, findings must match.
+
+---
+
+### [ ] STEP 14 — Breadth (Oct 18–20)
+
+- [ ] Kill Bill: remaining 17 listeners via `scan` (InvoiceListener ×6, PaymentBusEventHandler, BeatrixListener…)
+  — write EXPECTED first for the ones we score.
+- [ ] Eclipse hawkbit `AmqpMessageHandlerService` (RabbitMQ, EPL-2.0) — user clones; EXPECTED first.
+- [ ] If time: Apereo CAS `RegisteredServiceKafkaDistributedCacheListener` (Kafka) or DHIS2 `ApiAuditConsumer` (JMS).
+  GitHub search results: scratchpad (8 product repos of 1,598; only CAS / DHIS2 / KIE real products).
+
+---
+
+### [ ] STEP 15 — Results + submission (Oct 21–30)
+
+- [ ] `real-world/RESULTS.md`: "N listeners, M products, X/Y expected risks, Z valid extras, K false positives".
+- [ ] Demo consumer: Fineract `KafkaRemoteMessageListener` (ack after failure) or `LoginAttemptEventListener` (lockout race).
+- [ ] README (what / how / run it in your repo / results / Nebius sandbox + Nemotron roles), MIT license.
+- [ ] 3-minute video: problem → `scan` on Fineract → report evidence → sandbox + Nemotron callouts.
+- [ ] Secrets check (`git log --all -S "NEBIUS"`, `.env` ignored), clean install test, push.
+- [ ] Buffer Oct 28–30. **Submit before Oct 30, 10:00 AM PDT.**
 
 ---
 
@@ -717,16 +748,18 @@ Expected shape (finalise after B3):
 
 | File | Purpose |
 |---|---|
-| `eventbreaker/scenarios/executor.py` | Harness generation, Maven build, execution |
-| `eventbreaker/agent/nemotron.py` | Nemotron Ultra risk identification + TestConfig |
-| `eventbreaker/scenarios/models.py` | ChaosScenario, TestConfig, FaultInjection |
+| `eventbreaker/cli/main.py` | CLI: `analyze` (+ `--method`, `--classpath`, `--fresh`), `scan` (+ `--all`, `--only`) |
+| `eventbreaker/agent/nemotron.py` | Nemotron Ultra risk identification + TestConfig (cached) |
+| `eventbreaker/agent/path_setup.py` | Nemotron Super path setup (returnValues), reachability, retry feedback |
+| `eventbreaker/agent/usage.py` | Token/cost log → `~/.eventbreaker/usage.csv` |
+| `eventbreaker/diagnosis/analyzer.py` | Nemotron Super diagnosis, baseline diff, kind-aware merge |
+| `eventbreaker/scenarios/executor.py` | Harness generation (`__EBInstantiate` helper), Maven build, sandbox JAR, execution |
+| `eventbreaker/scenarios/models.py` | ChaosScenario, TestConfig, FaultInjection, ReturnValue |
 | `eventbreaker/scenarios/experiment.py` | Pure Python feasibility validator |
-| `eventbreaker/cli/main.py` | 6-step pipeline CLI |
-| `eventbreaker/diagnosis/analyzer.py` | Nemotron Super diagnosis |
-| `eventbreaker/analyzer/bridge.py` | Java JAR → Python bridge |
-| `eventbreaker/report/reporter.py` | Markdown report generator |
-| `eventbreaker/models/consumer.py` | ConsumerAnalysis Pydantic models |
-| `eventbreaker/models/observation.py` | ObservationEntry, ObservationResult, ReliabilityFinding |
-| `target/eventbreaker-analyzer.jar` | Java static analyzer fat JAR |
-| `src/test/resources/consumers/` | 12 example consumers |
-| `/tmp/test_testconfig.py` | TestConfig prompt validation script — keep this |
+| `eventbreaker/sandbox/executor.py` | Nebius ConTree sandbox run (transport timeout 120s) |
+| `eventbreaker/analyzer/bridge.py` | Java JAR → Python bridge (`analyze`, `scan`) |
+| `eventbreaker/report/reporter.py` | Markdown report (timestamped, never overwritten) |
+| `src/main/java/com/eventbreaker/analyzer/` | Static analyzer (listener detection, helper inlining, scan) |
+| `src/test/resources/real-world/` | Real-world consumers + SOURCES / EXPECTED / INVENTORY |
+| `src/test/resources/consumers/` | 16 synthetic consumers (stand-in mode — removed in STEP 12) |
+| `~/eb-classpaths/` | Classpath files + Gradle init script (outside repo) |

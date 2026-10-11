@@ -6,39 +6,157 @@ import com.eventbreaker.analyzer.model.DependencyInfo;
 import com.eventbreaker.analyzer.model.MethodCallInfo;
 import com.eventbreaker.analyzer.model.ObjectCreationInfo;
 import com.eventbreaker.analyzer.model.VariableInitializationInfo;
+import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.body.VariableDeclarator;
+import com.github.javaparser.ast.expr.AnnotationExpr;
 import com.github.javaparser.ast.expr.AssignExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.ObjectCreationExpr;
+import com.github.javaparser.ast.type.ClassOrInterfaceType;
+import com.github.javaparser.ast.type.Type;
 
+import com.eventbreaker.analyzer.model.ListenerInfo;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.stream.Stream;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Set;
 
 public class ConsumerAnalyzer {
 
+    static {
+        // Real code uses modern syntax (pattern matching, records, switch expressions);
+        // JavaParser's default language level rejects it.
+        StaticJavaParser.getParserConfiguration()
+                .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_21);
+    }
+
+    // Method-level annotations that mark an event listener (matched by simple name).
+    private static final Set<String> LISTENER_ANNOTATIONS = Set.of(
+            "EventBreakerConsumer",
+            "KafkaListener",
+            "RabbitListener",
+            "RabbitHandler",
+            "JmsListener",
+            "SqsListener",
+            "StreamListener",
+            "EventListener",
+            "TransactionalEventListener",
+            "Subscribe"
+    );
+
+    // Listener parameters supplied by the messaging framework, never the event itself.
+    private static final Set<String> FRAMEWORK_PARAM_TYPES = Set.of(
+            "Acknowledgment",
+            "Channel",
+            "MessageHeaders",
+            "Headers",
+            "Consumer"
+    );
+
+    // Envelope types whose last type argument is the event payload.
+    private static final Set<String> WRAPPER_TYPES = Set.of(
+            "ConsumerRecord",
+            "Message"
+    );
+
     public ConsumerAnalysis analyze(Path sourceFile) throws Exception {
+        return analyze(sourceFile, null);
+    }
+
+    /**
+     * Every listener method under root (test sources skipped). Files that do not
+     * parse are skipped too — a scan must not fail because of one odd file.
+     */
+    public List<ListenerInfo> scan(Path root) throws IOException {
+
+        List<ListenerInfo> found = new ArrayList<>();
+        List<Path> files;
+        try (Stream<Path> walk = Files.walk(root)) {
+            files = walk
+                    .filter(p -> p.toString().endsWith(".java"))
+                    .filter(p -> !p.toString().contains("/src/test/"))
+                    .filter(p -> !p.toString().contains("/build/") && !p.toString().contains("/target/"))
+                    .sorted()
+                    .toList();
+        }
+        for (Path file : files) {
+            CompilationUnit cu;
+            try {
+                cu = StaticJavaParser.parse(file);
+            } catch (Exception | StackOverflowError e) {
+                continue;
+            }
+            for (MethodDeclaration method : cu.findAll(MethodDeclaration.class)) {
+                if (!isConsumerMethod(method)) {
+                    continue;
+                }
+                String className = method.findAncestor(ClassOrInterfaceDeclaration.class)
+                        .map(ClassOrInterfaceDeclaration::getNameAsString)
+                        .orElse("?");
+                String eventType;
+                try {
+                    eventType = extractEventType(method);
+                } catch (RuntimeException e) {
+                    continue;  // no event parameter: a lifecycle hook (e.g. onStartup), not a consumer
+                }
+                found.add(new ListenerInfo(file.toString(), className, method.getNameAsString(), eventType));
+            }
+        }
+        return found;
+    }
+
+    public ConsumerAnalysis analyze(Path sourceFile, String methodName) throws Exception {
 
         CompilationUnit cu = StaticJavaParser.parse(sourceFile);
 
         List<DependencyInfo> dependencies =
                 extractDependencies(cu);
 
-        MethodDeclaration consumerMethod =
+        List<MethodDeclaration> listenerMethods =
                 cu.findAll(MethodDeclaration.class)
                         .stream()
                         .filter(this::isConsumerMethod)
-                        .findFirst()
-                        .orElseThrow(() ->
-                                new IllegalArgumentException(
-                                        "No @EventBreakerConsumer method found"
-                                )
-                        );
+                        .toList();
+
+        if (listenerMethods.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "No listener method found (looked for @"
+                            + String.join(", @", LISTENER_ANNOTATIONS.stream().sorted().toList())
+                            + ")"
+            );
+        }
+
+        MethodDeclaration consumerMethod =
+                methodName == null
+                        ? listenerMethods.get(0)
+                        : listenerMethods.stream()
+                                .filter(m -> m.getNameAsString().equals(methodName))
+                                .findFirst()
+                                .orElseThrow(() ->
+                                        new IllegalArgumentException(
+                                                "No listener method named '" + methodName
+                                                        + "'. Listener methods: "
+                                                        + listenerNames(listenerMethods)
+                                        )
+                                );
+
+        List<String> otherListenerMethods =
+                listenerMethods.stream()
+                        .filter(m -> m != consumerMethod)
+                        .map(MethodDeclaration::getNameAsString)
+                        .distinct()
+                        .toList();
 
         String className =
                 consumerMethod
@@ -73,17 +191,84 @@ public class ConsumerAnalyzer {
                 methodCalls,
                 objectCreations,
                 assignments,
-                variableInitializations
+                variableInitializations,
+                otherListenerMethods
         );
+    }
+
+    private static List<String> listenerNames(List<MethodDeclaration> methods) {
+        return methods.stream()
+                .map(MethodDeclaration::getNameAsString)
+                .distinct()
+                .toList();
     }
 
     private boolean isConsumerMethod(MethodDeclaration method) {
 
-        return method.getAnnotationByName("EventBreakerConsumer")
-                .isPresent();
+        return method.getAnnotations()
+                .stream()
+                .anyMatch(a -> LISTENER_ANNOTATIONS.contains(simpleName(a)));
+    }
+
+    private static String simpleName(AnnotationExpr annotation) {
+        return annotation.getName().getIdentifier();
     }
 
     private String extractEventType(MethodDeclaration method) {
+
+        if (method.getAnnotationByName("EventBreakerConsumer").isPresent()) {
+            return extractEventBreakerEventType(method);
+        }
+
+        // Real listeners: the event is the @Payload parameter, else the first
+        // parameter that is not framework-supplied (ack, channel, @Header ...).
+        Parameter eventParam =
+                method.getParameters()
+                        .stream()
+                        .filter(p -> p.getAnnotationByName("Payload").isPresent())
+                        .findFirst()
+                        .or(() -> method.getParameters()
+                                .stream()
+                                .filter(p -> !isFrameworkParam(p))
+                                .findFirst())
+                        .orElseThrow(() ->
+                                new IllegalArgumentException(
+                                        "Listener method " + method.getNameAsString()
+                                                + " has no event parameter"
+                                )
+                        );
+
+        return unwrapPayloadType(eventParam.getType());
+    }
+
+    private boolean isFrameworkParam(Parameter param) {
+
+        if (param.getAnnotationByName("Header").isPresent()
+                || param.getAnnotationByName("Headers").isPresent()) {
+            return true;
+        }
+        Type type = param.getType();
+        String name = type.isClassOrInterfaceType()
+                ? type.asClassOrInterfaceType().getNameAsString()
+                : type.asString();
+        return FRAMEWORK_PARAM_TYPES.contains(name);
+    }
+
+    private String unwrapPayloadType(Type type) {
+
+        if (type.isClassOrInterfaceType()) {
+            ClassOrInterfaceType cls = type.asClassOrInterfaceType();
+            if (WRAPPER_TYPES.contains(cls.getNameAsString())) {
+                var args = cls.getTypeArguments().orElse(null);
+                if (args != null && !args.isEmpty()) {
+                    return unwrapPayloadType(args.get(args.size() - 1));
+                }
+            }
+        }
+        return type.asString();
+    }
+
+    private String extractEventBreakerEventType(MethodDeclaration method) {
 
         return method.getAnnotationByName("EventBreakerConsumer")
                 .orElseThrow()
@@ -114,6 +299,9 @@ public class ConsumerAnalyzer {
                 new ArrayList<>();
 
         cu.findAll(FieldDeclaration.class)
+                .stream()
+                // Static fields (loggers, constants, caches) are never injected dependencies.
+                .filter(field -> !field.isStatic())
                 .forEach(field -> {
 
                     String type =
@@ -137,11 +325,56 @@ public class ConsumerAnalyzer {
             MethodDeclaration method
     ) {
 
-        return method.findAll(MethodCallExpr.class)
-                .stream()
-                .filter(this::isTopLevelMethodCall)
-                .map(this::createMethodCallInfo)
-                .toList();
+        Set<MethodDeclaration> visited =
+                Collections.newSetFromMap(new IdentityHashMap<>());
+        visited.add(method);
+        return extractMethodCalls(method, visited);
+    }
+
+    /*
+     * Top-level calls of the method, with the calls made inside same-class
+     * helper methods it invokes (e.g. handle(e) -> process(e) -> repo.save())
+     * inlined right after the call that reaches them. Real listeners often
+     * delegate all side effects to private helpers.
+     */
+    private List<MethodCallInfo> extractMethodCalls(
+            MethodDeclaration method,
+            Set<MethodDeclaration> visited
+    ) {
+
+        List<MethodCallInfo> calls = new ArrayList<>();
+        for (MethodCallExpr call : method.findAll(MethodCallExpr.class)) {
+            if (isTopLevelMethodCall(call)) {
+                calls.add(createMethodCallInfo(call));
+            }
+            for (MethodDeclaration helper : sameClassTargets(call, method)) {
+                if (visited.add(helper)) {
+                    calls.addAll(extractMethodCalls(helper, visited));
+                }
+            }
+        }
+        return calls;
+    }
+
+    /* Methods of the enclosing class that an unscoped / this. call may resolve to (same name and arity). */
+    private List<MethodDeclaration> sameClassTargets(
+            MethodCallExpr call,
+            MethodDeclaration from
+    ) {
+
+        boolean ownCall = call.getScope()
+                .map(scope -> scope.isThisExpr())
+                .orElse(true);
+        if (!ownCall) {
+            return List.of();
+        }
+        return from.findAncestor(ClassOrInterfaceDeclaration.class)
+                .map(cls -> cls.getMethodsByName(call.getNameAsString())
+                        .stream()
+                        .filter(m -> m.getParameters().size() == call.getArguments().size())
+                        .filter(m -> m.getBody().isPresent())
+                        .toList())
+                .orElse(List.of());
     }
 
     private boolean isTopLevelMethodCall(

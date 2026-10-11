@@ -9,12 +9,14 @@ class ObservationEntry(BaseModel):
 
 class ObservationResult(BaseModel):
     scenario: str
-    status: str = "REPRODUCED"   # REPRODUCED | NOT_REPRODUCED | ERROR
+    status: str = "REPRODUCED"   # REPRODUCED | NOT_REACHED | ERROR
     observations: list[ObservationEntry] = []
     rawOutput: str | None = None
     executionError: str | None = None
     consumerThrew: bool = False
     callSequence: list[str] = []
+    consumerException: str | None = None   # first exception the consumer threw, if any
+    notReached: list[str] = []             # targets the scenario was about but never called
 
 
 class ReliabilityFinding(BaseModel):
@@ -25,3 +27,5 @@ class ReliabilityFinding(BaseModel):
     suggestedFix: str              # concrete fix advice referencing the actual code
     severity: str = "HIGH"        # HIGH | MEDIUM | LOW
     alsoSeenIn: list[str] = []     # other scenarios that reported this method (set by merge_findings)
+    kind: str = "other"            # repeated | failure | other — from the scenario that produced it (set by diagnose)
+    onFaultedCall: bool = False    # the scenario injected its fault on this very method

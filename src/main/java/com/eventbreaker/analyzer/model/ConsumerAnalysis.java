@@ -11,6 +11,7 @@ public record ConsumerAnalysis(
         List<MethodCallInfo> methodCalls,
         List<ObjectCreationInfo> objectCreations,
         List<AssignmentInfo> assignments,
-        List<VariableInitializationInfo> variableInitializations
+        List<VariableInitializationInfo> variableInitializations,
+        List<String> otherListenerMethods
 ) {
 }

@@ -2,7 +2,8 @@ from datetime import datetime
 from pathlib import Path
 
 from eventbreaker.models.consumer import ConsumerAnalysis
-from eventbreaker.models.observation import ObservationResult, ReliabilityFinding
+from eventbreaker.diagnosis.analyzer import KIND_LABELS
+from eventbreaker.models.observation import ObservationEntry, ObservationResult, ReliabilityFinding
 from eventbreaker.scenarios.experiment import ExperimentPlan
 from eventbreaker.scenarios.models import ChaosScenario
 
@@ -15,8 +16,14 @@ def generate(
     findings: list[ReliabilityFinding],
     theoretical: list[tuple[ChaosScenario, ExperimentPlan]],
     sandbox: bool,
+    baselines: dict[str, ObservationResult] | None = None,
 ) -> str:
-    """Render a Markdown reliability report and return it as a string."""
+    """Render a Markdown reliability report and return it as a string.
+
+    baselines: scenarioType -> the fault-free run of the same setup, shown next to
+    each scenario's counts so the reader can see exactly what changed.
+    """
+    baselines = baselines or {}
     date = datetime.now().strftime("%Y-%m-%d %H:%M")
     exec_mode = "Nebius Sandbox" if sandbox else "local JVM"
 
@@ -74,31 +81,63 @@ def generate(
 
     for scenario, result in executions:
         sections.append(f"\n### {scenario.scenarioType}  \n")
-        sections.append(f"**Status:** {result.status}  \n**Reason:** {scenario.reason}\n")
+        sections.append(f"**Status:** {result.status.replace('_', ' ')}  \n")
+        if result.notReached:
+            sections.append(
+                "**⚠ Not reached:** the listener never called "
+                + ", ".join(f"`{t}`" for t in result.notReached)
+                + " — execution stopped earlier (a guard, branch or exception), so this scenario"
+                " neither confirms nor rules out the risk.  \n"
+            )
+        if result.consumerException:
+            sections.append(f"**Listener exception:** `{result.consumerException}`  \n")
+        sections.append(f"**What we did:** {describe_test(scenario)}  \n")
+        setup = scenario.testConfig.returnValues if scenario.testConfig else []
+        if setup:
+            sections.append(
+                "**Path setup** (what the fakes returned so execution reaches the risky code): "
+                + ", ".join(f"`{rv.target}` → `{rv.returns}`" for rv in setup)
+                + "  \n"
+            )
+        sections.append(f"**Why:** {scenario.reason}\n")
         if result.executionError:
             sections.append(f"\n**Error:** {result.executionError}\n")
+            continue
+        sections.append(
+            "\n**Consumer outcome:** "
+            + ("threw — the failure propagates (a broker redelivers the message; an in-process "
+               "event's publisher sees the exception)"
+               if result.consumerThrew else
+               "completed normally — the event is treated as processed (a broker message is acknowledged)")
+            + "  \n"
+        )
+        if result.callSequence:
+            seq_str = " → ".join(f"`{s}`" for s in result.callSequence)
+            sections.append(f"**Call sequence:** {seq_str}  \n")
+
+        baseline = baselines.get(scenario.scenarioType)
+        base_counts = {o.target: o.callCount for o in baseline.observations} if baseline else None
+        observed = {o.target: o for o in result.observations}
+        all_targets = expected_dep_calls + [t for t in observed if t not in expected_dep_calls]
+        if base_counts is not None:
+            all_targets += [t for t in base_counts if t not in all_targets]
+            sections.append(
+                "\n| Dependency.Method | Without fault | This scenario | Status |\n"
+                "|-------------------|---------------|---------------|--------|\n"
+            )
         else:
-            if result.consumerThrew:
-                sections.append("**Consumer threw:** YES  \n")
-            if result.callSequence:
-                seq_str = " → ".join(f"`{s}`" for s in result.callSequence)
-                sections.append(f"**Call sequence:** {seq_str}  \n")
-            observed = {o.target: o.callCount for o in result.observations}
-            all_targets = expected_dep_calls + [
-                t for t in observed if t not in expected_dep_calls
-            ]
             sections.append(
                 "\n| Dependency.Method | Calls | Status |\n"
                 "|-------------------|-------|--------|\n"
             )
-            for target in all_targets:
-                count = observed.get(target)
-                if count is None:
-                    sections.append(f"| `{target}` | 0 | SKIPPED |\n")
-                elif count > 1:
-                    sections.append(f"| `{target}` | {count} | ⚠ called {count}× |\n")
-                else:
-                    sections.append(f"| `{target}` | {count} | ✓ |\n")
+        for target in all_targets:
+            obs = observed.get(target)
+            count = obs.callCount if obs else 0
+            status = _call_status(obs, count, base_counts.get(target, 0) if base_counts is not None else None)
+            if base_counts is not None:
+                sections.append(f"| `{target}` | {base_counts.get(target, 0)} | {count} | {status} |\n")
+            else:
+                sections.append(f"| `{target}` | {count} | {status} |\n")
 
     # ── Reliability findings (one per concern) ────────────────────────────────
     sections.append(f"\n---\n\n## Reliability Findings ({len(findings)})\n")
@@ -109,6 +148,7 @@ def generate(
         sections.append(
             f"\n### Finding {i} — `{finding.affectedMethod}`\n"
             f"**Severity:** {finding.severity}  \n"
+            f"**Kind:** {KIND_LABELS.get(finding.kind, finding.kind)}  \n"
             f"**Observed:** {finding.summary}\n"
         )
         sections.append(f"\n**Why it matters:** {finding.explanation}\n")
@@ -140,6 +180,56 @@ def generate(
     return "".join(sections)
 
 
-def save(report: str, output_path: Path = Path("eventbreaker-report.md")) -> Path:
-    output_path.write_text(report, encoding="utf-8")
-    return output_path
+REPORTS_DIR = Path("eventbreaker-reports")
+
+
+def save(report: str, analysis: ConsumerAnalysis, output_dir: Path = REPORTS_DIR) -> Path:
+    """Write the report to <dir>/<Class>.<method>-<YYYYMMDD-HHMMSS>.md — never overwrites."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = f"{analysis.className}.{analysis.methodName}-{stamp}"
+    path = output_dir / f"{base}.md"
+    n = 2
+    while path.exists():  # two runs in the same second
+        path = output_dir / f"{base}-{n}.md"
+        n += 1
+    path.write_text(report, encoding="utf-8")
+    return path
+
+
+def describe_test(scenario: ChaosScenario) -> str:
+    """Plain-language description of what the scenario did to the consumer."""
+    tc = scenario.testConfig
+    if tc is None:
+        return "not executed"
+    delivery = {
+        "SINGLE": "Delivered the event once",
+        "DUPLICATE": "Delivered the same event twice in a row (redelivery)",
+        "CONCURRENT": "Delivered the same event twice at the same time",
+    }.get(tc.callPattern, tc.callPattern)
+    faults = []
+    for fi in tc.faultInjections:
+        target = f"`{fi.dep}.{fi.method}`"
+        faults.append({
+            "THROW": f"made {target} throw on every call",
+            "THROW_ONCE": f"made {target} throw on its first call only",
+            "DELAY": f"made {target} wait {fi.delayMs or 500} ms",
+        }.get(fi.fault, f"{fi.fault} on {target}"))
+    return delivery + (" and " + "; ".join(faults) if faults else ", no injected failure")
+
+
+def _call_status(obs: ObservationEntry | None, count: int, baseline: int | None) -> str:
+    """Status cell: threw / missing / extra vs the fault-free baseline (or plain counts without one)."""
+    parts: list[str] = []
+    if obs is not None and obs.threw:
+        parts.append("⚠ threw")
+    if baseline is not None:
+        if count < baseline:
+            parts.append(f"⚠ {baseline - count} missing")
+        elif count > baseline:
+            parts.append(f"⚠ {count - baseline} extra")
+    elif count == 0:
+        parts.append("SKIPPED")
+    elif count > 1:
+        parts.append(f"⚠ called {count}×")
+    return ", ".join(parts) or "✓"

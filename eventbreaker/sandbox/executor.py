@@ -2,7 +2,9 @@ import os
 from pathlib import Path
 
 from contree_sdk import ContreeSync
+from contree_sdk.config import ContreeConfig
 from contree_sdk.sdk.exceptions import FailedOperationError, OperationTimedOutError
+from contree_sdk.sdk.exceptions.base import ContreeError
 
 # Alpine 3.20 is the lightest available image that supports openjdk21.
 _IMAGE = "alpine:3.20"
@@ -12,6 +14,10 @@ _JAR_PATH = "/app/eventbreaker.jar"
 
 # Total sandbox timeout: ~30s to install JRE + a few seconds to run the JAR.
 _TIMEOUT_SECONDS = 180
+
+# Per-HTTP-request timeout. The SDK default (10s) is too short to upload a
+# real-classpath JAR (~9 MB) on an ordinary home connection.
+_TRANSPORT_TIMEOUT_SECONDS = 120.0
 
 
 class SandboxExecutor:
@@ -36,7 +42,7 @@ class SandboxExecutor:
                 "Add it to your .env file."
             )
 
-        client = ContreeSync()
+        client = ContreeSync(ContreeConfig(transport_timeout=_TRANSPORT_TIMEOUT_SECONDS))
         sandbox = client.images.use(_IMAGE)
 
         try:
@@ -54,6 +60,8 @@ class SandboxExecutor:
             ) from e
         except FailedOperationError as e:
             raise RuntimeError(f"Sandbox operation failed: {e}") from e
+        except ContreeError as e:  # upload / transport / API errors
+            raise RuntimeError(f"Sandbox request failed: {type(e).__name__}: {e}") from e
 
         stdout = result.stdout or ""
         stderr = result.stderr or ""

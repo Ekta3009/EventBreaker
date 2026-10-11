@@ -2,6 +2,8 @@ import os
 from pathlib import Path
 
 import typer
+import atexit
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -10,12 +12,13 @@ from rich.panel import Panel
 from rich.table import Table
 from rich import box
 
-from eventbreaker.analyzer.bridge import analyze
+from eventbreaker.analyzer.bridge import analyze, scan
 from eventbreaker.agent.nemotron import identify_risks
-from eventbreaker.diagnosis.analyzer import diagnose, merge_findings
+from eventbreaker.agent.path_setup import not_reached, plan_path, reach_feedback, target_calls
+from eventbreaker.diagnosis.analyzer import KIND_LABELS, diagnose, merge_findings
 from eventbreaker.models.observation import ObservationResult, ReliabilityFinding
 from eventbreaker.report import reporter
-from eventbreaker.scenarios.models import ChaosScenario
+from eventbreaker.scenarios.models import ChaosScenario, TestConfig
 from eventbreaker.scenarios.executor import ScenarioExecutor
 from eventbreaker.scenarios.experiment import ExperimentPlan, check_feasibility
 
@@ -41,11 +44,20 @@ def analyze_consumer(
         exists=True,
         readable=True,
     ),
+    method: str | None = typer.Option(
+        None, "--method", help="Listener method to analyze when the class has several (default: the first).",
+    ),
+    classpath: str | None = typer.Option(
+        None, "--classpath",
+        help="The consumer project's dependency jars (path-separated, or @file containing that). "
+             "Compiles against real types instead of generated stubs.",
+    ),
     fresh: bool = typer.Option(
         False, "--fresh", help="Ignore the cached risk-identification response and call Nemotron Ultra again.",
     ),
-) -> None:
+) -> dict:
     """Analyze an event consumer and identify reliability risks."""
+    _register_usage_print()
 
     console.print(
         f"\n[bold cyan]EventBreaker[/bold cyan] — analyzing "
@@ -55,7 +67,7 @@ def analyze_consumer(
     # ── Step 1: Static analysis ───────────────────────────────────────────────
     with console.status("[bold green]Running static analysis..."):
         try:
-            analysis = analyze(file)
+            analysis = analyze(file, method)
         except FileNotFoundError as e:
             console.print(f"[bold red]Setup error:[/bold red] {e}")
             raise typer.Exit(1)
@@ -75,6 +87,11 @@ def analyze_consumer(
         title="Consumer",
         border_style="green",
     ))
+    if analysis.otherListenerMethods:
+        console.print(
+            f"[dim]Other listener methods in this class (not analysed): "
+            f"{', '.join(analysis.otherListenerMethods)} — select one with --method[/dim]"
+        )
 
     # Dependencies table
     if analysis.dependencies:
@@ -165,8 +182,51 @@ def analyze_consumer(
     exec_mode = "[cyan]Nebius Sandbox[/cyan]" if in_sandbox else "[yellow]local JVM[/yellow]"
 
     executions: list[tuple[ChaosScenario, ObservationResult]] = []
-    executor = ScenarioExecutor()
+    jars = _parse_classpath(classpath)
+    executor = ScenarioExecutor(jars)
+    # Real classpath: plan what the fakes must return so each scenario reaches
+    # its risky call, and run the same setup without faults as a baseline.
+    baselines: dict[str, ObservationResult] = {}
+    def run_baseline(values: list) -> ObservationResult:
+        key = "|".join(sorted(f"{rv.target}={rv.returns}" for rv in values))
+        if key not in baselines:
+            with console.status(f"[bold green]Executing fault-free baseline ({exec_mode})..."):
+                baselines[key] = executor.execute(
+                    ChaosScenario(
+                        scenarioType="BASELINE", reason="fault-free run of the same setup",
+                        expectedConcern="none",
+                        testConfig=TestConfig(callPattern="SINGLE", returnValues=values),
+                    ),
+                    analysis, file,
+                )
+        return baselines[key]
+
     for scenario, plan in feasible:
+        targets = target_calls(scenario)
+        if jars and scenario.testConfig is not None:
+            with console.status(f"[bold green]Planning path setup: {scenario.scenarioType}..."):
+                values = plan_path(analysis, source_code, scenario)
+            baseline = run_baseline(values)
+            missing = not_reached(baseline, targets) if baseline.status == "REPRODUCED" else []
+            if missing:
+                # One retry: show Nemotron what its setup actually did.
+                console.print(
+                    f"[dim]  Path setup did not reach {', '.join(missing)} — "
+                    f"asking Nemotron to revise it (1 retry)[/dim]"
+                )
+                with console.status(f"[bold green]Revising path setup: {scenario.scenarioType}..."):
+                    retry = plan_path(analysis, source_code, scenario,
+                                      feedback=reach_feedback(values, baseline, missing))
+                if retry and retry != values:
+                    values = retry
+                    run_baseline(values)
+            scenario.testConfig.returnValues = values
+            if values:
+                console.print(
+                    f"[dim]  Path setup for {scenario.scenarioType}: "
+                    + ", ".join(f"{rv.target} → {rv.returns}" for rv in values)
+                    + "[/dim]"
+                )
         with console.status(
             f"[bold green]Executing: {scenario.scenarioType} ({exec_mode})..."
         ):
@@ -178,10 +238,19 @@ def analyze_consumer(
                 )
                 continue
 
-        ok = result.status == "REPRODUCED"
-        colour, mark = ("green", "✓") if ok else ("red", "✗")
+        # A run that never called the scenario's target proves nothing about it.
+        if jars and result.status == "REPRODUCED":
+            result.notReached = not_reached(result, targets)
+            if result.notReached:
+                result.status = "NOT_REACHED"
+        console.print(f"[dim]  {reporter.describe_test(scenario).replace('`', '')}[/dim]")
+        colour, mark = {
+            "REPRODUCED": ("green", "✓"), "NOT_REACHED": ("yellow", "⚠"),
+        }.get(result.status, ("red", "✗"))
         console.print(
-            f"[bold {colour}]{mark} {scenario.scenarioType} — {result.status}[/bold {colour}]"
+            f"[bold {colour}]{mark} {scenario.scenarioType} — {result.status.replace('_', ' ')}"
+            + (f" (never called {', '.join(result.notReached)})" if result.notReached else "")
+            + f"[/bold {colour}]"
         )
         _print_observations(result, analysis)
         executions.append((scenario, result))
@@ -200,7 +269,10 @@ def analyze_consumer(
             f"[bold green]Diagnosing {scenario.scenarioType}..."
         ):
             try:
-                scenario_findings = diagnose(analysis, scenario, result, source_code)
+                baseline = baselines.get(_setup_key(scenario)) if scenario.testConfig else None
+                if baseline is not None and baseline.status != "REPRODUCED":
+                    baseline = None
+                scenario_findings = diagnose(analysis, scenario, result, source_code, baseline=baseline)
                 if not scenario_findings:
                     console.print(
                         f"[dim]  {scenario.scenarioType}: no production risk observed[/dim]"
@@ -236,12 +308,166 @@ def analyze_consumer(
         findings=all_findings,
         theoretical=theoretical,
         sandbox=in_sandbox,
+        baselines={
+            sc.scenarioType: baselines[_setup_key(sc)]
+            for sc, _ in executions
+            if sc.testConfig is not None and _setup_key(sc) in baselines
+            and baselines[_setup_key(sc)].status == "REPRODUCED"
+        },
     )
-    report_path = reporter.save(report_md)
+    report_path = reporter.save(report_md, analysis)
     console.print(
         f"\n[bold green]✓ Report saved →[/bold green] "
         f"[yellow]{report_path}[/yellow]\n"
     )
+    return {
+        "report": report_path,
+        "findings": all_findings,
+        "reproduced": sum(1 for _, r in executions if r.status == "REPRODUCED"),
+        "errors": sum(1 for _, r in executions if r.status == "ERROR"),
+        "not_reached": sum(1 for _, r in executions if r.status == "NOT_REACHED"),
+    }
+
+
+@app.command("scan")
+def scan_repository(
+    directory: Path = typer.Argument(
+        ..., help="Repository or module directory to search for listener methods.",
+        exists=True, file_okay=False,
+    ),
+    run_all: bool = typer.Option(False, "--all", help="Analyze every listener found."),
+    only: str | None = typer.Option(
+        None, "--only",
+        help="Analyze only these listeners: numbers from the list and/or Class.method names, comma-separated "
+             "(e.g. --only 1,3 or --only NoteListener.onCreate).",
+    ),
+    classpath: str | None = typer.Option(
+        None, "--classpath", help="Dependency jars for the listeners' module (same as analyze --classpath).",
+    ),
+    fresh: bool = typer.Option(False, "--fresh", help="Re-ask Nemotron Ultra instead of using cached risks."),
+) -> None:
+    """List every listener method in a repository, and optionally analyze them."""
+    _register_usage_print()
+    with console.status("[bold green]Scanning for listener methods..."):
+        try:
+            listeners = scan(directory)
+        except Exception as e:
+            console.print(f"[bold red]Scan failed:[/bold red] {e}")
+            raise typer.Exit(1)
+
+    if not listeners:
+        console.print(f"[yellow]No listener methods found under {directory}.[/yellow]")
+        raise typer.Exit(0)
+
+    table = Table(box=box.SIMPLE, show_header=True, header_style="bold")
+    table.add_column("#", justify="right")
+    table.add_column("Listener", style="cyan", no_wrap=True)
+    table.add_column("Event", style="yellow")
+    table.add_column("File", style="dim")
+    for i, l in enumerate(listeners, 1):
+        table.add_row(str(i), f"{l.className}.{l.methodName}", l.eventType, Path(l.file).name)
+    console.print(Panel(table, title=f"[bold]{len(listeners)} listener method(s) in {directory}[/bold]",
+                        border_style="cyan"))
+
+    selected = _select_listeners(listeners, run_all, only)
+    if not selected:
+        console.print("[dim]Analyze them with --all, or pick some with --only 1,3 / --only Class.method[/dim]")
+        return
+
+    summary: list[tuple] = []
+    for n, l in enumerate(selected, 1):
+        console.rule(f"[bold cyan]{n}/{len(selected)}  {l.className}.{l.methodName}[/bold cyan]")
+        try:
+            outcome = analyze_consumer(Path(l.file), method=l.methodName, classpath=classpath, fresh=fresh)
+        except typer.Exit:
+            outcome = None
+        except Exception as e:
+            console.print(f"[bold red]Failed:[/bold red] {e}")
+            outcome = None
+        summary.append((l, outcome))
+
+    _print_scan_summary(summary)
+
+
+def _select_listeners(listeners: list, run_all: bool, only: str | None) -> list:
+    if run_all:
+        return listeners
+    if not only:
+        return []
+    chosen = []
+    for token in (t.strip() for t in only.split(",") if t.strip()):
+        if token.isdigit() and 1 <= int(token) <= len(listeners):
+            match = [listeners[int(token) - 1]]
+        else:
+            match = [l for l in listeners if f"{l.className}.{l.methodName}" == token or l.className == token]
+        if not match:
+            raise typer.BadParameter(f"--only: no listener matches '{token}'")
+        chosen += [m for m in match if m not in chosen]
+    return chosen
+
+
+def _print_scan_summary(summary: list[tuple]) -> None:
+    t = Table(box=box.SIMPLE, show_header=True, header_style="bold")
+    t.add_column("Listener", style="cyan")
+    t.add_column("Scenarios", justify="right")
+    t.add_column("HIGH", justify="right", style="red")
+    t.add_column("MEDIUM", justify="right", style="yellow")
+    t.add_column("LOW", justify="right", style="green")
+    t.add_column("Report", style="dim")
+    for l, outcome in summary:
+        name = f"{l.className}.{l.methodName}"
+        if outcome is None:
+            t.add_row(name, "[red]not run[/red]", "—", "—", "—", "—")
+            continue
+        sev = [f.severity for f in outcome["findings"]]
+        ran = (
+            f"{outcome['reproduced']} ok"
+            + (f", [yellow]{outcome['not_reached']} not reached[/yellow]" if outcome["not_reached"] else "")
+            + (f", [red]{outcome['errors']} error[/red]" if outcome["errors"] else "")
+        )
+        t.add_row(name, ran, str(sev.count("HIGH")), str(sev.count("MEDIUM")), str(sev.count("LOW")),
+                  str(outcome["report"]))
+    console.print(Panel(t, title="[bold]Scan summary[/bold]", border_style="cyan"))
+
+
+_usage_print_registered = False
+
+
+def _register_usage_print() -> None:
+    global _usage_print_registered
+    if not _usage_print_registered:
+        atexit.register(_print_usage)
+        _usage_print_registered = True
+
+
+def _setup_key(scenario: ChaosScenario) -> str:
+    """Scenarios with the same path setup share one baseline run."""
+    values = scenario.testConfig.returnValues if scenario.testConfig else []
+    return "|".join(sorted(f"{rv.target}={rv.returns}" for rv in values))
+
+
+def _print_usage() -> None:
+    from eventbreaker.agent import usage
+    if usage.session["calls"]:
+        console.print(
+            f"[dim]Nemotron usage this run: {usage.session['calls']} call(s), "
+            f"{usage.session['input']:,} in / {usage.session['output']:,} out tokens, "
+            f"~${usage.session['cost']:.4f} (all runs logged: ~${usage.total_logged():.2f} "
+            f"in {usage.USAGE_FILE})[/dim]"
+        )
+
+
+def _parse_classpath(value: str | None) -> list[Path]:
+    """'a.jar:b.jar' or '@cp.txt' (as written by mvn dependency:build-classpath)."""
+    if not value:
+        return []
+    if value.startswith("@"):
+        value = Path(value[1:]).read_text().strip()
+    jars = [Path(p) for p in value.split(os.pathsep) if p.strip()]
+    missing = [str(j) for j in jars if not j.exists()]
+    if missing:
+        raise typer.BadParameter(f"classpath entries not found: {', '.join(missing[:3])}")
+    return jars
 
 
 def _print_theoretical(
@@ -351,7 +577,7 @@ def _print_findings(findings: list[ReliabilityFinding]) -> None:
             sev_colour = _SEVERITY_COLOURS.get(f.severity, "white")
             bullets.append(
                 f"[{sev_colour}]▸ {f.severity}[/{sev_colour}]  "
-                f"[cyan]{f.affectedMethod}[/cyan]\n"
+                f"[cyan]{f.affectedMethod}[/cyan]  [dim]({KIND_LABELS.get(f.kind, f.kind)})[/dim]\n"
                 f"  {f.summary}\n"
                 f"  [dim]{f.explanation}[/dim]\n"
                 f"  [green]Fix: {f.suggestedFix}[/green]"

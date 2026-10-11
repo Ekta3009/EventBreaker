@@ -3,6 +3,8 @@ import os
 import re
 
 from openai import OpenAI
+
+from eventbreaker.agent import usage
 from pydantic import ValidationError
 
 from eventbreaker.models.consumer import ConsumerAnalysis
@@ -89,6 +91,7 @@ def diagnose(
     scenario: ChaosScenario,
     result: ObservationResult,
     source_code: str,
+    baseline: ObservationResult | None = None,
 ) -> list[ReliabilityFinding]:
     """Send observations to Nemotron and return one ReliabilityFinding per concern.
 
@@ -113,7 +116,12 @@ def diagnose(
             for t in observed_targets
         )
     ]
-    if not _has_observation_signal(result) and not skipped:
+    deltas = _baseline_deltas(result, baseline) if baseline else None
+    if deltas is not None:
+        # With a fault-free baseline, the signal is exactly what changed.
+        if not deltas and not any(o.threw for o in result.observations) and not result.consumerThrew:
+            return []
+    elif not _has_observation_signal(result) and not skipped:
         return []
 
     # The exception reached the broker before any dependency call completed:
@@ -133,11 +141,12 @@ def diagnose(
         model=_MODEL,
         messages=[
             {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": _build_prompt(analysis, scenario, result, source_code)},
+            {"role": "user", "content": _build_prompt(analysis, scenario, result, source_code, deltas)},
         ],
         temperature=0.3,
-        max_tokens=4096,
+        max_tokens=8192,
     )
+    usage.record(_MODEL, getattr(response, "usage", None), "diagnosis")
 
     message = response.choices[0].message
     raw = message.content
@@ -149,11 +158,25 @@ def diagnose(
     return _parse(raw.strip(), scenario, result)
 
 
+def _baseline_deltas(
+    result: ObservationResult, baseline: ObservationResult
+) -> dict[str, tuple[int, int]]:
+    """target -> (baseline count, scenario count) for every call whose count changed."""
+    base = {o.target: o.callCount for o in baseline.observations}
+    now = {o.target: o.callCount for o in result.observations}
+    return {
+        t: (base.get(t, 0), now.get(t, 0))
+        for t in sorted(base.keys() | now.keys())
+        if base.get(t, 0) != now.get(t, 0)
+    }
+
+
 def _build_prompt(
     analysis: ConsumerAnalysis,
     scenario: ChaosScenario,
     result: ObservationResult,
     source_code: str,
+    deltas: dict[str, tuple[int, int]] | None = None,
 ) -> str:
     deps = ", ".join(f"{d.name} ({d.type})" for d in analysis.dependencies)
     calls = " → ".join(c.expression for c in analysis.methodCalls)
@@ -194,7 +217,24 @@ def _build_prompt(
     threw = [o for o in result.observations if o.threw]
 
     # Determine which methods need a finding based on the actual observation signals.
-    if doubled:
+    if deltas is not None:
+        # Compared with a fault-free run of the same input: report exactly what changed.
+        changed = [
+            f"  {t}: {b} call(s) without the fault, {n} with it "
+            + ("(MISSING — work that did not happen)" if n < b else "(EXTRA — work repeated)")
+            for t, (b, n) in deltas.items()
+        ]
+        concern_targets = list(deltas) + [o.target for o in threw if o.target not in deltas]
+        concern_description = "different from the fault-free baseline run, or threw"
+        skipped_section = (
+            "\nDifference from a fault-free run of the same event (the baseline):\n"
+            + ("\n".join(changed) if changed else "  (no call-count changes)")
+            + ("\nMethods that THREW an exception:\n" + "\n".join(f"  {o.target}" for o in threw) if threw else "")
+            + "\nCounts that equal the baseline are the consumer's normal behaviour for one event "
+            "(e.g. one call per related account) — they are not duplicates."
+        )
+        doubled_summary = ", ".join(t for t, (b, n) in deltas.items() if n > b) or "none"
+    elif doubled:
         concern_targets = [o.target for o in doubled]
         concern_description = "called more than once"
         skipped_section = ""
@@ -243,7 +283,7 @@ Observations (call counts after scenario execution):
 {call_seq_line}
 
 Methods called more than once: {doubled_summary}{skipped_section}
-
+{_repetition_guidance(scenario)}
 Source code:
 {source_code}
 
@@ -258,6 +298,27 @@ These dependency methods were {concern_description} and each needs its own findi
 Produce exactly {len(concern_targets)} ReliabilityFinding objects — one per method listed above.
 Apply the severity rules: use NONE for any method whose observation is not a production risk.
 Return a JSON array of exactly {len(concern_targets)} findings."""
+
+
+def _repetition_guidance(scenario: ChaosScenario) -> str:
+    """Extra instructions when the scenario delivers the event more than once."""
+    tc = scenario.testConfig
+    if tc is None or tc.callPattern not in ("DUPLICATE", "CONCURRENT"):
+        return ""
+    how = "twice in a row" if tc.callPattern == "DUPLICATE" else "twice at the same time"
+    return f"""
+THIS SCENARIO DELIVERED THE SAME EVENT {how.upper()}.
+Every call the consumer makes for one event therefore happens again — that alone is NOT a problem.
+Report a method only if doing its work a second time for the same event causes harm
+(money charged twice, a second email/message/event sent, a duplicate record created, a counter
+incremented twice, stock reserved twice, a job run twice with different results).
+These are NEVER findings here — give them severity NONE:
+- READs and IDEMPOTENT WRITEs (same input → same state).
+- Per-message setup / cleanup that runs once per delivery (e.g. before/after, open/close,
+  begin/end, set/clear context, acquire/release) — each delivery cleaning up after itself is correct.
+- Acknowledging / committing the message once per delivery.
+- Work that only recomputes or refreshes current state from the source of truth.
+"""
 
 
 def _parse(
@@ -304,6 +365,7 @@ def _parse(
             benign += 1
             continue
         item.setdefault("scenario", scenario.scenarioType)
+        item["kind"] = _finding_kind(scenario)
         if not item.get("affectedMethod") and result.observations:
             top = max(result.observations, key=lambda o: o.callCount)
             item["affectedMethod"] = top.target
@@ -315,6 +377,7 @@ def _parse(
         ]
         if len(mentioned) == 1 and item.get("affectedMethod") != mentioned[0]:
             item["affectedMethod"] = mentioned[0]
+        item["onFaultedCall"] = item.get("affectedMethod") in _fault_targets(scenario)
         try:
             findings.append(ReliabilityFinding.model_validate(item))
         except ValidationError:
@@ -331,21 +394,47 @@ def _parse(
 
 _SEVERITY_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 
+KIND_LABELS = {
+    "repeated": "work repeated (duplicate / concurrent delivery)",
+    "failure": "behaviour when a dependency fails",
+    "other": "observed behaviour",
+}
+
+
+def _finding_kind(scenario: ChaosScenario) -> str:
+    """What kind of problem a scenario can reveal — decided by how it was run, not by the LLM."""
+    tc = scenario.testConfig
+    if tc is None:
+        return "other"
+    if tc.callPattern in ("DUPLICATE", "CONCURRENT"):
+        return "repeated"
+    if tc.faultInjections:
+        return "failure"
+    return "other"
+
+
+def _fault_targets(scenario: ChaosScenario) -> set[str]:
+    tc = scenario.testConfig
+    return {f"{fi.dep}.{fi.method}" for fi in tc.faultInjections} if tc else set()
+
 
 def merge_findings(findings: list[ReliabilityFinding]) -> list[ReliabilityFinding]:
-    """Collapse findings to one per affectedMethod.
+    """Collapse findings to one per (affectedMethod, kind).
 
-    diagnose() runs per scenario, so a method hit by several scenarios is reported
-    several times. Keep the most severe finding (first one on ties) and record the
-    other scenarios in alsoSeenIn. Method order follows first appearance.
+    diagnose() runs per scenario, so the same problem on a method is reported once
+    per scenario that hits it. Findings of a different kind on the same method —
+    "lost after a failure" vs "repeated on redelivery" — are different problems
+    and both stay. Within a group keep the most severe finding; on a tie prefer
+    the one whose scenario injected its fault on that very method, then the first.
+    Other scenarios go to alsoSeenIn. Order follows first appearance.
     """
-    groups: dict[str, list[ReliabilityFinding]] = {}
+    groups: dict[tuple[str, str], list[ReliabilityFinding]] = {}
     for f in findings:
-        groups.setdefault(f.affectedMethod, []).append(f)
+        groups.setdefault((f.affectedMethod, f.kind), []).append(f)
 
     merged: list[ReliabilityFinding] = []
     for group in groups.values():
-        best = min(group, key=lambda f: _SEVERITY_RANK.get(f.severity, 9))
+        best = min(group, key=lambda f: (_SEVERITY_RANK.get(f.severity, 9), not f.onFaultedCall))
         others = [
             f.scenario for f in group
             if f is not best and f.scenario != best.scenario

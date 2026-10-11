@@ -1,0 +1,128 @@
+# Real-world failure inventory (STEP 10 Phase B)
+
+Per consumer, per stage: pass, or the exact failure mapped to a gap (G#, see docs/PLAN.md STEP 10).
+
+## Run 1 — 2026-10-11, before any real-world fixes
+
+| Consumer | Analyze | Risk ID | Feasibility | Build | Run | Diagnose |
+|---|---|---|---|---|---|---|
+| fineract `KafkaRemoteMessageListener` | ✗ G1 | — | — | — | — | — |
+| killbill `OverdueListener` | ✗ G1 | — | — | — | — | — |
+
+Both: `No @EventBreakerConsumer method found`. Failed before any LLM call (no cost).
+
+## Run 2 — 2026-10-11, after G1 + G2 + G5 (analyzer recognises real listener annotations, event type from parameter, `--method`)
+
+| Consumer | Analyze | Risk ID | Feasibility | Build | Run | Diagnose |
+|---|---|---|---|---|---|---|
+| fineract `KafkaRemoteMessageListener` | ✓ (2 deps, event `ContextualMessage`) | ✓ 4 scenarios | ✓ 4 reproducible | ✗ 4/4 compile errors | — | — |
+| killbill `OverdueListener` (`handleTagInsert`) | ✓ (5 other listeners listed) | ✓ 4 scenarios | ✓ 3 reproducible, 1 theoretical | ✗ 3/3 compile errors | — | — |
+
+### Build failures — root cause
+
+The consumer is compiled verbatim, and stubs are generated only for types the analyzer knows about
+(dependencies, event type, types of called methods). Real consumers import many more types:
+
+| # | Failure | Consumer | Gap |
+|---|---|---|---|
+| B-1 | `package lombok.extern.slf4j / org.springframework.* / jakarta.inject does not exist` — framework **annotations** imported but never stubbed (`@Slf4j @Component @Conditional @Autowired @KafkaListener @Payload @Inject @Named @Subscribe @AllowConcurrentEvents`) | both | G6 |
+| B-2 | Imported **non-dependency types** never stubbed: `Acknowledgment`, `KafkaWorkerCondition`, `ObjectType`, `ControlTagType`, `Account`, `OverdueConfig`, `DefaultOverdueState`, `CacheType`, `CallOrigin`, `UserType`, `BusEvent`, nested `OverdueAsyncBusNotificationKey.OverdueAsyncBusNotificationAction` … | both | new **G13** |
+| B-3 | **Enum constants** used in logic (`ControlTagType.OVERDUE_ENFORCEMENT_OFF`, `ObjectType.ACCOUNT`, `CallOrigin.INTERNAL`) need enum stubs with those constants | killbill | G13 |
+| B-4 | **JDK type stubbed**: generator wrote `src/main/java/java/util/UUID.java` → `package exists in another module: java.base` | killbill | new bug **G14** |
+| B-5 | **Generic arity**: `CacheController<String, UUID>` but stub declares one type parameter → `wrong number of type arguments; required 1` | killbill | new bug **G15** |
+| B-6 | **Stub return types** too weak for real logic: `UUID cannot be converted to Long` (`event.getSearchKey1()` passed where `Long` is expected) | killbill | G13 (patcher territory) |
+| B-7 | Lombok `@Slf4j` → `log` used but never declared (masked by B-1 today) | fineract | G7 |
+
+Expected next layer once it compiles (not yet observed): G4 (`onMessage(payload, acknowledgment)` called with one
+arg), G8 (killbill side effects in private helpers), G10 (children loop), constructor with `@Named` param and a
+field computed from a constructor argument (`objectIdCacheController`).
+
+## Run 3 — 2026-10-11, real classpath (`--classpath`, Kill Bill 0.25.4 jars from Maven Central)
+
+Building Kill Bill from source failed (master needs an unpublished SNAPSHOT parent POM). Release 0.25.4 has a
+byte-identical `OverdueListener`, so the consumer is pinned to that tag and compiled against its published jars.
+
+| Step | Result |
+|---|---|
+| Compile against real jars | ✓ — all B-1…B-7 build failures gone (no stubs needed) |
+| Run, default fakes | ✓ executes, but real code is not steered: `handleTagInsert` string/enum branches never taken (→ one **false positive** from diagnosis); `handlePaymentInfoEvent` dies on `(DefaultOverdueConfig)` cast before any side effect |
+| Static analysis | G3 fixed (static fields are not dependencies); G8 fixed (calls in same-class helpers inlined → `asyncPoster.insertOverdueNotification` ×3 and `accountApi.getChildrenAccounts` visible) |
+| Path setup (`returnValues`), hand-written | ✓ `getOverdueConfig → MOCK:DefaultOverdueConfig` → full path: insert ×3 (account, parent, child) |
+| K1 — THROW `accountApi.getChildrenAccounts` | ✓ consumer swallows, inserts 2 of 3 → diagnosis **HIGH, correct cause + fix** (after baseline-differential signal) |
+| K3 — DUPLICATE | ✓ inserts ×6 → diagnosis HIGH (EXPECTED says LOW — severity over-call) |
+| Path setup from Nemotron (proof B) | Super: correct on both cases (incl. `STRING:OVERDUE_ENFORCEMENT_OFF` for the hard branch) — executing its answer verbatim reaches insert ×3. Ultra: ran out of tokens on case 1, missed the string on case 2. |
+| Sandbox | ✗ upload of 91 jars (41 MB) timed out — next: minimized single fat JAR |
+
+New gaps found and fixed in this run: diagnosis keyed on "called >1×" (wrong for fan-out code) → replaced by
+**diff against a fault-free baseline run**; diagnosis `max_tokens` 4096 → 8192 (truncated JSON).
+Open: K2 needs a checked exception type (`OverdueApiException`) — THROW only raises RuntimeException.
+
+## Run 4 — 2026-10-11, full CLI end to end in the Nebius sandbox
+
+`eventbreaker analyze …/OverdueListener.java --method handlePaymentInfoEvent --classpath @cp.txt`
+Pipeline: Ultra risk ID (cached) → Super path setup per scenario → fault-free baseline → scenarios → Super diagnosis vs baseline.
+Sandbox upload fixed: one 8.8 MB JAR (fat JAR + jdeps-reachable classpath classes) + SDK HTTP timeout 10s → 120s.
+4 min wall time, 9 Nemotron calls, ~$0.04 (measured from usage log).
+
+| Scenario (Ultra) | Path setup (Super) | Execution | Diagnosis | vs EXPECTED |
+|---|---|---|---|---|
+| SILENT_DATA_LOSS — THROW `accountApi.getAccountById` | `getOverdueConfig → MOCK:DefaultOverdueConfig` | ✓ insert 1 (baseline 3), exception swallowed | MEDIUM on `getAccountById` (swallowed; parent+children skipped) | K1 ✓ found (severity low-ish; the "2 notifications lost" HIGH is hidden by the merge — see below) |
+| IDEMPOTENCY_VIOLATION — DUPLICATE | same | ✓ insert 6 (baseline 3) | HIGH duplicate inserts | K3 found, **over-rated** (EXPECTED LOW) |
+| RACE_CONDITION — CONCURRENT | same | ✓ insert 6 | merged into the HIGH above | K4 found, over-rated |
+| PARTIAL_PROCESSING — THROW `asyncPoster.insertOverdueNotification` | none | ✓ first insert threw, consumer threw (propagates) | none (call-order rule: nothing committed, redelivery is clean) | ✓ correct no-finding |
+
+Open issues found by this run:
+- **Merge hides distinct problems on one method** (STEP 9c key = affectedMethod): K1 "notifications missing" and K3 "notifications duplicated" are both on `insertOverdueNotification`; only the first HIGH is shown.
+- Duplicate/concurrent severity over-call (recompute-style side effects rated HIGH).
+- A fault on a method called several times hits every call (can't fail only the parent insert).
+
+## Run 5 — 2026-10-11, Fineract end to end in the Nebius sandbox
+
+Fineract is not on Maven Central. Built from the **1.15.0 source archive** (listener byte-identical to develop@c5cc48a;
+develop needs Java 25, 1.15.0 needs 21) with Gradle; classpath exported with `~/eb-classpaths/print-classpath.init.gradle`
+(`:fineract-provider:ebClasspath`, 370 entries / 221 MB incl. build/classes dirs → auto-packed into cached jars).
+
+Gaps hit and fixed:
+| Failure | Fix |
+|---|---|
+| Lombok `@Slf4j` (`log` missing; Lombok is compile-only, not on runtime classpath) — G7 | Classpath mode uses the **project's own compiled consumer class** when present, not the copied source (annotation processors already applied) |
+| `onMessage(ContextualMessage, Acknowledgment)` called with 1 arg — G4 | Non-event listener params get **recorder fakes**; `acknowledgment.acknowledge` is now observed |
+| Harness re-imported consumer's compile-only imports | Keep only imports that resolve on the classpath / JDK |
+
+| Scenario (Ultra) | Execution | Diagnosis | vs EXPECTED |
+|---|---|---|---|
+| THROW `stepExecutionRequestHandler.handle` | threw, consumer did not throw, `acknowledge` ×1 | HIGH — swallowed, Kafka message acknowledged; fix: rethrow / ack inside try | **F1 ✓** |
+| THROW `inputInterceptor.beforeHandleMessage` | `handle` skipped, `acknowledge` ×1 | HIGH — step lost, acknowledged anyway | **F2 ✓** |
+| DUPLICATE | `handle` ×2, `acknowledge` ×2 | merged into F1 ("Also seen in") | F3 — hidden by merge |
+| (F4 afterHandleMessage cleanup failure) | not generated by Ultra | — | F4 ✗ missed |
+
+1 min 44 s, 4 Nemotron calls, ~$0.008. Kill Bill re-verified after these changes: 4/4 REPRODUCED.
+
+## Run 6 — 2026-10-11, `eventbreaker scan ~/fineract-1.15.0` (analysed in place, no copies)
+
+`scan` found 7 consumer methods (lifecycle `onStartup` hooks skipped). Iterations needed (all general fixes):
+| Failure | Fix |
+|---|---|
+| `LoginAttemptEventListener` missing from scan | JavaParser language level → Java 21 (`instanceof AppUser user`) |
+| `ClassCastException Object → AppUser` | Fakes use the most specific return type (covariant override in `AppUserRepository`) |
+| `NoteListener` / `LegacyMeetingAttendanceListener is not public` | Reflective create + call (package-private classes/methods) |
+| Sandbox: consumer class missing (`Class.forName`) | Consumer class files added as jdeps roots |
+| Sandbox jar reused from a previous run | Jar name keyed by builder version + fat-jar mtime + roots |
+| `Cannot mock final class JsonCommand` | Inline mock maker in classpath mode (verified to self-attach in the sandbox JRE) |
+| `TypeNotPresentException SimpleReflectiveProcessor` (annotation value) | Interfaces faked `withoutAnnotations()` (inline maker rejects it for classes) |
+| Legacy: never past `"collectionsheet".equalsIgnoreCase(entityName)` | Path-setup retry with feedback → `event.getEntityName → STRING:collectionsheet` |
+| `Object → Calendar` (`findById` → `Optional<T>`) | Element type of Optional/List/Set resolved against the faked repository |
+| `Serializable → Long` (entity `getId()` returns `<ID extends Serializable>`) | Any type-variable return resolved (bounded too) |
+| Helper fixes not picked up by cached builds | Build cache key includes the `__EBInstantiate` helper source |
+
+| Listener | Scenarios | Findings | vs EXPECTED |
+|---|---|---|---|
+| `LoginAttemptEventListener.onAuthenticationFailure` | 4/4 | HIGH `saveAndFlush` — lost update on failed-attempt counter (fix: `@Version` / atomic UPDATE) | **L1 ✅** |
+| `LoginAttemptEventListener.onAuthenticationSuccess` | 3/3 | none | ✅ correct |
+| `NoteListener.onCreate` | 3/3 | HIGH duplicate `createNote` | N1 ✅ over-rated (LOW expected: in-process event) |
+| `NoteListener.onUpdate` | 4/4 | MEDIUM duplicate `createNote`; Ultra risk "onUpdate calls createNote" | N1 ✅; N2 half-seen (risk only) |
+| `NoteListener.onDelete` | 3/3 | MEDIUM duplicate `createNote`; Ultra risk "onDelete calls createNote" | N1 ✅; N2 half-seen |
+| `LegacyMeetingAttendanceListener.onUpdate` | 2/3 (1 NOT REACHED) | HIGH `meetingRepositoryWrapper.save` — check-then-create race vs unique constraint | **M1 ✅** (MEDIUM expected); M3 correctly no finding |
+
+Scan cost ~$0.13 + re-runs; all real-world work today ~$0.55 (usage log).
+Open: Legacy scenario 1 NOT REACHED (its retry prompt was identical to a cached one) → STEP 10b setup reuse.

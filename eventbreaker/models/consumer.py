@@ -46,3 +46,4 @@ class ConsumerAnalysis(BaseModel):
     objectCreations: list[ObjectCreationInfo] = []
     assignments: list[AssignmentInfo] = []
     variableInitializations: list[VariableInitializationInfo] = []
+    otherListenerMethods: list[str] = []   # listener methods in the class not analysed this run

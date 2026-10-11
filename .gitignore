@@ -45,6 +45,7 @@ dist/
 
 ### EventBreaker generated output ###
 eventbreaker-report.md
+eventbreaker-reports/
 *.png
 *.jpg
 *.jpeg

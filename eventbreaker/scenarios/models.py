@@ -8,9 +8,20 @@ class FaultInjection(BaseModel):
     delayMs: int = 0    # milliseconds — only used when fault=DELAY
 
 
+class ReturnValue(BaseModel):
+    """What a fake returns so execution reaches the risky code path.
+
+    target: "dep.method" or a getter path "dep.getA.getB" / "event.getA.getB".
+    returns: true | false | <number> | STRING:<text> | ENUM:<CONSTANT> | MOCK:<ConcreteType> | NULL
+    """
+    target: str
+    returns: str
+
+
 class TestConfig(BaseModel):
     callPattern: str                          # SINGLE | DUPLICATE | CONCURRENT
     faultInjections: list[FaultInjection] = []
+    returnValues: list[ReturnValue] = []      # real-classpath mode only
     observeOrdering: bool = False             # true if risk is about call order
     detectSwallowing: bool = False            # true if risk is about silent exception swallowing
 

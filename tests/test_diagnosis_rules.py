@@ -121,3 +121,41 @@ class TestParse:
     def test_scenario_defaults_to_scenario_type(self):
         assert _parse(json.dumps([finding("payment.charge")]), SCENARIO, self.R)[0].scenario \
             == "DOWNSTREAM_FAILURE"
+
+
+# ── Finding kind + duplicate-delivery guidance ───────────────────────────────
+
+from eventbreaker.diagnosis.analyzer import _finding_kind, _repetition_guidance
+from eventbreaker.scenarios.models import FaultInjection, TestConfig
+
+
+def _sc(pattern, faults=()):
+    return ChaosScenario(scenarioType="X", reason="r", expectedConcern="c",
+                         testConfig=TestConfig(callPattern=pattern, faultInjections=list(faults)))
+
+
+class TestFindingKind:
+    def test_duplicate_and_concurrent_are_repeated(self):
+        assert _finding_kind(_sc("DUPLICATE")) == "repeated"
+        assert _finding_kind(_sc("CONCURRENT")) == "repeated"
+
+    def test_single_with_fault_is_failure(self):
+        assert _finding_kind(_sc("SINGLE", [FaultInjection(dep="a", method="b", fault="THROW")])) == "failure"
+
+    def test_single_without_fault_is_other(self):
+        assert _finding_kind(_sc("SINGLE")) == "other"
+
+
+class TestRepetitionGuidance:
+    def test_only_for_repeated_delivery(self):
+        assert _repetition_guidance(_sc("SINGLE")) == ""
+        assert "setup / cleanup" in _repetition_guidance(_sc("DUPLICATE"))
+        assert "AT THE SAME TIME" in _repetition_guidance(_sc("CONCURRENT"))
+
+
+def test_parse_sets_kind_and_fault_target():
+    sc = _sc("SINGLE", [FaultInjection(dep="repo", method="save", fault="THROW")])
+    r = result(E(target="repo.save", callCount=1, threw=True), E(target="bus.publish", callCount=0))
+    out = _parse(json.dumps([finding("repo.save"), finding("bus.publish")]), sc, r)
+    assert [(x.affectedMethod, x.kind, x.onFaultedCall) for x in out] == [
+        ("repo.save", "failure", True), ("bus.publish", "failure", False)]

@@ -359,6 +359,7 @@ class ConsumerAnalyzerTest {
 
         assertEquals("onMessage", analysis.methodName());
         assertEquals("ContextualMessage", analysis.eventType());
+        assertEquals("KafkaListener", analysis.listenerAnnotation());
         assertEquals(java.util.List.of(), analysis.otherListenerMethods());
     }
 
@@ -369,6 +370,7 @@ class ConsumerAnalyzerTest {
 
         assertEquals("handleTagInsert", analysis.methodName());
         assertEquals("ControlTagCreationInternalEvent", analysis.eventType());
+        assertEquals("Subscribe", analysis.listenerAnnotation());
         assertEquals(5, analysis.otherListenerMethods().size());
         assertFalse(analysis.otherListenerMethods().contains("handleTagInsert"));
     }

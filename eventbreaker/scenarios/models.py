@@ -33,3 +33,24 @@ class ChaosScenario(BaseModel):
     targetMethod: str | None = None
     expectedConcern: str
     testConfig: TestConfig | None = None      # populated by Nemotron Ultra; None = theoretical
+
+
+def describe_test(scenario: ChaosScenario) -> str:
+    """Plain-language description of what the scenario did to the consumer."""
+    tc = scenario.testConfig
+    if tc is None:
+        return "not executed"
+    delivery = {
+        "SINGLE": "Delivered the event once",
+        "DUPLICATE": "Delivered the same event twice in a row (redelivery)",
+        "CONCURRENT": "Delivered the same event twice at the same time",
+    }.get(tc.callPattern, tc.callPattern)
+    faults = []
+    for fi in tc.faultInjections:
+        target = f"`{fi.dep}.{fi.method}`"
+        faults.append({
+            "THROW": f"made {target} throw on every call",
+            "THROW_ONCE": f"made {target} throw on its first call only",
+            "DELAY": f"made {target} wait {fi.delayMs or 500} ms",
+        }.get(fi.fault, f"{fi.fault} on {target}"))
+    return delivery + (" and " + "; ".join(faults) if faults else ", no injected failure")

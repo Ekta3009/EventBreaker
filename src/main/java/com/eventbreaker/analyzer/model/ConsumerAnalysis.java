@@ -12,6 +12,9 @@ public record ConsumerAnalysis(
         List<ObjectCreationInfo> objectCreations,
         List<AssignmentInfo> assignments,
         List<VariableInitializationInfo> variableInitializations,
-        List<String> otherListenerMethods
+        List<String> otherListenerMethods,
+        // Simple name of the annotation that marks the method (KafkaListener, EventListener, ...):
+        // tells diagnosis how the event is delivered.
+        String listenerAnnotation
 ) {
 }

@@ -47,3 +47,4 @@ class ConsumerAnalysis(BaseModel):
     assignments: list[AssignmentInfo] = []
     variableInitializations: list[VariableInitializationInfo] = []
     otherListenerMethods: list[str] = []   # listener methods in the class not analysed this run
+    listenerAnnotation: str = ""           # e.g. KafkaListener, EventListener, Subscribe

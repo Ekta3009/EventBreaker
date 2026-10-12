@@ -174,6 +174,8 @@ def _parse(raw: str, analysis: ConsumerAnalysis, source_code: str) -> list[Retur
     except json.JSONDecodeError:
         return None
     roots = {d.name for d in analysis.dependencies} | {"event"}
+    # Names inside string literals and comments are not types the consumer uses.
+    code = re.sub(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/', " ", source_code, flags=re.S)
     values: list[ReturnValue] = []
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
@@ -183,7 +185,7 @@ def _parse(raw: str, analysis: ConsumerAnalysis, source_code: str) -> list[Retur
         if target.split(".")[0] not in roots or "." not in target or not _VALUE.match(returns):
             continue
         # A MOCK type must be one the consumer actually names (compile-safe, no invention).
-        if returns.startswith("MOCK:") and not re.search(rf"\b{re.escape(returns[5:].split('.')[-1])}\b", source_code):
+        if returns.startswith("MOCK:") and not re.search(rf"\b{re.escape(returns[5:].split('.')[-1])}\b", code):
             continue
         values.append(ReturnValue(target=target, returns=returns))
     return values

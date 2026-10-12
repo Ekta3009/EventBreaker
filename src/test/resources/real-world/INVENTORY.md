@@ -184,3 +184,31 @@ Same commands as run 8. Execution unchanged: every scenario REPRODUCED and the p
 (diffed). Fineract: same single HIGH `saveAndFlush` finding. Kill Bill: 3 findings (HIGH `insertOverdueNotification`
 missing, MEDIUM `getAccountById` swallowed, HIGH duplicate insert) vs 6 in run 8 on the **same** observations, and
 PARTIAL_PROCESSING correctly empty again → diagnosis is not stable run to run (STEP 13).
+
+## Run 10 — 2026-10-13, STEP 13 hybrid diagnosis (runs A and B; B re-asked every Nemotron answer)
+
+Diagnosis now: code measures changes → Super labels each dependency call (effect + impact, 3 votes) and, for race
+scenarios, answers "can two runs interfere?" (3 votes) → code rubric decides findings + severity → Super writes text →
+Ultra reviewer may only rewrite/drop. Also fixed before this run: generic `save()` fake returns its argument (login
+listener no longer crashes after the save; `onAuthenticationSuccess` reaches 3/3), MOCK path-setup types ignore
+strings/comments, sandbox retries once. 9 listener methods, 0 errors, 0 not reached. Cost ~$0.36 for both runs.
+
+**Run-to-run agreement (A vs B): 15 findings each; 14/15 same call + kind, 12/15 same severity.** All differences are
+race findings: Super labelled the same read `impact DATA` in A and `impact SECURITY` in B (3/3 votes within each run),
+which moves the race rule between MEDIUM and HIGH. Votes inside one run agree; across runs the impact label drifts.
+
+| Listener | Findings (A / B where different) | vs EXPECTED |
+|---|---|---|
+| fineract `KafkaRemoteMessageListener` | HIGH swallowed `handle` failure; MEDIUM duplicate `handle`; MEDIUM concurrent (on `handle` / `beforeHandleMessage`) | F1 ✅ exact · F3 ✅ exact · F2 ✖ (Ultra did not generate that scenario this time) · F4 ✖ · concurrent = extra |
+| fineract `LoginAttemptEventListener.onAuthenticationFailure` | concurrent lost update on the failed-login counter MEDIUM / HIGH | L1 ✅ (A under-rated) · L2 ✖ (`saveAndFlush` labelled IDEMPOTENT_WRITE → harmless) · L3 ✔ |
+| fineract `…onAuthenticationSuccess` | none (now reaches all 3 scenarios) | ✔ |
+| fineract `NoteListener` ×3 | LOW duplicate `createNote` (cap: in-process); MEDIUM concurrent on onCreate/onUpdate | N1 ✅ exact · N2 ✖ · concurrent ×2 = extra |
+| fineract `LegacyMeetingAttendanceListener` | MEDIUM concurrent check-then-create | M1 ✅ exact · M2 ✖ (save labelled IDEMPOTENT_WRITE) · M3 ✔ |
+| killbill `handlePaymentInfoEvent` | HIGH swallowed `getAccountById`; HIGH duplicate insert; concurrent MEDIUM / HIGH | K1 ✅ exact · K3 ⬆ HIGH vs LOW · K4 ⬆ · K2 ✖ |
+| killbill `handleTagInsert` | HIGH swallowed `getChildrenAccounts`; HIGH duplicate insert | K1 ✅ · K3 ⬆ |
+
+**Score: 8 / 14 found** (was 11/14), **exact severity 5–6 of 8** (was 5 of 11), **over-rated 2** (K3, K4; was 6),
+**negative controls 3/3 + onAuthenticationSuccess**, false positives from run 8/9 gone (Legacy/LoginAttempt config
+failures, Kill Bill "silently skipped"). Lost vs before: F2 (scenario not generated — the risk prompt changed because
+the analysis now carries `listenerAnnotation`, so Ultra was re-asked), L2 + M2 (LOW duplicates on saves the labeller
+calls idempotent). Extras: concurrent findings that repeat the duplicate one (Kafka, NoteListener).

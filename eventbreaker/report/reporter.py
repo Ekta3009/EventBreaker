@@ -5,7 +5,7 @@ from eventbreaker.models.consumer import ConsumerAnalysis
 from eventbreaker.diagnosis.analyzer import KIND_LABELS
 from eventbreaker.models.observation import ObservationEntry, ObservationResult, ReliabilityFinding
 from eventbreaker.scenarios.experiment import ExperimentPlan
-from eventbreaker.scenarios.models import ChaosScenario
+from eventbreaker.scenarios.models import ChaosScenario, describe_test  # noqa: F401 (used by the CLI)
 
 
 def generate(
@@ -17,6 +17,9 @@ def generate(
     theoretical: list[tuple[ChaosScenario, ExperimentPlan]],
     sandbox: bool,
     baselines: dict[str, ObservationResult] | None = None,
+    dismissed: list[ReliabilityFinding] | None = None,
+    harmless: dict[str, list[str]] | None = None,
+    labels: dict | None = None,
 ) -> str:
     """Render a Markdown reliability report and return it as a string.
 
@@ -151,10 +154,42 @@ def generate(
             f"**Kind:** {KIND_LABELS.get(finding.kind, finding.kind)}  \n"
             f"**Observed:** {finding.summary}\n"
         )
+        if finding.evidence:
+            sections.append("\n**Measured evidence:**\n" + "".join(f"- {e}\n" for e in finding.evidence))
         sections.append(f"\n**Why it matters:** {finding.explanation}\n")
         sections.append(f"\n**Suggested fix:** {finding.suggestedFix}\n")
+        if finding.severityNote:
+            sections.append(f"\n**Severity basis (rules):** {finding.severityNote}\n")
+        if finding.reviewNote:
+            sections.append(f"\n**Reviewer (Nemotron Ultra):** {finding.reviewNote}\n")
         if finding.alsoSeenIn:
             sections.append(f"\n**Also seen in:** {', '.join(finding.alsoSeenIn)}\n")
+
+    if harmless:
+        sections.append(
+            "\n### Harmless changes\n"
+            "_Measured differences from the fault-free run that no finding covers "
+            "(e.g. reads repeated). Listed so nothing measured is hidden._\n\n"
+        )
+        for scenario_type, items in harmless.items():
+            sections.append(f"- **{scenario_type}:** {'; '.join(items)}\n")
+
+    if labels:
+        sections.append(
+            "\n### What each dependency call does\n"
+            "_Nemotron Super's answer to a closed question, asked 3× — majority shown with agreement._\n\n"
+            "| Call | Effect | Impact | Votes | Reason |\n|---|---|---|---|---|\n"
+        )
+        for name, lb in sorted(labels.items()):
+            sections.append(f"| `{name}` | {lb.effect} | {lb.impact} | {lb.agreement} | {lb.reason} |\n")
+
+    if dismissed:
+        sections.append(
+            f"\n### Dismissed by the reviewer ({len(dismissed)})\n"
+            "_Diagnosis reported these, but Nemotron Ultra judged them not to be production risks._\n\n"
+        )
+        for f in dismissed:
+            sections.append(f"- `{f.affectedMethod}` ({f.scenario}, was {f.severity}): {f.reviewNote}\n")
 
     # ── Theoretical risks ─────────────────────────────────────────────────────
     if theoretical:
@@ -195,27 +230,6 @@ def save(report: str, analysis: ConsumerAnalysis, output_dir: Path = REPORTS_DIR
         n += 1
     path.write_text(report, encoding="utf-8")
     return path
-
-
-def describe_test(scenario: ChaosScenario) -> str:
-    """Plain-language description of what the scenario did to the consumer."""
-    tc = scenario.testConfig
-    if tc is None:
-        return "not executed"
-    delivery = {
-        "SINGLE": "Delivered the event once",
-        "DUPLICATE": "Delivered the same event twice in a row (redelivery)",
-        "CONCURRENT": "Delivered the same event twice at the same time",
-    }.get(tc.callPattern, tc.callPattern)
-    faults = []
-    for fi in tc.faultInjections:
-        target = f"`{fi.dep}.{fi.method}`"
-        faults.append({
-            "THROW": f"made {target} throw on every call",
-            "THROW_ONCE": f"made {target} throw on its first call only",
-            "DELAY": f"made {target} wait {fi.delayMs or 500} ms",
-        }.get(fi.fault, f"{fi.fault} on {target}"))
-    return delivery + (" and " + "; ".join(faults) if faults else ", no injected failure")
 
 
 def _call_status(obs: ObservationEntry | None, count: int, baseline: int | None) -> str:

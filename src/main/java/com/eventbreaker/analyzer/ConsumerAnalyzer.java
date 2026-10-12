@@ -191,7 +191,8 @@ public class ConsumerAnalyzer {
                 objectCreations,
                 assignments,
                 variableInitializations,
-                otherListenerMethods
+                otherListenerMethods,
+                listenerAnnotation(consumerMethod)
         );
     }
 
@@ -207,6 +208,15 @@ public class ConsumerAnalyzer {
         return method.getAnnotations()
                 .stream()
                 .anyMatch(a -> LISTENER_ANNOTATIONS.contains(simpleName(a)));
+    }
+
+    private static String listenerAnnotation(MethodDeclaration method) {
+        return method.getAnnotations()
+                .stream()
+                .map(ConsumerAnalyzer::simpleName)
+                .filter(LISTENER_ANNOTATIONS::contains)
+                .findFirst()
+                .orElse("");
     }
 
     private static String simpleName(AnnotationExpr annotation) {

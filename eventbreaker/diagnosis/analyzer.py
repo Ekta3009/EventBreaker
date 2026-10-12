@@ -1,89 +1,175 @@
+"""Diagnosis: turn one scenario's measurements into findings.
+
+Code measures (every change against the fault-free baseline), Nemotron Super answers small
+closed questions about each dependency call (classify.py, majority of 3 votes), code decides
+which findings exist and how severe they are (rubric.py), and Super only writes their text.
+"""
 import json
-import os
 import re
+from dataclasses import dataclass
 
-from openai import OpenAI
-
-from eventbreaker.agent import usage
-from pydantic import ValidationError
-
+from eventbreaker.agent import llm
+from eventbreaker.diagnosis.classify import Label, check_interference
+from eventbreaker.diagnosis.rubric import Draft, assess
 from eventbreaker.models.consumer import ConsumerAnalysis
 from eventbreaker.models.observation import ObservationResult, ReliabilityFinding
-from eventbreaker.scenarios.models import ChaosScenario
+from eventbreaker.scenarios.models import ChaosScenario, describe_test
 
-_MODEL = "nvidia/nemotron-3-super-120b-a12b"
-_BASE_URL = "https://api.tokenfactory.nebius.com/v1/"
+_MODEL = llm.SUPER
 
-_SYSTEM_PROMPT = """\
-You are an expert in distributed systems reliability and event-driven architecture.
+# ── How the event reaches the listener ────────────────────────────────────────
 
-You will receive:
-1. A Java event consumer's structure (class, method, dependencies, call order)
-2. The source code of that consumer
-3. A chaos scenario that was executed against it
-4. Observations — for each dependency method: how many times it was called, and whether it threw
+_BROKER = {"KafkaListener", "RabbitListener", "RabbitHandler", "JmsListener", "SqsListener", "StreamListener"}
+_IN_PROCESS = {"EventListener", "TransactionalEventListener"}
+_BUS = {"Subscribe"}
 
-Your task: produce a JSON array of ReliabilityFinding objects — one for EACH \
-method listed as a concern target. Use the observation signals to reason:
-- called > 1: the method executed multiple times — explain the duplicate-call risk
-- called = 0: the method was never reached — explain the skipped-call risk
-- threw = true: the method was called but threw — explain what was left inconsistent
-- called = 1, threw = false: normal execution — explain the atomicity or sequencing risk
-  (e.g. this call succeeded but a later call failed, leaving state partially committed)
-
-Each finding must use this exact format:
-{
-  "scenario": "<the scenario type>",
-  "summary": "<one sentence: what was concretely observed for this specific method>",
-  "explanation": "<2-3 sentences: why this specific method being called N times or being skipped is a production risk>",
-  "affectedMethod": "<dependency.method for this finding, e.g. paymentClient.charge>",
-  "suggestedFix": "<concrete fix referencing the actual code for this specific method>",
-  "severity": "<HIGH | MEDIUM | LOW | NONE>"
+TRANSPORT_TEXT = {
+    "broker": (
+        "message broker (at-least-once): a message is redelivered after a failure or a consumer "
+        "rebalance, so duplicate delivery is normal; an exception thrown by the listener causes redelivery; "
+        "an exception the listener swallows means the message is acknowledged and the work is lost."
+    ),
+    "in-process": (
+        "in-process Spring event: the listener is a synchronous method call inside the publishing code. "
+        "There is NO broker and NO redelivery — the same event only runs twice if the code publishes it "
+        "twice. Concurrent runs are still real (two requests at once). An exception thrown by the listener "
+        "propagates to the code that published the event; one the listener swallows is simply lost."
+    ),
+    "event-bus": (
+        "event bus (@Subscribe): delivery guarantees depend on the bus — some persist and retry events, "
+        "some are in-memory. Judge from the source; do not assume broker-style redelivery."
+    ),
+    "unknown": "unknown delivery mechanism.",
 }
 
-Judge whether each observation is a real production risk. Decide from the consumer's source code what each dependency call does to external state — do not assume a risk just because a method ran more than once or an exception occurred:
-- READ: returns data and changes nothing (a lookup or query). Running it again is harmless.
-- IDEMPOTENT WRITE: repeating it with the same input leaves the same state (overwriting a value under the same key, setting a field, an upsert).
-- NON-IDEMPOTENT SIDE EFFECT: repeating it changes state again or is visible externally (charging, sending a message or email, publishing an event, inserting a row, incrementing, reserving, appending).
 
-Severity rules:
-- A READ called more than once → severity NONE.
-- An IDEMPOTENT WRITE repeated with the same input → severity NONE. Under concurrency, at most LOW, and only if the code shows two deliveries could write different values in the wrong order.
-- A NON-IDEMPOTENT SIDE EFFECT executed more than once → HIGH (money, inventory, external messages) or MEDIUM.
-- The consumer threw (the exception propagated, so the broker will redeliver) and the only calls that completed before the failure were READs or IDEMPOTENT WRITEs → severity NONE. This is the safe outcome: nothing was left half-done and the retry repeats it cleanly.
-- A NON-IDEMPOTENT SIDE EFFECT completed before a failure → HIGH or MEDIUM: the retry repeats it, or state is left partially committed.
-- The consumer did NOT throw (it completed or swallowed the exception), but a call failed or was skipped → the message is acknowledged and that work is lost: HIGH or MEDIUM, unless the skipped work is only a READ.
-- LOW is for real but minor risks (extra latency, a harmless log line written twice).
-- Use NONE whenever the observation is the expected, safe behaviour. A finding with severity NONE is discarded and not shown to the user, so do not inflate severity to make it count.
+def transport(analysis: ConsumerAnalysis) -> str:
+    """broker | in-process | event-bus | unknown, from the listener's annotation."""
+    a = analysis.listenerAnnotation
+    if a in _BROKER:
+        return "broker"
+    if a in _IN_PROCESS:
+        return "in-process"
+    if a in _BUS:
+        return "event-bus"
+    return "unknown"
 
-Rules:
-- Produce one finding per concerning method — do not merge multiple methods into one finding.
-- Reference actual class names, field names, and method names from the consumer code.
-- suggestedFix must be actionable — name the specific check or pattern (idempotency key, existence check, outbox pattern, compensating transaction, etc).
-- affectedMethod MUST be exactly "dependencyFieldName.methodName" — e.g. "paymentClient.charge".
-  NO parentheses, NO arguments, NO full expressions. Just field name dot method name.
-- Return ONLY the JSON array — no explanation, no markdown fences, no extra text.\
+
+# ── What was measured ─────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class Change:
+    """One measured difference that a finding must account for."""
+    target: str                 # dependency.method
+    kind: str                   # MISSING | EXTRA | THREW
+    before: int | None = None   # calls in the fault-free baseline (None without a baseline)
+    after: int = 0              # calls in this scenario
+
+    def describe(self) -> str:
+        if self.kind == "THREW":
+            return f"{self.target} threw"
+        base = f" (baseline {self.before}×)" if self.before is not None else ""
+        word = "missing" if self.kind == "MISSING" else "extra"
+        return f"{self.target}: called {self.after}×{base} — {word}"
+
+
+def measured_changes(result: ObservationResult, baseline: ObservationResult | None) -> list[Change]:
+    """Every call whose count differs from the baseline, plus every call that threw."""
+    changes: list[Change] = []
+    if baseline is not None:
+        base = {o.target: o.callCount for o in baseline.observations}
+        now = {o.target: o.callCount for o in result.observations}
+        for t in sorted(base.keys() | now.keys()):
+            b, n = base.get(t, 0), now.get(t, 0)
+            if b != n:
+                changes.append(Change(t, "MISSING" if n < b else "EXTRA", b, n))
+    else:
+        changes += [Change(o.target, "EXTRA", None, o.callCount) for o in result.observations if o.callCount > 1]
+    changes += [Change(o.target, "THREW", None, o.callCount) for o in result.observations if o.threw]
+    return changes
+
+
+def listener_outcome(result: ObservationResult) -> str:
+    """The measured outcome of the listener call itself — part of every finding's evidence."""
+    if result.consumerThrew:
+        return f"the listener THREW ({result.consumerException or 'an exception'}) — the failure was not swallowed"
+    return "the listener did NOT throw — it completed normally or caught the exception"
+
+
+# ── Writing the text ──────────────────────────────────────────────────────────
+
+_WRITER_PROMPT = """\
+You write findings for developers about a Java event listener. Each finding has ALREADY been decided —
+its severity and the call it is about are fixed by measurement and rules; do not change or question
+them. The listener was run with recording fakes for every dependency (no real database, broker or
+network) and compared with a fault-free run; the measured evidence is given.
+
+For each finding write:
+- "summary": one sentence stating what was measured.
+- "explanation": 2-3 sentences on what this means in production for this listener, using the source.
+  Only state what the evidence shows or the source makes certain; describe production consequences
+  as what WOULD happen — the fakes cannot show database, broker or network effects.
+- "suggestedFix": a concrete fix referencing the actual code.
+
+Return ONLY a JSON array with one object per finding, in the same order:
+[{"summary": "...", "explanation": "...", "suggestedFix": "..."}]\
 """
 
 
-def _has_observation_signal(result: ObservationResult) -> bool:
-    """Return True if observations contain at least one anomalous signal.
+def _write_text(
+    analysis: ConsumerAnalysis, scenario: ChaosScenario, drafts: list[Draft],
+    labels: dict[str, Label], source_code: str, fresh: bool,
+) -> list[dict]:
+    blocks = []
+    for i, d in enumerate(drafts, 1):
+        involved = sorted({e.split(":")[0].split(" ")[0] for e in d.evidence if "." in e.split(" ")[0]})
+        label_lines = "".join(
+            f"\n    {t}: {labels[t].describe()} — {labels[t].reason}" for t in involved if t in labels
+        )
+        blocks.append(
+            f"Finding {i}: severity {d.severity} on {d.affectedMethod}\n"
+            f"  Why this severity: {d.basis}\n"
+            f"  Measured evidence: {'; '.join(d.evidence)}"
+            + (f"\n  What the calls do:{label_lines}" if label_lines else "")
+        )
+    user = (
+        f"Listener: {analysis.className}.{analysis.methodName}({analysis.eventType})\n"
+        f"Delivery: {TRANSPORT_TEXT[transport(analysis)]}\n"
+        f"Scenario: {scenario.scenarioType} — {describe_test(scenario).replace('`', '')}\n"
+        f"Concern: {scenario.expectedConcern}\n\n"
+        + "\n\n".join(blocks)
+        + f"\n\nSource code:\n{source_code}\n\nReturn the JSON array of {len(drafts)} findings."
+    )
+    raw = llm.chat(
+        _MODEL, [{"role": "system", "content": _WRITER_PROMPT}, {"role": "user", "content": user}],
+        "diagnosis", valid=lambda r: len(_items(r) or []) == len(drafts), fresh=fresh,
+    )
+    texts = _items(raw) or []
+    return texts if len(texts) == len(drafts) else [{} for _ in drafts]
 
-    A signal means: any method called more than once, any method that threw,
-    or any expected dependency method that was never called (skipped).
-    Without a signal, diagnosis would be speculative rather than evidence-based.
-    """
-    return any(o.callCount > 1 or o.threw for o in result.observations) or result.consumerThrew
+
+def _items(raw: str) -> list[dict] | None:
+    """The JSON array in a reply (a single object is wrapped), or None if there is none."""
+    cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
+    for opener, closer in (("[", "]"), ("{", "}")):
+        start, end = cleaned.find(opener), cleaned.rfind(closer) + 1
+        if start == -1 or end == 0:
+            continue
+        try:
+            data = json.loads(cleaned[start:end])
+        except json.JSONDecodeError:
+            continue
+        items = data if isinstance(data, list) else [data]
+        return [i for i in items if isinstance(i, dict)]
+    return None
 
 
-def _failed_before_any_completed_call(result: ObservationResult) -> bool:
-    """Return True if the consumer threw and no dependency call completed without throwing.
+# ── Diagnose ──────────────────────────────────────────────────────────────────
 
-    Uses only the observed calls, never method names: if every call that ran threw,
-    no external state was changed before the exception propagated.
-    """
-    completed = [o for o in result.observations if o.callCount > 0 and not o.threw]
-    return result.consumerThrew and not completed
+@dataclass
+class Diagnosis:
+    findings: list[ReliabilityFinding]
+    harmless: list[str]          # measured changes that no finding covers
 
 
 def diagnose(
@@ -91,326 +177,56 @@ def diagnose(
     scenario: ChaosScenario,
     result: ObservationResult,
     source_code: str,
+    labels: dict[str, Label],
     baseline: ObservationResult | None = None,
-) -> list[ReliabilityFinding]:
-    """Send observations to Nemotron and return one ReliabilityFinding per concern.
+    fresh: bool = False,
+) -> Diagnosis:
+    """Findings for one executed scenario.
 
-    Returns an empty list if there is no observation signal to diagnose.
-    Raises EnvironmentError if NEBIUS_API_KEY is not set.
-    Raises ValueError if Nemotron returns nothing usable.
+    Code decides which findings exist and their severity (rubric.assess) from the measured
+    changes and the voted call labels; Nemotron Super only writes their text. Every measured
+    change ends up either in a finding's evidence or in the harmless list.
     """
-    # No anomalous signal — diagnosing would produce speculative, low-quality findings.
-    dep_names = {d.name for d in analysis.dependencies}
-    observed_targets = {o.target for o in result.observations}
-    expected_dep_calls = [
-        c.expression for c in analysis.methodCalls
-        if c.scope in dep_names
-    ]
-    skipped = [
-        expr for expr in expected_dep_calls
-        if not any(
-            expr.startswith(t) or (
-                t.split(".")[0] == expr.split(".")[0]
-                and t.split(".")[-1] in expr
-            )
-            for t in observed_targets
-        )
-    ]
-    deltas = _baseline_deltas(result, baseline) if baseline else None
-    if deltas is not None:
-        # With a fault-free baseline, the signal is exactly what changed.
-        if not deltas and not any(o.threw for o in result.observations) and not result.consumerThrew:
-            return []
-    elif not _has_observation_signal(result) and not skipped:
-        return []
-
-    # The exception reached the broker before any dependency call completed:
-    # nothing was changed, so redelivery repeats the work cleanly. Not a finding.
-    if _failed_before_any_completed_call(result):
-        return []
-
-    api_key = os.environ.get("NEBIUS_API_KEY")
-    if not api_key:
-        raise EnvironmentError(
-            "NEBIUS_API_KEY environment variable is not set."
-        )
-
-    client = OpenAI(base_url=_BASE_URL, api_key=api_key)
-
-    response = client.chat.completions.create(
-        model=_MODEL,
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": _build_prompt(analysis, scenario, result, source_code, deltas)},
-        ],
-        temperature=0.3,
-        max_tokens=8192,
-    )
-    usage.record(_MODEL, getattr(response, "usage", None), "diagnosis")
-
-    message = response.choices[0].message
-    raw = message.content
-    if raw is None:
-        raw = getattr(message, "reasoning_content", None)
-    if raw is None:
-        raise ValueError("Nemotron returned no content for diagnosis.")
-
-    return _parse(raw.strip(), scenario, result)
-
-
-def _baseline_deltas(
-    result: ObservationResult, baseline: ObservationResult
-) -> dict[str, tuple[int, int]]:
-    """target -> (baseline count, scenario count) for every call whose count changed."""
-    base = {o.target: o.callCount for o in baseline.observations}
-    now = {o.target: o.callCount for o in result.observations}
-    return {
-        t: (base.get(t, 0), now.get(t, 0))
-        for t in sorted(base.keys() | now.keys())
-        if base.get(t, 0) != now.get(t, 0)
-    }
-
-
-def _build_prompt(
-    analysis: ConsumerAnalysis,
-    scenario: ChaosScenario,
-    result: ObservationResult,
-    source_code: str,
-    deltas: dict[str, tuple[int, int]] | None = None,
-) -> str:
-    deps = ", ".join(f"{d.name} ({d.type})" for d in analysis.dependencies)
-    calls = " → ".join(c.expression for c in analysis.methodCalls)
-
-    obs_lines = "\n".join(
-        f"  {o.target}: called {o.callCount} time(s)"
-        + (" [THREW]" if o.threw else "")
-        for o in result.observations
-    )
-    doubled = [o for o in result.observations if o.callCount > 1]
-    doubled_summary = (
-        ", ".join(f"{o.target} ({o.callCount}x)" for o in doubled) or "none"
-    )
-    consumer_threw_line = (
-        "Consumer threw an exception: YES (it propagated — the broker will redeliver the event)"
-        if result.consumerThrew
-        else "Consumer threw an exception: NO (the handler completed or swallowed the exception "
-        "— the event is acknowledged)"
-    )
-    call_seq_line = (
-        "Call sequence (in order): " + " → ".join(result.callSequence)
-        if result.callSequence else "Call sequence: (empty — consumer may have thrown before any dep call)"
-    )
-
-    # Compute which dep methods were skipped entirely (never appeared in observations).
-    observed_targets = {o.target for o in result.observations}
-    dep_names = {d.name for d in analysis.dependencies}
-    expected_dep_calls = [
-        c.expression for c in analysis.methodCalls
-        if c.scope in dep_names
-    ]
-    skipped = [
-        expr for expr in expected_dep_calls
-        if not any(expr.startswith(t) or t.split(".")[0] == expr.split(".")[0]
-                   and t.split(".")[-1] in expr
-                   for t in observed_targets)
-    ]
-    threw = [o for o in result.observations if o.threw]
-
-    # Determine which methods need a finding based on the actual observation signals.
-    if deltas is not None:
-        # Compared with a fault-free run of the same input: report exactly what changed.
-        changed = [
-            f"  {t}: {b} call(s) without the fault, {n} with it "
-            + ("(MISSING — work that did not happen)" if n < b else "(EXTRA — work repeated)")
-            for t, (b, n) in deltas.items()
-        ]
-        concern_targets = list(deltas) + [o.target for o in threw if o.target not in deltas]
-        concern_description = "different from the fault-free baseline run, or threw"
-        skipped_section = (
-            "\nDifference from a fault-free run of the same event (the baseline):\n"
-            + ("\n".join(changed) if changed else "  (no call-count changes)")
-            + ("\nMethods that THREW an exception:\n" + "\n".join(f"  {o.target}" for o in threw) if threw else "")
-            + "\nCounts that equal the baseline are the consumer's normal behaviour for one event "
-            "(e.g. one call per related account) — they are not duplicates."
-        )
-        doubled_summary = ", ".join(t for t, (b, n) in deltas.items() if n > b) or "none"
-    elif doubled:
-        concern_targets = [o.target for o in doubled]
-        concern_description = "called more than once"
-        skipped_section = ""
-    elif skipped:
-        concern_targets = skipped
-        concern_description = "skipped after the failure"
-        skipped_section = (
-            "\nDependency calls SKIPPED after failure (never executed):\n"
-            + "\n".join(f"  {s}" for s in skipped)
-        )
-    elif threw:
-        # A method was called but threw — focus on what preceded it (committed)
-        # and the method that threw (lost the operation).
-        committed = [o.target for o in result.observations if not o.threw and o.callCount > 0]
-        concern_targets = committed + [o.target for o in threw]
-        concern_description = "executed before or at the failure point"
-        skipped_section = (
-            "\nMethods that THREW an exception:\n"
-            + "\n".join(f"  {o.target}" for o in threw)
-            + "\nMethods that committed successfully before the throw:\n"
-            + "\n".join(f"  {t}" for t in committed)
-        )
-    else:
-        # No strong anomaly signal — only report on methods directly relevant
-        # to the scenario concern (avoid findings for healthy, unrelated methods).
-        concern_targets = [o.target for o in result.observations if o.callCount > 0][:2]
-        concern_description = "observed"
-        skipped_section = ""
-
-    target_list = "\n".join(f"  - {t}" for t in concern_targets)
-
-    return f"""\
-Consumer:     {analysis.className}.{analysis.methodName}
-Event type:   {analysis.eventType}
-Dependencies: {deps}
-Call order:   {calls}
-
-Scenario type:    {scenario.scenarioType}
-Scenario reason:  {scenario.reason}
-Expected concern: {scenario.expectedConcern}
-
-Observations (call counts after scenario execution):
-{obs_lines}
-
-{consumer_threw_line}
-{call_seq_line}
-
-Methods called more than once: {doubled_summary}{skipped_section}
-{_repetition_guidance(scenario)}
-Source code:
-{source_code}
-
-IMPORTANT: Your findings must specifically address the concern above ("{scenario.expectedConcern}").
-Do not produce generic idempotency findings if this scenario is about something else \
-(e.g. silent data loss, transaction boundaries, partial failures).
-Tailor the summary, explanation, and suggestedFix to this specific concern.
-
-These dependency methods were {concern_description} and each needs its own finding:
-{target_list}
-
-Produce exactly {len(concern_targets)} ReliabilityFinding objects — one per method listed above.
-Apply the severity rules: use NONE for any method whose observation is not a production risk.
-Return a JSON array of exactly {len(concern_targets)} findings."""
-
-
-def _repetition_guidance(scenario: ChaosScenario) -> str:
-    """Extra instructions when the scenario delivers the event more than once."""
+    changes = measured_changes(result, baseline)
     tc = scenario.testConfig
-    if tc is None or tc.callPattern not in ("DUPLICATE", "CONCURRENT"):
-        return ""
-    how = "twice in a row" if tc.callPattern == "DUPLICATE" else "twice at the same time"
-    return f"""
-THIS SCENARIO DELIVERED THE SAME EVENT {how.upper()}.
-Every call the consumer makes for one event therefore happens again — that alone is NOT a problem.
-Report a method only if doing its work a second time for the same event causes harm
-(money charged twice, a second email/message/event sent, a duplicate record created, a counter
-incremented twice, stock reserved twice, a job run twice with different results).
-These are NEVER findings here — give them severity NONE:
-- READs and IDEMPOTENT WRITEs (same input → same state).
-- Per-message setup / cleanup that runs once per delivery (e.g. before/after, open/close,
-  begin/end, set/clear context, acquire/release) — each delivery cleaning up after itself is correct.
-- Acknowledging / committing the message once per delivery.
-- Work that only recomputes or refreshes current state from the source of truth.
-"""
+    interference = (
+        check_interference(analysis, source_code, scenario, fresh=fresh)
+        if tc is not None and tc.callPattern == "CONCURRENT" and changes else None
+    )
+    assessment = assess(scenario, result, changes, labels, transport(analysis),
+                        listener_outcome(result), interference)
+    if not assessment.drafts:
+        return Diagnosis([], assessment.harmless)
 
-
-def _parse(
-    raw: str,
-    scenario: ChaosScenario,
-    result: ObservationResult,
-) -> list[ReliabilityFinding]:
-    cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
-
-    # Accept either a JSON array or a single object (wrap single object in list)
-    start_arr = cleaned.find("[")
-    start_obj = cleaned.find("{")
-
-    if start_arr != -1 and (start_obj == -1 or start_arr < start_obj):
-        end = cleaned.rfind("]") + 1
-        if end == 0:
-            raise ValueError(
-                f"Nemotron did not return a complete JSON array.\nRaw response:\n{raw}"
-            )
-        try:
-            data = json.loads(cleaned[start_arr:end])
-        except json.JSONDecodeError as e:
-            raise ValueError(
-                f"Nemotron returned invalid JSON: {e}\nRaw response:\n{raw}"
-            ) from e
-        items = data if isinstance(data, list) else [data]
-    elif start_obj != -1:
-        end = cleaned.rfind("}") + 1
-        try:
-            items = [json.loads(cleaned[start_obj:end])]
-        except json.JSONDecodeError as e:
-            raise ValueError(
-                f"Nemotron returned invalid JSON: {e}\nRaw response:\n{raw}"
-            ) from e
-    else:
-        raise ValueError(
-            f"Nemotron did not return a JSON object or array.\nRaw response:\n{raw}"
+    texts = _write_text(analysis, scenario, assessment.drafts, labels, source_code, fresh)
+    findings = [
+        ReliabilityFinding(
+            scenario=scenario.scenarioType,
+            summary=str(t.get("summary") or f"{d.affectedMethod}: " + "; ".join(d.evidence[:-1])),
+            explanation=str(t.get("explanation") or d.basis),
+            affectedMethod=d.affectedMethod,
+            suggestedFix=str(t.get("suggestedFix") or "Review this call's error handling and idempotency."),
+            severity=d.severity,
+            kind=d.kind,
+            onFaultedCall=d.affectedMethod in _fault_targets(scenario),
+            callPattern=tc.callPattern if tc else "",
+            evidence=d.evidence,
+            severityNote=d.basis,
         )
-
-    findings: list[ReliabilityFinding] = []
-    benign = 0
-    for item in items:
-        if str(item.get("severity", "")).upper() == "NONE":
-            benign += 1
-            continue
-        item.setdefault("scenario", scenario.scenarioType)
-        item["kind"] = _finding_kind(scenario)
-        if not item.get("affectedMethod") and result.observations:
-            top = max(result.observations, key=lambda o: o.callCount)
-            item["affectedMethod"] = top.target
-        # The model sometimes copies the scenario's target into every finding.
-        # When the summary names exactly one observed dep.method, trust the summary.
-        mentioned = [
-            o.target for o in result.observations
-            if o.target in str(item.get("summary", ""))
-        ]
-        if len(mentioned) == 1 and item.get("affectedMethod") != mentioned[0]:
-            item["affectedMethod"] = mentioned[0]
-        item["onFaultedCall"] = item.get("affectedMethod") in _fault_targets(scenario)
-        try:
-            findings.append(ReliabilityFinding.model_validate(item))
-        except ValidationError:
-            continue
-
-    if not findings and not benign:
-        raise ValueError(
-            f"No valid ReliabilityFinding objects in Nemotron response.\n"
-            f"Raw response:\n{raw}"
-        )
-
-    return findings
+        for d, t in zip(assessment.drafts, texts)
+    ]
+    return Diagnosis(findings, assessment.harmless)
 
 
 _SEVERITY_RANK = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 
+
 KIND_LABELS = {
-    "repeated": "work repeated (duplicate / concurrent delivery)",
+    "repeated": "work repeated (duplicate delivery)",
+    "concurrent": "concurrent deliveries",
     "failure": "behaviour when a dependency fails",
     "other": "observed behaviour",
 }
-
-
-def _finding_kind(scenario: ChaosScenario) -> str:
-    """What kind of problem a scenario can reveal — decided by how it was run, not by the LLM."""
-    tc = scenario.testConfig
-    if tc is None:
-        return "other"
-    if tc.callPattern in ("DUPLICATE", "CONCURRENT"):
-        return "repeated"
-    if tc.faultInjections:
-        return "failure"
-    return "other"
 
 
 def _fault_targets(scenario: ChaosScenario) -> set[str]:

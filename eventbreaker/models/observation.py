@@ -27,5 +27,9 @@ class ReliabilityFinding(BaseModel):
     suggestedFix: str              # concrete fix advice referencing the actual code
     severity: str = "HIGH"        # HIGH | MEDIUM | LOW
     alsoSeenIn: list[str] = []     # other scenarios that reported this method (set by merge_findings)
-    kind: str = "other"            # repeated | failure | other — from the scenario that produced it (set by diagnose)
+    kind: str = "other"            # repeated | failure | other | unexplained — from how the scenario ran (set by diagnose)
     onFaultedCall: bool = False    # the scenario injected its fault on this very method
+    callPattern: str = ""          # SINGLE | DUPLICATE | CONCURRENT of the scenario that produced it
+    evidence: list[str] = []       # measured changes this finding explains — attached by code, not the LLM
+    severityNote: str = ""         # why code adjusted the severity (e.g. in-process duplicate capped at LOW)
+    reviewNote: str = ""           # what the reviewer (Nemotron Ultra) changed, if anything

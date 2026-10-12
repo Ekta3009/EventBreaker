@@ -26,6 +26,17 @@ class SandboxExecutor:
     Requires NEBIUS_API_KEY and NEBIUS_PROJECT_ID in the environment.
     """
 
+    @staticmethod
+    def _run_once(sandbox, jar_path: Path):
+        return sandbox.run(
+            shell=(
+                "apk add --no-cache openjdk21-jre-headless >/dev/null 2>&1 "
+                f"&& java -jar {_JAR_PATH}"
+            ),
+            files={_JAR_PATH: jar_path},
+            timeout=_TIMEOUT_SECONDS,
+        ).wait()
+
     def execute(self, jar_path: Path) -> tuple[str, str]:
         """Upload jar_path to sandbox, install JRE, run it.
 
@@ -46,21 +57,20 @@ class SandboxExecutor:
         sandbox = client.images.use(_IMAGE)
 
         try:
-            result = sandbox.run(
-                shell=(
-                    "apk add --no-cache openjdk21-jre-headless >/dev/null 2>&1 "
-                    f"&& java -jar {_JAR_PATH}"
-                ),
-                files={_JAR_PATH: jar_path},
-                timeout=_TIMEOUT_SECONDS,
-            ).wait()
+            try:
+                result = self._run_once(sandbox, jar_path)
+            except (OperationTimedOutError, FailedOperationError):
+                raise
+            except ContreeError:
+                # A dropped connection (e.g. during the JAR upload) is transient: retry once.
+                result = self._run_once(sandbox, jar_path)
         except OperationTimedOutError as e:
             raise RuntimeError(
                 f"Sandbox execution timed out after {_TIMEOUT_SECONDS}s: {e}"
             ) from e
         except FailedOperationError as e:
             raise RuntimeError(f"Sandbox operation failed: {e}") from e
-        except ContreeError as e:  # upload / transport / API errors
+        except ContreeError as e:  # upload / transport / API errors, twice
             raise RuntimeError(f"Sandbox request failed: {type(e).__name__}: {e}") from e
 
         stdout = result.stdout or ""

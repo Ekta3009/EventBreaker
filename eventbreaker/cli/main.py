@@ -20,6 +20,8 @@ from eventbreaker.agent.path_setup import (
     forget_plan, not_reached, plan_path, reach_feedback, reusable_setup, target_calls,
 )
 from eventbreaker.diagnosis.analyzer import KIND_LABELS, diagnose, merge_findings
+from eventbreaker.diagnosis.classify import label_calls
+from eventbreaker.diagnosis.reviewer import review
 from eventbreaker.models.observation import ObservationResult, ReliabilityFinding
 from eventbreaker.report import reporter
 from eventbreaker.scenarios.models import ChaosScenario, TestConfig
@@ -68,7 +70,7 @@ def analyze_consumer(
              "Default: read from the listener's own Maven/Gradle module.",
     ),
     fresh: bool = typer.Option(
-        False, "--fresh", help="Ignore the cached risk-identification response and call Nemotron Ultra again.",
+        False, "--fresh", help="Ignore cached Nemotron answers (risks, diagnosis, review) and ask again.",
     ),
 ) -> dict:
     """Analyze an event consumer and identify reliability risks."""
@@ -308,7 +310,24 @@ def analyze_consumer(
     console.print()
 
     # ── Step 5: Nemotron diagnosis for every reproduced scenario ──────────────
+    # Closed questions first: what each dependency call does (3 votes), shared by all scenarios.
+    reproduced = [(sc, r) for sc, r in executions if r.status == "REPRODUCED" and r.observations]
+    methods = {o.target for _, r in reproduced for o in r.observations} | {
+        o.target for b in baselines.values() for o in b.observations
+    }
+    labels = {}
+    if reproduced:
+        with console.status("[bold green]Classifying dependency calls (Nemotron Super, 3 votes)..."):
+            try:
+                labels = label_calls(analysis, source_code, sorted(methods), fresh=fresh)
+            except EnvironmentError as e:
+                console.print(f"[bold red]Config error:[/bold red] {e}")
+                raise typer.Exit(1)
+        for m, lb in sorted(labels.items()):
+            console.print(f"[dim]  {m}: {lb.describe()}[/dim]")
+
     all_findings: list[ReliabilityFinding] = []
+    harmless: dict[str, list[str]] = {}
     for scenario, result in executions:
         if result.status != "REPRODUCED" or not result.observations:
             continue
@@ -319,7 +338,11 @@ def analyze_consumer(
                 baseline = baselines.get(_setup_key(scenario)) if scenario.testConfig else None
                 if baseline is not None and baseline.status != "REPRODUCED":
                     baseline = None
-                scenario_findings = diagnose(analysis, scenario, result, source_code, baseline=baseline)
+                diagnosis = diagnose(analysis, scenario, result, source_code, labels,
+                                     baseline=baseline, fresh=fresh)
+                scenario_findings = diagnosis.findings
+                if diagnosis.harmless:
+                    harmless[scenario.scenarioType] = diagnosis.harmless
                 if not scenario_findings:
                     console.print(
                         f"[dim]  {scenario.scenarioType}: no production risk observed[/dim]"
@@ -338,6 +361,17 @@ def analyze_consumer(
                 )
 
     all_findings = merge_findings(all_findings)
+
+    # ── Step 5b: Nemotron Ultra reviews every finding against its evidence ───
+    dismissed: list[ReliabilityFinding] = []
+    if all_findings:
+        with console.status("[bold green]Reviewing findings against the evidence (Nemotron Ultra)..."):
+            try:
+                all_findings, dismissed = review(analysis, source_code, all_findings, fresh=fresh)
+            except Exception as e:  # the findings stand unreviewed rather than being lost
+                console.print(f"[yellow]  Review skipped: {e}[/yellow]")
+        for f in dismissed:
+            console.print(f"[dim]  Reviewer dismissed {f.affectedMethod} ({f.scenario}): {f.reviewNote}[/dim]")
     if all_findings:
         console.print(
             f"[bold green]✓ Diagnosis complete — {len(all_findings)} finding(s) total[/bold green]\n"
@@ -353,6 +387,9 @@ def analyze_consumer(
         scenarios=scenarios,
         executions=executions,
         findings=all_findings,
+        dismissed=dismissed,
+        harmless=harmless,
+        labels=labels,
         theoretical=theoretical,
         sandbox=in_sandbox,
         baselines={
@@ -391,7 +428,7 @@ def scan_repository(
     classpath: str | None = typer.Option(
         None, "--classpath", help="Override the dependency jars for every listener (default: each listener's own module).",
     ),
-    fresh: bool = typer.Option(False, "--fresh", help="Re-ask Nemotron Ultra instead of using cached risks."),
+    fresh: bool = typer.Option(False, "--fresh", help="Ignore cached Nemotron answers and ask again."),
 ) -> None:
     """List every listener method in a repository, and optionally analyze them."""
     _register_usage_print()
@@ -653,8 +690,11 @@ def _print_findings(findings: list[ReliabilityFinding]) -> None:
                 f"[{sev_colour}]▸ {f.severity}[/{sev_colour}]  "
                 f"[cyan]{f.affectedMethod}[/cyan]  [dim]({KIND_LABELS.get(f.kind, f.kind)})[/dim]\n"
                 f"  {f.summary}\n"
-                f"  [dim]{f.explanation}[/dim]\n"
+                + (f"  [dim]Evidence: {'; '.join(f.evidence)}[/dim]\n" if f.evidence else "")
+                + f"  [dim]{f.explanation}[/dim]\n"
                 f"  [green]Fix: {f.suggestedFix}[/green]"
+                + (f"\n  [dim]Severity basis: {f.severityNote}[/dim]" if f.severityNote else "")
+                + (f"\n  [dim]Reviewer: {f.reviewNote}[/dim]" if f.reviewNote else "")
                 + (f"\n  [dim]Also seen in: {', '.join(f.alsoSeenIn)}[/dim]" if f.alsoSeenIn else "")
             )
 

@@ -314,6 +314,15 @@ public final class __EBInstantiate {
         Class<?> rt = returnType(inv);
         if (rt == void.class) return null;
         if (RETURNS.containsKey(path)) return convert(RETURNS.get(path), rt, path);
+        // <S extends T> S save(S entity): the method returns what it was given (JPA save /
+        // saveAndFlush / merge, fluent builders). An Object fake would fail the caller's cast.
+        java.lang.reflect.Type grt = m.getGenericReturnType();
+        if (grt instanceof java.lang.reflect.TypeVariable<?>) {
+            java.lang.reflect.Type[] params = m.getGenericParameterTypes();
+            for (int i = 0; i < params.length; i++) {
+                if (params[i].equals(grt)) return inv.getArgument(i);
+            }
+        }
         if (rt == boolean.class || rt == Boolean.class) return true;
         if (rt == int.class || rt == Integer.class) return 1;
         if (rt == long.class || rt == Long.class) return 1L;
@@ -917,7 +926,7 @@ def _generate_execution(
     ]
     consumer_instantiation = "\n".join(lines)
 
-    fault_injections = _build_named_faults(test_config, consumer_file) if test_config else ""
+    fault_injections = _build_named_faults(test_config, consumer_file, available_classes) if test_config else ""
     call_pattern = _build_call_pattern(analysis, test_config, call_args) if test_config else (
         f"        try {{\n"
         f"            {_consumer_call(analysis, call_args)};\n"
@@ -973,7 +982,9 @@ def _listener_arguments(analysis: ConsumerAnalysis) -> tuple[list[DependencyInfo
     return extra, ", ".join(args)
 
 
-def _build_named_faults(test_config: TestConfig, consumer_file: Path) -> str:
+def _build_named_faults(
+    test_config: TestConfig, consumer_file: Path, available_classes: "set[str] | None" = None,
+) -> str:
     """Real-classpath mode: register faults and return values by path on __EBInstantiate.
 
     Applied inside each fake's default answer, so no argument matchers are needed
@@ -988,8 +999,12 @@ def _build_named_faults(test_config: TestConfig, consumer_file: Path) -> str:
     for rv in test_config.returnValues:
         target = rv.target.replace("()", "").replace("\\", "").replace('"', "")
         if rv.returns.startswith("MOCK:"):
-            # Class literal: compile-checked against the consumer's imports/package.
-            value = f"{_qualify(rv.returns[5:].strip(), consumer_file)}.class"
+            # Class literal, resolved through the consumer's imports/package. A class that
+            # isn't on the classpath would break the build: skip that override instead.
+            fqn = _qualify(rv.returns[5:].strip(), consumer_file)
+            if available_classes is not None and fqn.replace(".", "/") not in available_classes:
+                continue
+            value = f"{fqn}.class"
         else:
             value = '"' + rv.returns.replace("\\", "\\\\").replace('"', '\\"') + '"'
         lines.append(

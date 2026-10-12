@@ -742,14 +742,64 @@ Regression: Fineract + Kill Bill call counts identical before/after (diffed); Fi
 
 ### [ ] STEP 13 — Accuracy (Oct 16–17)
 
-- [ ] Severity calibration: in-process events (Spring `@EventListener`) have no redelivery → duplicate risks LOW
-  unless money/messages; duplicate of recompute/refresh work LOW; tell diagnosis the transport.
-- [ ] One finding per root cause per scenario (the swallowed failure), not one per affected call.
+#### ▶ START HERE next session (stopped 2026-10-13 ~00:45)
+
+State: hybrid diagnosis implemented, 136 tests green, measured twice (INVENTORY.md **run 10**). All code uncommitted
+until the user commits (message prepared in the session). **No code was changed after the measurement — the five
+items below are open decisions for the user. Present them with options; implement only what the user picks.**
+
+1. **Impact-label drift.** 3 votes agree within a run (3/3), but across runs the same call was `DATA` once and
+   `SECURITY` once → race findings flip MEDIUM ↔ HIGH (12/15 findings identical A-vs-B; all 3 differences are this).
+   Options: 5 votes instead of 3 / accept + disclose (cache keeps a report reproducible) / give the impact question
+   more listener context (generic, no test-set hints).
+2. **Scenario coverage.** F2 (Kafka `beforeHandleMessage` failure) was not tested this round — `listenerAnnotation`
+   changed Ultra's input, it was re-asked and produced different scenarios; F4 never generated. Option: code also
+   generates a THROW scenario for every dependency call (research pattern "code enumerates candidates, LLM judges"),
+   so coverage no longer depends on Ultra.
+3. **Race findings that repeat the duplicate finding** (Kafka, NoteListener: MEDIUM "concurrent" = same as the
+   duplicate). Comes from the gap choice "race without interference → duplicate rule without in-process cap".
+   Option: report a race only when the interference vote is YES.
+4. **Recompute/refresh work rated HIGH** (Kill Bill K3/K4: refresh notification counted as EXTERNAL_MESSAGE side
+   effect). Option: generic `REFRESH` effect label (recomputes from source of truth → repeat is LOW).
+5. **L2 / M2 now harmless** (entity saves labelled IDEMPOTENT_WRITE). EXPECTED rates both LOW → arguably acceptable.
+
+After the decisions: implement → unit tests → one measurement round (A + B, ~45 min, ~$0.40) → update INVENTORY →
+user commits → STEP 14.
+
+#### Results so far (run 10 vs run 8/9)
+
+| | Before | Now |
+|---|---|---|
+| Expected risks found | 11/14 | 8/14 (lost F2 = not generated, L2/M2 = harmless) |
+| Over-rated | 6 | 2 (K3, K4) |
+| False positives (config failures, Kill Bill "silently skipped") | 3 | 0 |
+| Negative controls | 3/3 | 3/3 + `onAuthenticationSuccess` now reaches 3/3 |
+| Run-to-run (A vs B, all answers re-asked) | finding counts differed | 12/15 identical, 14/15 same call + kind |
+
+#### How diagnosis works now (decisions 2026-10-12, user)
+Research (LLM non-determinism): temperature 0 is not deterministic on batched servers; the common pattern is
+"code decides, the LLM answers small closed questions". So: code measures every change vs the fault-free baseline →
+Super labels each dependency call (effect READ / IDEMPOTENT_WRITE / SIDE_EFFECT, impact MONEY / SECURITY /
+EXTERNAL_MESSAGE / DATA / MINOR; 3 seeds, majority, ties → cautious; `diagnosis/classify.py`) and, for each race
+scenario, "can two runs interfere?" (3 votes) → fixed rubric in code decides findings + severity
+(`diagnosis/rubric.py`, table in its docstring; gap choices: swallowed failed write = lost work; race without
+interference = duplicate rule without in-process cap; unknown/tie → cautious) → Super writes text only → Ultra
+reviewer may rewrite text or DROP, severity disagreement shown as a note → temperature 0 + seed + cache
+(`agent/llm.py`, `--fresh` re-asks). Transport from the listener annotation (analyzer `listenerAnnotation`).
+Superseded from round 1: per-root-cause grouping by the LLM, coverage re-ask / "unexplained change".
+**Rules:** never tune prompts toward EXPECTED.md; prompt changes only follow scenarios the agent created at runtime;
+rubric tested with synthetic listeners only. EXPECTED.md listeners are now a tuning set — STEP 14's new listeners
+(EXPECTED written first) are the real generalization test.
+
+Also fixed this session (user-approved): generic `<S> S save(S)` fake returns its argument (login listener crashed
+after the save in every scenario since STEP 10); path-setup MOCK types ignore strings/comments and are skipped if not on
+the classpath; sandbox retries once on a transport error.
+
+#### Checklist
+- [~] Severity calibration — transport + in-process cap + rubric done; recompute/refresh (decision 4) open.
+- [x] One finding per root cause per scenario (rubric groups by scenario; all changes kept as evidence).
 - [ ] Optional: THROW with a declared checked exception type (K2); fail only the Nth call (parent insert).
-- [ ] Stability: run Fineract + Kill Bill 2× each, findings must match.
-  Evidence (2026-10-12): Kill Bill `handlePaymentInfoEvent` — identical call counts, Super gave 6 findings in one run and
-  3 in the next (and flipped PARTIAL_PROCESSING HIGH → none). Candidates: temperature 0, cache diagnosis by observation
-  hash, deterministic rules for the obvious cases.
+- [~] Stability — measured (12/15 identical); impact-label drift (decision 1) open.
 
 ---
 

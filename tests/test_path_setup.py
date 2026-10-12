@@ -73,3 +73,11 @@ def test_forget_plan_drops_only_that_retry_answer(tmp_path, monkeypatch):
     first.write_text("[]")
     forget_plan(analysis, "src", scenario, "fb")
     assert not retry.exists() and first.exists()
+
+
+def test_parse_ignores_type_names_inside_strings_and_comments():
+    analysis = ConsumerAnalysis(className="C", methodName="m", eventType="E",
+                                dependencies=[DependencyInfo(name="repo", type="Repo")])
+    src = 'class C { String m = "No Calendar found"; // Calendar\n /* Calendar */ Meeting x; }'
+    raw = '[{"target": "repo.find", "returns": "MOCK:Calendar"}, {"target": "repo.get", "returns": "MOCK:Meeting"}]'
+    assert [v.returns for v in _parse(raw, analysis, src)] == ["MOCK:Meeting"]

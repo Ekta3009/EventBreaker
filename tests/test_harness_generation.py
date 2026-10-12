@@ -175,3 +175,13 @@ class TestParseOutput:
         r = _parse_output("BUILD FAILURE", self.S)
         assert r.status == "ERROR"
         assert r.observations == []
+
+
+def test_mock_class_not_on_classpath_is_skipped_not_compiled():
+    tc = TestConfig(callPattern="SINGLE", returnValues=[
+        ReturnValue(target="calendarRepository.findById", returns="MOCK:Calendar"),
+        ReturnValue(target="overdueConfigCache.getOverdueConfig", returns="MOCK:DefaultOverdueConfig"),
+    ])
+    available = {"org/killbill/billing/overdue/config/DefaultOverdueConfig"}
+    out = _build_named_faults(tc, listener_file("OverdueListener"), available)
+    assert "Calendar" not in out and "DefaultOverdueConfig.class" in out

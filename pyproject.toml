@@ -25,6 +25,9 @@ eventbreaker = "eventbreaker.cli.main:app"
 where = ["."]
 include = ["eventbreaker*"]
 
+[tool.setuptools.package-data]
+eventbreaker = ["analyzer/eventbreaker-analyzer.jar", "classpath/print-classpath.init.gradle"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # TestConfig is a Pydantic model, not a test class.

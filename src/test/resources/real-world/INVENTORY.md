@@ -161,3 +161,19 @@ Scored against EXPECTED.md. ✅ found · ⬆ found but severity over-rated · �
 `getOverdueConfig` THROW scenarios correctly gave no finding.
 **Severity:** 6 of the 11 are over-rated (K3 K4 L2 N1 M1 M2), every one on a duplicate/concurrent risk → STEP 13 calibration.
 The earlier "11 / 14" (STEP 10) was not itemised per risk; this table is the itemised count.
+
+## Run 8 — 2026-10-12, auto classpath (STEP 11), no `--classpath` flag
+
+| Listener | Build | Classpath | Result |
+|---|---|---|---|
+| fineract `LoginAttemptEventListener.onAuthenticationFailure` (`scan . --only …` from `~/fineract-1.15.0`) | Gradle wrapper + bundled init script, 32 s first time | 370 entries, identical to the hand-made one | 4/4, HIGH `saveAndFlush` (L1/L2), L3 held — same as run 6; report written into the Fineract checkout |
+| killbill `OverdueListener.handlePaymentInfoEvent` (0.25.4 release source, `overdue` module) | `mvn compile` once, then `dependency:build-classpath`, 7 s | 83 entries (runtime scope) | first try ✗ compile errors → fixed (below) → 4/4 |
+
+Failures and fixes:
+| Failure | Fix |
+|---|---|
+| Maven default scope pulled the module's test Mockito 5.3.1 + TestNG onto the classpath | `-DincludeScope=runtime` (the user property has no `mdep.` prefix — `-Dmdep.includeScope` is silently ignored) |
+| Kill Bill: `javax.annotation.Nullable` / `com.google.inject` not found in `DefaultOverdueConfigCache`, `DefaultOverdueModule` | Executor copied the whole Maven module's sources (stand-in-mode behaviour); in real-classpath mode only the listener is copied, the module is already compiled on the classpath |
+
+Diagnosis drift (→ STEP 13): Kill Bill gave 6 HIGH this time — 4 on one swallowed `getAccountById`/children failure —
+and a HIGH on PARTIAL_PROCESSING, which run 4 correctly left empty.

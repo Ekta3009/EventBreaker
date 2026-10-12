@@ -44,6 +44,8 @@ dist/
 .env
 
 ### EventBreaker generated output ###
+# Analyzer JAR is a build output (mvn package)
+eventbreaker/analyzer/eventbreaker-analyzer.jar
 eventbreaker-report.md
 eventbreaker-reports/
 *.png

@@ -4,9 +4,10 @@ from pathlib import Path
 import typer
 import atexit
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
-load_dotenv()
+load_dotenv(find_dotenv(usecwd=True))   # .env in or above the directory you run from
+load_dotenv()                           # EventBreaker's own .env (dev checkout); never overrides
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -14,6 +15,7 @@ from rich import box
 
 from eventbreaker.analyzer.bridge import analyze, scan
 from eventbreaker.agent.nemotron import identify_risks
+from eventbreaker.classpath.resolver import ClasspathError, find_module, resolve
 from eventbreaker.agent.path_setup import (
     forget_plan, not_reached, plan_path, reach_feedback, reusable_setup, target_calls,
 )
@@ -34,8 +36,19 @@ console = Console()
 
 
 @app.callback()
-def _callback() -> None:
+def _callback(
+    version: bool = typer.Option(
+        False, "--version", is_eager=True, help="Show the version and exit.",
+        callback=lambda value: _print_version() if value else None,
+    ),
+) -> None:
     """EventBreaker — break your consumers before production does."""
+
+
+def _print_version() -> None:
+    from importlib.metadata import version
+    console.print(f"eventbreaker {version('eventbreaker')}")
+    raise typer.Exit()
 
 
 @app.command("analyze")
@@ -51,8 +64,8 @@ def analyze_consumer(
     ),
     classpath: str | None = typer.Option(
         None, "--classpath",
-        help="The consumer project's dependency jars (path-separated, or @file containing that). "
-             "Compiles against real types instead of generated stubs.",
+        help="Override the dependency jars (path-separated, or @file containing that). "
+             "Default: read from the listener's own Maven/Gradle module.",
     ),
     fresh: bool = typer.Option(
         False, "--fresh", help="Ignore the cached risk-identification response and call Nemotron Ultra again.",
@@ -122,6 +135,10 @@ def analyze_consumer(
 
     console.print("[bold green]✓ Static analysis complete[/bold green]\n")
 
+    # Real classpath: --classpath wins; otherwise ask the listener's own build.
+    # Resolved before any Nemotron call so a build problem costs nothing.
+    jars = _parse_classpath(classpath) if classpath else _auto_classpath(file)
+
     # ── Step 2: Nemotron risk identification ──────────────────────────────────
     if not os.environ.get("NEBIUS_API_KEY"):
         console.print(
@@ -184,7 +201,6 @@ def analyze_consumer(
     exec_mode = "[cyan]Nebius Sandbox[/cyan]" if in_sandbox else "[yellow]local JVM[/yellow]"
 
     executions: list[tuple[ChaosScenario, ObservationResult]] = []
-    jars = _parse_classpath(classpath)
     executor = ScenarioExecutor(jars)
     # Real classpath: plan what the fakes must return so each scenario reaches
     # its risky call, and run the same setup without faults as a baseline.
@@ -373,7 +389,7 @@ def scan_repository(
              "(e.g. --only 1,3 or --only NoteListener.onCreate).",
     ),
     classpath: str | None = typer.Option(
-        None, "--classpath", help="Dependency jars for the listeners' module (same as analyze --classpath).",
+        None, "--classpath", help="Override the dependency jars for every listener (default: each listener's own module).",
     ),
     fresh: bool = typer.Option(False, "--fresh", help="Re-ask Nemotron Ultra instead of using cached risks."),
 ) -> None:
@@ -489,6 +505,27 @@ def _print_usage() -> None:
             f"~${usage.session['cost']:.4f} (all runs logged: ~${usage.total_logged():.2f} "
             f"in {usage.USAGE_FILE})[/dim]"
         )
+
+
+def _auto_classpath(file: Path) -> list[Path]:
+    """The listener module's classpath from Maven/Gradle ([] when it has no build of its own)."""
+    module = find_module(file)
+    if module is None:
+        console.print("[dim]No Maven/Gradle module around this file — using generated stand-in types "
+                      "(pass --classpath to use real ones).[/dim]\n")
+        return []
+    with console.status(
+        f"[bold green]Resolving classpath for {module.dir.name} ({module.tool}; "
+        f"first time per module can take a few minutes)..."
+    ):
+        try:
+            jars = resolve(module)
+        except ClasspathError as e:
+            console.print(f"[bold red]Classpath error:[/bold red] {e}")
+            raise typer.Exit(1)
+    console.print(f"[bold green]✓ Classpath:[/bold green] {len(jars)} entries from {module.tool} "
+                  f"([dim]{module.dir}[/dim])\n")
+    return jars
 
 
 def _parse_classpath(value: str | None) -> list[Path]:

@@ -1,0 +1,15 @@
+// Gradle init script: `./gradlew -I print-classpath.init.gradle :<module>:ebClasspath -q`
+// compiles the module, then prints its compiled classes dir + full runtime classpath on one marked line.
+allprojects {
+    afterEvaluate { p ->
+        if (p.plugins.hasPlugin('java')) {
+            p.tasks.register('ebClasspath') {
+                dependsOn p.tasks.named('classes')
+                doLast {
+                    def entries = p.sourceSets.main.output.files + p.sourceSets.main.runtimeClasspath.files
+                    println 'EB_CLASSPATH=' + entries.findAll { it.exists() }.unique().join(File.pathSeparator)
+                }
+            }
+        }
+    }
+}

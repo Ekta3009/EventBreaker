@@ -690,14 +690,26 @@ prompt is identical.
 Goal: a Fineract/Kill Bill developer runs `eventbreaker analyze <Listener.java>` (or `scan .`) inside their
 own checkout with **no `--classpath` flag** and gets a report in `<repo>/eventbreaker-reports/`.
 
-- [ ] **Auto classpath:** walk up from the listener to its module; `pom.xml` → `mvn -q dependency:build-classpath`
+- [x] **Auto classpath:** walk up from the listener to its module; `pom.xml` → `mvn -q dependency:build-classpath`
   (+ `target/classes`); `build.gradle(.kts)` → bundled init script (`ebClasspath` task, as in
   `~/eb-classpaths/print-classpath.init.gradle`). Cache per module keyed by build-file mtimes. `scan` resolves
   a classpath per module. Clear message if the module isn't built ("run ./gradlew classes / mvn compile first").
-- [ ] `--classpath` stays as an override.
-- [ ] **Packaging:** `pipx install` works; analyzer JAR shipped as package data (bridge must not assume our
+- [x] `--classpath` stays as an override.
+- [x] **Packaging:** `pipx install` works; analyzer JAR shipped as package data (bridge must not assume our
   repo layout); `eventbreaker --version`.
-- [ ] Docs: one-paragraph "run it in your repo" in README.
+- [x] Docs: one-paragraph "run it in your repo" in README.
+- [x] **Decided 2026-10-12 (user):** analyzer JAR is gitignored (build output); shipped via a release wheel (STEP 15).
+
+*Done 2026-10-12:* `eventbreaker/classpath/resolver.py` — module = dir above `src/main/java` with pom/build.gradle;
+Maven `dependency:build-classpath -DincludeScope=runtime` (+ `target/classes`; test-scope Mockito/TestNG would clash);
+Gradle bundled init script via the project's `./gradlew`, run from the settings root; cache keyed by build-file mtimes.
+JAR built into the package by pom.xml (`outputFile`), `package-data` in pyproject, `--version`, `.env` loaded from cwd.
+Executor: real-classpath mode no longer copies the whole Maven module's sources (they needed provided-scope Guice/jsr305).
+Verified: Fineract `scan . --only LoginAttempt…onAuthenticationFailure` from `~/fineract-1.15.0` (Gradle, 370 entries,
+4/4, same finding as before, report in the Fineract checkout); Kill Bill `handlePaymentInfoEvent` from the 0.25.4
+release source `~/killbill-killbill-0.25.4` (Maven, 83 entries, 4/4); clean `pip install .` in a fresh venv works.
+Open: provided-scope jars are not on the runtime classpath (fine so far); Kill Bill diagnosis this run gave 6 HIGH
+(4 for one swallowed failure) and a HIGH on PARTIAL_PROCESSING that run 4 correctly left empty → STEP 13 stability.
 
 **Test:** from `~/fineract-1.15.0`: `eventbreaker scan . --only LoginAttemptEventListener.onAuthenticationFailure`
 with no classpath flag; same for a Kill Bill module (requires a Kill Bill checkout that builds — use release jars
@@ -744,8 +756,15 @@ Decided 2026-10-11 (option 2): once auto-classpath works, real-classpath is the 
 
 - [ ] `real-world/RESULTS.md`: "N listeners, M products, X/Y expected risks, Z valid extras, K false positives".
 - [ ] Demo consumer: Fineract `KafkaRemoteMessageListener` (ack after failure) or `LoginAttemptEventListener` (lockout race).
+- [ ] **Owner one-pager** (`docs/EXPLAINER.md`, plain language, for the user — not judges): problem → how it works
+  (Ultra fills a fixed TestConfig, never writes code → executor builds + runs it in the Nebius sandbox → Super
+  diagnoses against a fault-free baseline) → evidence (score table) → known limits. Then a mock Q&A: Claude asks
+  likely judge questions, user answers, gaps get explained. Do this BEFORE recording the video.
 - [ ] README (what / how / run it in your repo / results / Nebius sandbox + Nemotron roles), MIT license.
 - [ ] 3-minute video: problem → `scan` on Fineract → report evidence → sandbox + Nemotron callouts.
+- [ ] **Release wheel:** `mvn package` → `python -m build` → check the wheel contains `analyzer/eventbreaker-analyzer.jar`
+  + `classpath/print-classpath.init.gradle` → fresh-venv install test → user creates GitHub Release `v0.1.0` with the
+  wheel attached. README install = `pipx install <release wheel URL>` (dev install from source stays documented).
 - [ ] Secrets check (`git log --all -S "NEBIUS"`, `.env` ignored), clean install test, push.
 - [ ] Buffer Oct 28–30. **Submit before Oct 30, 10:00 AM PDT.**
 

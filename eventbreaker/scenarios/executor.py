@@ -729,7 +729,10 @@ class ScenarioExecutor:
         )
 
         maven_root = _find_maven_root(consumer_file)
-        if maven_root:
+        # Stand-in mode only: copy the consumer's module sources. With a real classpath the
+        # module is already compiled on it, and its other sources may need provided-scope
+        # jars (Guice, jsr305) that a runtime classpath leaves out.
+        if maven_root and not self.classpath:
             origin_src = maven_root / "src" / "main" / "java"
             if origin_src.exists():
                 for java_file in origin_src.rglob("*.java"):
@@ -746,9 +749,9 @@ class ScenarioExecutor:
         if self.classpath and _classpath_contains(self.classpath, fqn_path):
             return
 
-        # If the consumer file lives outside src/main/java (e.g. test resources),
-        # copy it to the correct package directory in the temp project.
-        if maven_root is None or not _is_under(
+        # Copy the consumer to its package directory when the steps above didn't provide
+        # it: it lives outside src/main/java (e.g. test resources), or real-classpath mode.
+        if self.classpath or maven_root is None or not _is_under(
             consumer_file, maven_root / "src" / "main" / "java"
         ):
             pkg = _read_package(consumer_file) or ""

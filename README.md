@@ -124,10 +124,9 @@ cd EventBreaker
 # Build the Java static analyzer fat JAR
 mvn package -q
 
-# Install the Python CLI
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
+# Install the CLI (the analyzer JAR ships inside the package)
+pipx install .          # or, for development: python -m venv .venv && .venv/bin/pip install -e .
+eventbreaker --version
 ```
 
 ---
@@ -147,7 +146,7 @@ NEBIUS_API_KEY=your_nebius_api_key_here
 NEBIUS_PROJECT_ID=your_project_id_here
 ```
 
-The `.env` file is loaded automatically on every run.
+A `.env` in (or above) the directory you run from is loaded automatically; exported variables work too.
 
 ---
 
@@ -156,6 +155,24 @@ The `.env` file is loaded automatically on every run.
 ```bash
 eventbreaker analyze path/to/YourConsumer.java
 ```
+
+### Run it in your repo
+
+Inside your own Maven or Gradle checkout, point EventBreaker at a listener — or scan the whole repo — with no
+extra setup. For a listener in `<module>/src/main/java`, it asks that module's own build for the real classpath
+(`mvn dependency:build-classpath`, or a bundled Gradle init script run through your `./gradlew`), caches it until a
+build file changes, and runs the scenarios against your real classes. Build the module once first
+(`mvn compile`, or Gradle compiles it for you); multi-module Maven projects may need `mvn install -DskipTests`
+at the root. Reports land in `./eventbreaker-reports/`.
+
+```bash
+cd ~/src/fineract
+eventbreaker scan .                                                   # list every listener method
+eventbreaker scan . --only LoginAttemptEventListener.onAuthenticationFailure
+eventbreaker analyze path/to/OrderListener.java --method onOrderPlaced
+```
+
+`--classpath a.jar:b.jar` (or `--classpath @cp.txt`) overrides the detected classpath.
 
 ### Example
 
@@ -216,10 +233,10 @@ EventBreaker/
 │   ├── annotation/                    + JavaParser-based static analyzer
 │   └── analyzer/                      fat JAR built by mvn package
 ├── src/test/resources/consumers/      12 example consumers (safe, risky, adversarial)
-├── target/eventbreaker-analyzer.jar   Pre-built static analyzer JAR
 ├── eventbreaker/                      Python package
 │   ├── cli/main.py                    Typer CLI — 6-step pipeline
-│   ├── analyzer/bridge.py             Java JAR → Python bridge
+│   ├── analyzer/bridge.py             Java JAR → Python bridge (JAR shipped as package data)
+│   ├── classpath/resolver.py          Auto classpath from the listener's Maven/Gradle module
 │   ├── agent/nemotron.py              Nemotron Ultra risk identification + TestConfig
 │   ├── scenarios/
 │   │   ├── models.py                  ChaosScenario, TestConfig, FaultInjection

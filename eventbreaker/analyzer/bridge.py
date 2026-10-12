@@ -6,9 +6,8 @@ from pydantic import BaseModel
 
 from eventbreaker.models.consumer import ConsumerAnalysis
 
-# Resolve JAR path relative to the repo root (two levels up from this file)
-_REPO_ROOT = Path(__file__).parent.parent.parent
-_JAR_PATH = _REPO_ROOT / "target" / "eventbreaker-analyzer.jar"
+# Shipped inside the package (pom.xml writes it here), so installs don't depend on the repo layout.
+_JAR_PATH = Path(__file__).with_name("eventbreaker-analyzer.jar")
 
 
 def analyze(consumer_file: Path, method: str | None = None) -> ConsumerAnalysis:
@@ -20,7 +19,7 @@ def analyze(consumer_file: Path, method: str | None = None) -> ConsumerAnalysis:
     if not _JAR_PATH.exists():
         raise FileNotFoundError(
             f"Analyzer JAR not found at {_JAR_PATH}. "
-            "Run 'mvn package' in the repo root first."
+            "Run 'mvn package' in the EventBreaker repo first."
         )
 
     result = subprocess.run(
@@ -54,7 +53,7 @@ def scan(root: Path) -> list[ListenerInfo]:
     """Every listener method under root (test sources skipped), via the Java analyzer."""
     if not _JAR_PATH.exists():
         raise FileNotFoundError(
-            f"Analyzer JAR not found at {_JAR_PATH}. Run 'mvn package' in the repo root first."
+            f"Analyzer JAR not found at {_JAR_PATH}. Run 'mvn package' in the EventBreaker repo first."
         )
     result = subprocess.run(
         ["java", "-jar", str(_JAR_PATH), "--scan", str(root)],

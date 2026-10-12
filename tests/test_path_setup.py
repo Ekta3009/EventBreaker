@@ -1,5 +1,8 @@
 """Path setup: which calls a scenario targets, whether a run reached them, and the retry feedback."""
-from eventbreaker.agent.path_setup import _parse, not_reached, reach_feedback, target_calls
+from eventbreaker.agent import path_setup
+from eventbreaker.agent.path_setup import (
+    _parse, forget_plan, not_reached, reach_feedback, reusable_setup, target_calls,
+)
 from eventbreaker.models.consumer import ConsumerAnalysis, DependencyInfo
 from eventbreaker.models.observation import ObservationEntry as E
 from eventbreaker.models.observation import ObservationResult
@@ -44,3 +47,29 @@ def test_parse_drops_invented_targets_and_types():
     values = _parse(raw, analysis, "class C { Meeting m; }")
     assert [(v.target, v.returns) for v in values] == [
         ("event.getEntityName", "STRING:collectionsheet"), ("repo.find", "MOCK:Meeting")]
+
+
+def test_reuse_picks_smallest_setup_that_reached_every_target():
+    reached = ObservationResult(scenario="B", observations=[E(target="repo.save", callCount=1)])
+    missed = ObservationResult(scenario="B", observations=[E(target="repo.save", callCount=0)])
+    failed = ObservationResult(scenario="B", status="ERROR",
+                               observations=[E(target="repo.save", callCount=1)])
+    one = [ReturnValue(target="event.getName", returns="STRING:x")]
+    two = one + [ReturnValue(target="repo.find", returns="NULL")]
+    assert reusable_setup(["repo.save"], [(two, reached), (one, reached)]) == one
+    assert reusable_setup(["repo.save"], [(one, missed), (two, failed)]) is None
+    assert reusable_setup(["repo.save", "repo.publish"], [(one, reached)]) is None
+    assert reusable_setup([], [(one, reached)]) is None
+
+
+def test_forget_plan_drops_only_that_retry_answer(tmp_path, monkeypatch):
+    monkeypatch.setattr(path_setup, "_CACHE_DIR", tmp_path)
+    analysis = ConsumerAnalysis(className="C", methodName="m", eventType="E",
+                                dependencies=[DependencyInfo(name="repo", type="Repo")])
+    scenario = sc(faults=[FaultInjection(dep="repo", method="save", fault="THROW")])
+    retry = path_setup._cache_file(path_setup._prompt(analysis, "src", scenario, "fb"))
+    first = path_setup._cache_file(path_setup._prompt(analysis, "src", scenario, None))
+    retry.write_text("[]")
+    first.write_text("[]")
+    forget_plan(analysis, "src", scenario, "fb")
+    assert not retry.exists() and first.exists()

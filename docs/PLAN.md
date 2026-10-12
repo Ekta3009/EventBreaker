@@ -668,10 +668,17 @@ prompt is identical.
 
 ### [ ] STEP 10b — Quick wins + bookkeeping (Oct 12)
 
-- [ ] Path setup: before asking Super, **reuse a setup from another scenario whose baseline already reached
+- [x] Path setup: before asking Super, **reuse a setup from another scenario whose baseline already reached
   this scenario's target** (fixes Legacy scenario 1); don't cache a retry answer that didn't help.
-- [ ] Re-run `LegacyMeetingAttendanceListener` and Kill Bill `handleTagInsert` through the CLI.
-- [ ] INVENTORY.md run 6 (Fineract scan) + per-listener score table; keep EXPECTED.md untouched except notes.
+  *Done 2026-10-12:* `reusable_setup` (fewest overrides wins) + `forget_plan` in `path_setup.py`; CLI plans all
+  setups first, then a second pass reuses later-found setups for scenarios still not reached. Verify via re-run below.
+- [x] Re-run `LegacyMeetingAttendanceListener` and Kill Bill `handleTagInsert` through the CLI.
+  *Done 2026-10-12:* Legacy 3/3 reached (scenario 1 via second-pass reuse), M1 HIGH on `meetingRepositoryWrapper.save`.
+  `handleTagInsert` 4/4 reached (2 via reuse), 4 findings: swallowed `getAccountById` failure skips parent/child
+  notifications (3 findings for one root cause → STEP 13), duplicate `insertOverdueNotification` 6× vs 3×.
+- [x] INVENTORY.md run 6 (Fineract scan) + per-listener score table; keep EXPECTED.md untouched except notes.
+  *Done 2026-10-12:* run 6 was already written; added run 7 (re-runs) + score table: 11/14, negative controls 3/3,
+  6/11 over-rated (all duplicate/concurrent).
 - [ ] User commits today's work (see session notes for the file list).
 
 **Test:** `.venv/bin/python -m pytest` green; Legacy 3/3 reached.

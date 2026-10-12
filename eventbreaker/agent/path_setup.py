@@ -55,6 +55,20 @@ def not_reached(result: ObservationResult, targets: list[str]) -> list[str]:
     return [t for t in targets if t not in called]
 
 
+def reusable_setup(
+    targets: list[str], tried: list[tuple[list[ReturnValue], ObservationResult]],
+) -> list[ReturnValue] | None:
+    """A setup whose fault-free baseline already reached every target (fewest overrides first), else None.
+
+    tried: (overrides, baseline run) for each setup executed so far. Reusing one costs no LLM call.
+    """
+    if not targets:
+        return None
+    reaching = [values for values, baseline in tried
+                if baseline.status == "REPRODUCED" and not not_reached(baseline, targets)]
+    return min(reaching, key=len) if reaching else None
+
+
 def reach_feedback(values: list[ReturnValue], result: ObservationResult, missing: list[str]) -> str:
     """What happened with the previous setup — sent back to Nemotron for one retry."""
     tried = ", ".join(f"{v.target} → {v.returns}" for v in values) or "(no overrides)"
@@ -84,20 +98,10 @@ def plan_path(
     feedback: what happened when a previous setup was executed (see reach_feedback);
     used for one retry when the target was not reached.
     """
-    target = _target(scenario)
-    if not target:
+    user = _prompt(analysis, source_code, scenario, feedback)
+    if not user:
         return []
-    deps = "\n".join(f"  {d.name}: {d.type}" for d in analysis.dependencies)
-    user = (
-        f"Listener method: {analysis.className}.{analysis.methodName}({analysis.eventType} event)\n"
-        f"Dependencies (field: type):\n{deps}\n"
-        f"TARGET call that must be reached: {target}\n"
-        f"Scenario concern: {scenario.expectedConcern}\n\n"
-        + (f"{feedback}\n\n" if feedback else "")
-        + f"Source:\n{source_code}"
-    )
-    key = hashlib.sha256(f"{_MODEL}\0{_SYSTEM_PROMPT}\0{user}".encode()).hexdigest()[:16]
-    cache_file = _CACHE_DIR / f"{key}.json"
+    cache_file = _cache_file(user)
     if cache_file.exists():
         raw = cache_file.read_text()
     else:
@@ -121,6 +125,38 @@ def plan_path(
             _CACHE_DIR.mkdir(parents=True, exist_ok=True)
             cache_file.write_text(raw)
     return _parse(raw, analysis, source_code) or []
+
+
+def forget_plan(
+    analysis: ConsumerAnalysis, source_code: str, scenario: ChaosScenario, feedback: str,
+) -> None:
+    """Drop a cached retry answer that did not reach the target, so the next run asks again."""
+    user = _prompt(analysis, source_code, scenario, feedback)
+    if user:
+        _cache_file(user).unlink(missing_ok=True)
+
+
+def _prompt(
+    analysis: ConsumerAnalysis, source_code: str, scenario: ChaosScenario, feedback: str | None,
+) -> str:
+    """The user prompt for this scenario ("" when it has no target call)."""
+    target = _target(scenario)
+    if not target:
+        return ""
+    deps = "\n".join(f"  {d.name}: {d.type}" for d in analysis.dependencies)
+    return (
+        f"Listener method: {analysis.className}.{analysis.methodName}({analysis.eventType} event)\n"
+        f"Dependencies (field: type):\n{deps}\n"
+        f"TARGET call that must be reached: {target}\n"
+        f"Scenario concern: {scenario.expectedConcern}\n\n"
+        + (f"{feedback}\n\n" if feedback else "")
+        + f"Source:\n{source_code}"
+    )
+
+
+def _cache_file(user: str) -> Path:
+    key = hashlib.sha256(f"{_MODEL}\0{_SYSTEM_PROMPT}\0{user}".encode()).hexdigest()[:16]
+    return _CACHE_DIR / f"{key}.json"
 
 
 def _target(scenario: ChaosScenario) -> str:

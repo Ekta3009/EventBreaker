@@ -14,7 +14,9 @@ from rich import box
 
 from eventbreaker.analyzer.bridge import analyze, scan
 from eventbreaker.agent.nemotron import identify_risks
-from eventbreaker.agent.path_setup import not_reached, plan_path, reach_feedback, target_calls
+from eventbreaker.agent.path_setup import (
+    forget_plan, not_reached, plan_path, reach_feedback, reusable_setup, target_calls,
+)
 from eventbreaker.diagnosis.analyzer import KIND_LABELS, diagnose, merge_findings
 from eventbreaker.models.observation import ObservationResult, ReliabilityFinding
 from eventbreaker.report import reporter
@@ -187,8 +189,10 @@ def analyze_consumer(
     # Real classpath: plan what the fakes must return so each scenario reaches
     # its risky call, and run the same setup without faults as a baseline.
     baselines: dict[str, ObservationResult] = {}
+    setups: dict[str, list] = {}          # setup key → its overrides
     def run_baseline(values: list) -> ObservationResult:
-        key = "|".join(sorted(f"{rv.target}={rv.returns}" for rv in values))
+        key = _values_key(values)
+        setups[key] = values
         if key not in baselines:
             with console.status(f"[bold green]Executing fault-free baseline ({exec_mode})..."):
                 baselines[key] = executor.execute(
@@ -201,32 +205,59 @@ def analyze_consumer(
                 )
         return baselines[key]
 
+    def tried() -> list:
+        return [(setups[key], run) for key, run in baselines.items()]
+
+    def missing_for(scenario: ChaosScenario, values: list) -> list[str]:
+        baseline = run_baseline(values)
+        return not_reached(baseline, target_calls(scenario)) if baseline.status == "REPRODUCED" else []
+
+    def show_setup(scenario: ChaosScenario, values: list, note: str = "") -> None:
+        if values:
+            console.print(
+                f"[dim]  Path setup for {scenario.scenarioType}{note}: "
+                + ", ".join(f"{rv.target} → {rv.returns}" for rv in values)
+                + "[/dim]"
+            )
+
+    planned = [sc for sc, _ in feasible if jars and sc.testConfig is not None]
+    for scenario in planned:
+        # A setup another scenario already proved reaches this target costs no LLM call.
+        values = reusable_setup(target_calls(scenario), tried())
+        if values is not None:
+            scenario.testConfig.returnValues = values
+            show_setup(scenario, values, " (reused)")
+            continue
+        with console.status(f"[bold green]Planning path setup: {scenario.scenarioType}..."):
+            values = plan_path(analysis, source_code, scenario)
+        missing = missing_for(scenario, values)
+        if missing:
+            # One retry: show Nemotron what its setup actually did.
+            console.print(
+                f"[dim]  Path setup did not reach {', '.join(missing)} — "
+                f"asking Nemotron to revise it (1 retry)[/dim]"
+            )
+            feedback = reach_feedback(values, baselines[_values_key(values)], missing)
+            with console.status(f"[bold green]Revising path setup: {scenario.scenarioType}..."):
+                retry = plan_path(analysis, source_code, scenario, feedback=feedback)
+            if retry and retry != values:
+                values = retry
+                missing = missing_for(scenario, values)
+            if missing:
+                forget_plan(analysis, source_code, scenario, feedback)
+        scenario.testConfig.returnValues = values
+        show_setup(scenario, values)
+
+    # A scenario planned early may be reachable with a setup found for a later one.
+    for scenario in planned:
+        if missing_for(scenario, scenario.testConfig.returnValues):
+            values = reusable_setup(target_calls(scenario), tried())
+            if values is not None:
+                scenario.testConfig.returnValues = values
+                show_setup(scenario, values, " (reused from another scenario)")
+
     for scenario, plan in feasible:
         targets = target_calls(scenario)
-        if jars and scenario.testConfig is not None:
-            with console.status(f"[bold green]Planning path setup: {scenario.scenarioType}..."):
-                values = plan_path(analysis, source_code, scenario)
-            baseline = run_baseline(values)
-            missing = not_reached(baseline, targets) if baseline.status == "REPRODUCED" else []
-            if missing:
-                # One retry: show Nemotron what its setup actually did.
-                console.print(
-                    f"[dim]  Path setup did not reach {', '.join(missing)} — "
-                    f"asking Nemotron to revise it (1 retry)[/dim]"
-                )
-                with console.status(f"[bold green]Revising path setup: {scenario.scenarioType}..."):
-                    retry = plan_path(analysis, source_code, scenario,
-                                      feedback=reach_feedback(values, baseline, missing))
-                if retry and retry != values:
-                    values = retry
-                    run_baseline(values)
-            scenario.testConfig.returnValues = values
-            if values:
-                console.print(
-                    f"[dim]  Path setup for {scenario.scenarioType}: "
-                    + ", ".join(f"{rv.target} → {rv.returns}" for rv in values)
-                    + "[/dim]"
-                )
         with console.status(
             f"[bold green]Executing: {scenario.scenarioType} ({exec_mode})..."
         ):
@@ -442,7 +473,10 @@ def _register_usage_print() -> None:
 
 def _setup_key(scenario: ChaosScenario) -> str:
     """Scenarios with the same path setup share one baseline run."""
-    values = scenario.testConfig.returnValues if scenario.testConfig else []
+    return _values_key(scenario.testConfig.returnValues if scenario.testConfig else [])
+
+
+def _values_key(values: list) -> str:
     return "|".join(sorted(f"{rv.target}={rv.returns}" for rv in values))
 
 

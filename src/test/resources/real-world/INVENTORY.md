@@ -126,3 +126,38 @@ Gaps hit and fixed:
 
 Scan cost ~$0.13 + re-runs; all real-world work today ~$0.55 (usage log).
 Open: Legacy scenario 1 NOT REACHED (its retry prompt was identical to a cached one) → STEP 10b setup reuse.
+
+## Run 7 — 2026-10-12, path-setup reuse (STEP 10b)
+
+Change: setups are planned for every scenario before any runs. A scenario first reuses a setup whose fault-free
+baseline already reached its target (no LLM call), else asks Super (+1 retry); a second pass gives scenarios that
+still miss a setup found later. A retry answer that still misses is removed from the cache.
+
+| Listener | Reached | How the setups were found | Findings | Cost |
+|---|---|---|---|---|
+| `LegacyMeetingAttendanceListener.onUpdate` | **3/3** (was 2/3) | RACE: Super; DOWNSTREAM: reused; IDEMPOTENCY: Super + retry both missed → reused in pass 2 | HIGH duplicate `meetingRepositoryWrapper.save` (also seen in RACE) — M1 + M2; DOWNSTREAM correctly none | ~$0.02 |
+| killbill `OverdueListener.handleTagInsert` | **4/4** (first CLI run; was a hand-run proof) | IDEMPOTENCY: Super retry (`STRING:OVERDUE_ENFORCEMENT_OFF`, `ENUM:ACCOUNT`, `MOCK:DefaultOverdueConfig`); RACE: reused; both SILENT_DATA_LOSS: reused in pass 2 | HIGH THROW `getAccountById` → `insertOverdueNotification` 1× vs baseline 3× (K1), + 2 MEDIUM on the same root cause; HIGH duplicate insert 6× vs 3× (K3, also seen in RACE = K4); THROW `getOverdueConfig` correctly none | ~$0.07 |
+
+Open (→ STEP 13): one root cause reported 3× (`handleTagInsert` K1); Legacy finding claims a "unique constraint
+violation" that stateless fakes cannot show — only "save called twice" was observed.
+
+## Score per listener (after run 7)
+
+Scored against EXPECTED.md. ✅ found · ⬆ found but severity over-rated · ✖ missed · ✔ negative control held
+(no finding where none is expected). Risks are counted once even when several listeners show them.
+
+| Listener | Expected | Result |
+|---|---|---|
+| fineract `KafkaRemoteMessageListener.onMessage` | F1 F2 F3 F4 | F1 ✅ · F2 ✅ · F3 ✅ (merged into F1) · F4 ✖ (Ultra never generated it) |
+| killbill `OverdueListener.handlePaymentInfoEvent` | K1 K2 K3 K4 | K1 ✅ · K2 ✖ (needs checked-exception THROW) · K3 ⬆ HIGH vs LOW · K4 ⬆ HIGH vs LOW |
+| killbill `OverdueListener.handleTagInsert` | (K1 K3 K4 — class-wide) | K1 ✅ · K3 ⬆ · K4 ⬆ — confirms the class-wide risks on a second handler |
+| fineract `LoginAttemptEventListener.onAuthenticationFailure` | L1 L2 L3 | L1 ✅ · L2 ⬆ HIGH vs LOW (same finding as L1) · L3 ✔ |
+| fineract `LoginAttemptEventListener.onAuthenticationSuccess` | — | ✔ no finding |
+| fineract `NoteListener.onCreate/onUpdate/onDelete` | N1 N2 | N1 ⬆ (HIGH on onCreate, MEDIUM on the others; LOW expected) · N2 ✖ (class-level, G16 — Ultra named it as a risk on onUpdate/onDelete but nothing measured it) |
+| fineract `LegacyMeetingAttendanceListener.onUpdate` | M1 M2 M3 | M1 ⬆ HIGH vs MEDIUM · M2 ⬆ HIGH vs LOW (newly reached in run 7) · M3 ✔ |
+
+**Total: 11 / 14 expected risks found** (F1 F2 F3 K1 K3 K4 L1 L2 N1 M1 M2); missed F4, K2, N2.
+**Negative controls: 3 / 3 held** (L3, M3, `onAuthenticationSuccess`); plus the Kill Bill PARTIAL_PROCESSING and
+`getOverdueConfig` THROW scenarios correctly gave no finding.
+**Severity:** 6 of the 11 are over-rated (K3 K4 L2 N1 M1 M2), every one on a duplicate/concurrent risk → STEP 13 calibration.
+The earlier "11 / 14" (STEP 10) was not itemised per risk; this table is the itemised count.

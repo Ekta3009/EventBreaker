@@ -717,18 +717,26 @@ if source build stays broken).
 
 ---
 
-### [ ] STEP 12 — Cleanup: remove stand-in mode (after STEP 11)
+### [x] STEP 12 — Cleanup: remove stand-in mode (after STEP 11)
 
 Decided 2026-10-11 (option 2): once auto-classpath works, real-classpath is the only mode.
-- [ ] Delete stand-in code in `executor.py` (`_generate_stubs`, `_stub_source`, `_generate_chain_stubs`,
+- [x] Delete stand-in code in `executor.py` (`_generate_stubs`, `_stub_source`, `_generate_chain_stubs`,
   `_retype_to_chain`, `_analyze_chains`, `_patch_stubs_from_errors`, return-type guessing, `__EBChain`,
   subclass mock maker, non-real_types branches) — ~530 lines.
-- [ ] Delete `src/test/resources/consumers/` (16 synthetic), `src/main/java/com/eventbreaker/{consumer,event,model,service}`
+- [x] Delete `src/test/resources/consumers/` (16 synthetic), `src/main/java/com/eventbreaker/{consumer,event,model,service}`
   (`@EventBreakerConsumer` + Order sample classes), `@EventBreakerConsumer` support in the analyzer
   (keep listener detection for real annotations), tests that only cover stand-in mode.
-- [ ] Regression suite = real-world listeners (Fineract 7 + Kill Bill) via `scan`; keep offline pytest.
+- [x] Regression suite = real-world listeners (Fineract 7 + Kill Bill) via `scan`; keep offline pytest.
 
 **Test:** pytest + Java tests green; Fineract + Kill Bill scan results unchanged.
+
+*Done 2026-10-12:* executor.py 2004 → 1171 lines (stub generator, chain stubs, stub patcher + retry loop, return-type
+guessing, subclass mock maker, module-source copy, matcher/argument-list builders removed); `ScenarioExecutor` requires
+a classpath; CLI errors clearly when a file has no module and no `--classpath`. User chose to keep 6 toy consumers as
+analyzer parser inputs (`src/test/resources/analyzer/`, now `@EventListener`); other 10 + sample `Order*` classes +
+`@EventBreakerConsumer` deleted. Harness tests rewritten for real-classpath mode on Kill Bill/Fineract sources
+(named faults, MOCK class literals, Kafka ack recorder, reflective create/inject/call). pytest 109, Java 15 green.
+Regression: Fineract + Kill Bill call counts identical before/after (diffed); Fineract finding identical.
 
 ---
 
@@ -739,6 +747,9 @@ Decided 2026-10-11 (option 2): once auto-classpath works, real-classpath is the 
 - [ ] One finding per root cause per scenario (the swallowed failure), not one per affected call.
 - [ ] Optional: THROW with a declared checked exception type (K2); fail only the Nth call (parent insert).
 - [ ] Stability: run Fineract + Kill Bill 2× each, findings must match.
+  Evidence (2026-10-12): Kill Bill `handlePaymentInfoEvent` — identical call counts, Super gave 6 findings in one run and
+  3 in the next (and flipped PARTIAL_PROCESSING HIGH → none). Candidates: temperature 0, cache diagnosis by observation
+  hash, deterministic rules for the obvious cases.
 
 ---
 

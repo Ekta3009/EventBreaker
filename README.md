@@ -2,7 +2,7 @@
 
 **Break your event consumers before production does.**
 
-EventBreaker is an AI-powered reliability analysis and fault-injection tool for Java event-driven applications. Point it at any `@EventBreakerConsumer`-annotated Java class and it automatically identifies reliability risks, proves them with real JVM execution, and generates grounded fix recommendations — all in a single command.
+EventBreaker is an AI-powered reliability analysis and fault-injection tool for Java event-driven applications. Point it at an event listener in your Maven or Gradle project (`@KafkaListener`, `@RabbitListener`, `@JmsListener`, `@SqsListener`, `@EventListener`, Guava `@Subscribe`, …) and it automatically identifies reliability risks, proves them with real JVM execution, and generates grounded fix recommendations — all in a single command.
 
 Built for the **Nebius × NVIDIA Global AI Hackathon 2026**.
 
@@ -23,7 +23,7 @@ These bugs are invisible in unit tests, hard to reproduce locally, and expensive
 ## How It Works
 
 ```
-eventbreaker analyze OrderConsumer.java
+eventbreaker analyze OrderListener.java
          │
          ▼
   [Static Analyzer]             JavaParser reads the consumer AST.
@@ -177,7 +177,8 @@ eventbreaker analyze path/to/OrderListener.java --method onOrderPlaced
 ### Example
 
 ```bash
-eventbreaker analyze src/test/resources/consumers/OrderConsumer.java
+cd ~/fineract-1.15.0
+eventbreaker scan . --only LoginAttemptEventListener.onAuthenticationFailure
 ```
 
 **Pipeline steps:**
@@ -210,7 +211,8 @@ Risks that require return-value control (null checks, specific values) or real i
 
 ## Consumer Compatibility
 
-EventBreaker works with any Java consumer annotated with `@EventBreakerConsumer`. It auto-generates stub classes for unknown types and patches them iteratively on compiler errors.
+EventBreaker runs the listener against its project's real compiled classes and dependency jars, so there is
+nothing to annotate or stub. The module must be built first (`mvn compile`, or Gradle builds it for you).
 
 | Pattern | Supported |
 |---|---|
@@ -219,8 +221,9 @@ EventBreaker works with any Java consumer annotated with `@EventBreakerConsumer`
 | Package-private fields | ✅ via `setAccessible` |
 | 4+ dependencies | ✅ |
 | Generic typed dependencies (`Repository<Product>`) | ✅ |
-| Deep event method chains (`event.getOrder().getId()`) | ✅ |
-| Conditional logic, early returns | ✅ |
+| Final classes, records, Lombok-generated code | ✅ (inline mock maker, project's own compiled class) |
+| Extra listener parameters (Kafka `Acknowledgment`) | ✅ recorded like dependencies |
+| Conditional logic, early returns, casts | ✅ via path setup (Nemotron Super picks fake return values) |
 | Safe / idempotent consumers | ✅ correctly reported as no risk |
 
 ---
@@ -229,20 +232,21 @@ EventBreaker works with any Java consumer annotated with `@EventBreakerConsumer`
 
 ```
 EventBreaker/
-├── src/main/java/com/eventbreaker/    Java: @EventBreakerConsumer annotation
-│   ├── annotation/                    + JavaParser-based static analyzer
-│   └── analyzer/                      fat JAR built by mvn package
-├── src/test/resources/consumers/      12 example consumers (safe, risky, adversarial)
+├── src/main/java/com/eventbreaker/
+│   └── analyzer/                      JavaParser-based static analyzer (fat JAR built by mvn package)
+├── src/test/resources/
+│   ├── real-world/                    Kill Bill + Fineract listeners, expected risks, run inventory
+│   └── analyzer/                      Parser test inputs
 ├── eventbreaker/                      Python package
 │   ├── cli/main.py                    Typer CLI — 6-step pipeline
 │   ├── analyzer/bridge.py             Java JAR → Python bridge (JAR shipped as package data)
 │   ├── classpath/resolver.py          Auto classpath from the listener's Maven/Gradle module
 │   ├── agent/nemotron.py              Nemotron Ultra risk identification + TestConfig
+│   ├── agent/path_setup.py            Nemotron Super path setup (fake return values)
 │   ├── scenarios/
 │   │   ├── models.py                  ChaosScenario, TestConfig, FaultInjection
 │   │   ├── executor.py                Parameter-driven Java harness assembly + Maven build
-│   │   ├── experiment.py              Pure Python feasibility validator
-│   │   └── validator.py               Schema validation for LLM output
+│   │   └── experiment.py              Pure Python feasibility validator
 │   ├── sandbox/executor.py            Nebius ConTree SDK wrapper
 │   ├── diagnosis/analyzer.py          Nemotron Super diagnosis
 │   ├── report/reporter.py             Markdown report generator

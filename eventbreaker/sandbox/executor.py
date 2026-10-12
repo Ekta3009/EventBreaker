@@ -15,8 +15,8 @@ _JAR_PATH = "/app/eventbreaker.jar"
 # Total sandbox timeout: ~30s to install JRE + a few seconds to run the JAR.
 _TIMEOUT_SECONDS = 180
 
-# Per-HTTP-request timeout. The SDK default (10s) is too short to upload a
-# real-classpath JAR (~9 MB) on an ordinary home connection.
+# Per-HTTP-request timeout. The SDK default (10s) is too short to upload
+# an execution JAR (~9 MB) on an ordinary home connection.
 _TRANSPORT_TIMEOUT_SECONDS = 120.0
 
 

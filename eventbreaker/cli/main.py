@@ -135,7 +135,7 @@ def analyze_consumer(
 
     console.print("[bold green]✓ Static analysis complete[/bold green]\n")
 
-    # Real classpath: --classpath wins; otherwise ask the listener's own build.
+    # --classpath wins; otherwise ask the listener's own build.
     # Resolved before any Nemotron call so a build problem costs nothing.
     jars = _parse_classpath(classpath) if classpath else _auto_classpath(file)
 
@@ -202,8 +202,8 @@ def analyze_consumer(
 
     executions: list[tuple[ChaosScenario, ObservationResult]] = []
     executor = ScenarioExecutor(jars)
-    # Real classpath: plan what the fakes must return so each scenario reaches
-    # its risky call, and run the same setup without faults as a baseline.
+    # Plan what the fakes must return so each scenario reaches its risky call,
+    # and run the same setup without faults as a baseline.
     baselines: dict[str, ObservationResult] = {}
     setups: dict[str, list] = {}          # setup key → its overrides
     def run_baseline(values: list) -> ObservationResult:
@@ -236,7 +236,7 @@ def analyze_consumer(
                 + "[/dim]"
             )
 
-    planned = [sc for sc, _ in feasible if jars and sc.testConfig is not None]
+    planned = [sc for sc, _ in feasible if sc.testConfig is not None]
     for scenario in planned:
         # A setup another scenario already proved reaches this target costs no LLM call.
         values = reusable_setup(target_calls(scenario), tried())
@@ -286,7 +286,7 @@ def analyze_consumer(
                 continue
 
         # A run that never called the scenario's target proves nothing about it.
-        if jars and result.status == "REPRODUCED":
+        if result.status == "REPRODUCED":
             result.notReached = not_reached(result, targets)
             if result.notReached:
                 result.status = "NOT_REACHED"
@@ -508,12 +508,15 @@ def _print_usage() -> None:
 
 
 def _auto_classpath(file: Path) -> list[Path]:
-    """The listener module's classpath from Maven/Gradle ([] when it has no build of its own)."""
+    """The listener module's classpath from Maven/Gradle."""
     module = find_module(file)
     if module is None:
-        console.print("[dim]No Maven/Gradle module around this file — using generated stand-in types "
-                      "(pass --classpath to use real ones).[/dim]\n")
-        return []
+        console.print(
+            "[bold red]No classpath:[/bold red] this file is not under a Maven/Gradle module's "
+            "src/main/java. Run EventBreaker on the listener inside its project, or pass the "
+            "project's jars with --classpath."
+        )
+        raise typer.Exit(1)
     with console.status(
         f"[bold green]Resolving classpath for {module.dir.name} ({module.tool}; "
         f"first time per module can take a few minutes)..."

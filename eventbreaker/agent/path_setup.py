@@ -1,8 +1,8 @@
 """Path setup: what each fake must return so a scenario reaches its risky call.
 
-Real-classpath mode only. Real listeners branch on strings, enums, nulls and
-casts to concrete classes; default fakes can't satisfy those, so execution
-would stop before the side effect under test. Nemotron Super reads the source
+Real listeners branch on strings, enums, nulls and casts to concrete classes;
+default fakes can't satisfy those, so execution would stop before the side
+effect under test. Nemotron Super reads the source
 and returns a small list of ReturnValue overrides in a fixed vocabulary — the
 executor turns them into fake answers (no LLM-written code).
 """

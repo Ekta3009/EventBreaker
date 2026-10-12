@@ -177,3 +177,10 @@ Failures and fixes:
 
 Diagnosis drift (→ STEP 13): Kill Bill gave 6 HIGH this time — 4 on one swallowed `getAccountById`/children failure —
 and a HIGH on PARTIAL_PROCESSING, which run 4 correctly left empty.
+
+## Run 9 — 2026-10-12, after removing stand-in mode (STEP 12)
+
+Same commands as run 8. Execution unchanged: every scenario REPRODUCED and the per-call counts are identical to run 8
+(diffed). Fineract: same single HIGH `saveAndFlush` finding. Kill Bill: 3 findings (HIGH `insertOverdueNotification`
+missing, MEDIUM `getAccountById` swallowed, HIGH duplicate insert) vs 6 in run 8 on the **same** observations, and
+PARTIAL_PROCESSING correctly empty again → diagnosis is not stable run to run (STEP 13).

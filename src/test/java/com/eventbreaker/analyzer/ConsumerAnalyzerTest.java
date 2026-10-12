@@ -20,7 +20,7 @@ class ConsumerAnalyzerTest {
         ConsumerAnalysis analysis =
                 analyzer.analyze(
                         Path.of(
-                                "src/test/resources/consumers/SimpleConsumer.java"
+                                "src/test/resources/analyzer/SimpleConsumer.java"
                         )
                 );
 
@@ -70,7 +70,7 @@ class ConsumerAnalyzerTest {
         ConsumerAnalysis analysis =
                 analyzer.analyze(
                         Path.of(
-                                "src/test/resources/consumers/NotificationConsumer.java"
+                                "src/test/resources/analyzer/NotificationConsumer.java"
                         )
                 );
 
@@ -119,7 +119,7 @@ class ConsumerAnalyzerTest {
         ConsumerAnalysis analysis =
                 analyzer.analyze(
                         Path.of(
-                                "src/test/resources/consumers/DeepNestedConsumer.java"
+                                "src/test/resources/analyzer/DeepNestedConsumer.java"
                         )
                 );
 
@@ -190,7 +190,7 @@ class ConsumerAnalyzerTest {
         ConsumerAnalysis analysis =
                 analyzer.analyze(
                         Path.of(
-                                "src/test/resources/consumers/ConditionalConsumer.java"
+                                "src/test/resources/analyzer/ConditionalConsumer.java"
                         )
                 );
 
@@ -241,7 +241,7 @@ class ConsumerAnalyzerTest {
         ConsumerAnalysis analysis =
                 analyzer.analyze(
                         Path.of(
-                                "src/test/resources/consumers/ComplexConsumer.java"
+                                "src/test/resources/analyzer/ComplexConsumer.java"
                         )
                 );
 
@@ -299,7 +299,7 @@ class ConsumerAnalyzerTest {
         ConsumerAnalysis analysis =
                 analyzer.analyze(
                         Path.of(
-                                "src/test/resources/consumers/OrderConsumer.java"
+                                "src/test/resources/analyzer/OrderConsumer.java"
                         )
                 );
 

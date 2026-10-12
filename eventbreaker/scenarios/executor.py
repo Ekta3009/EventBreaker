@@ -104,7 +104,6 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 
-CONSUMER_IMPORT
 EXTRA_IMPORTS
 
 /**
@@ -125,18 +124,6 @@ public class EventBreakerExecution {
         }
     }
 
-    private static Object eventAnswer(org.mockito.invocation.InvocationOnMock inv) throws Throwable {
-        Class<?> rt = inv.getMethod().getReturnType();
-        if (rt == int.class || rt == Integer.class) return 1;
-        if (rt == long.class || rt == Long.class) return 1L;
-        if (rt == double.class || rt == Double.class) return 1.0;
-        if (rt == float.class || rt == Float.class) return 1.0f;
-        if (rt == short.class || rt == Short.class) return (short) 1;
-        if (rt == byte.class || rt == Byte.class) return (byte) 1;
-        if (rt == boolean.class || rt == Boolean.class) return true;
-        return RETURNS_DEFAULTS.answer(inv);
-    }
-
     private static void run() throws Exception {
 
         // ── Instrumented dependencies (recorders, not simulators) ──────────
@@ -146,9 +133,6 @@ public class EventBreakerExecution {
         List<String> callSequence = Collections.synchronizedList(new ArrayList<>());
 MOCK_DECLARATIONS
 
-        // ── Stub methods that return objects (prevents NullPointerException)
-STUBS
-
         // ── Instantiate the real consumer with recorder dependencies ───────
 CONSUMER_INSTANTIATION
 
@@ -156,8 +140,8 @@ CONSUMER_INSTANTIATION
         // Numeric getters return 1 and boolean getters return true, so guard
         // clauses like `if (event.getAmount() <= 0) return;` don't short-circuit.
         EVENT_CLASS event = mock(EVENT_CLASS.class,
-            withSettings().defaultAnswer(EventBreakerExecution::eventAnswer));
-CHAIN_STUBS
+            eventbreaker.generated.__EBInstantiate.settings(EVENT_CLASS.class, "event"));
+EVENT_STUBS
 
         // ── Reset counters — exclude stubbing-phase invocations ────────────
         // when(...).thenReturn(...) triggers one invocation on the stub target.
@@ -627,16 +611,17 @@ def _classpath_dependencies(classpath: list[Path]) -> str:
 class ScenarioExecutor:
     """Builds and runs one scenario harness per call.
 
-    classpath: the consumer project's dependency jars. When given, the consumer
-    compiles against its real types and no stub classes are generated; when
-    omitted, missing types are stubbed (works for self-contained consumers).
+    classpath: the consumer project's compiled classes and dependency jars; the
+    harness compiles and runs against the consumer's real types.
     """
 
-    def __init__(self, classpath: list[Path] | None = None) -> None:
+    def __init__(self, classpath: list[Path]) -> None:
+        if not classpath:
+            raise ValueError("ScenarioExecutor needs the consumer project's classpath")
         # Directories (e.g. Gradle build/classes of sibling modules) become jars:
         # Maven system-scope dependencies and the sandbox bundler both need files.
-        self.classpath = [_as_jar(Path(p)) for p in classpath or []]
-        self._classes: set[str] | None = _class_index(self.classpath) if self.classpath else None
+        self.classpath = [_as_jar(Path(p)) for p in classpath]
+        self._classes: set[str] = _class_index(self.classpath)
 
     def execute(
         self,
@@ -648,7 +633,7 @@ class ScenarioExecutor:
         # Different scenarios (different testConfig) → different cache keys.
         execution_code = _generate_execution(
             analysis, consumer_file, scenario.testConfig, scenario.scenarioType,
-            real_types=bool(self.classpath), available_classes=self._classes,
+            available_classes=self._classes,
         )
         cache_key = hashlib.sha256(
             (
@@ -656,7 +641,7 @@ class ScenarioExecutor:
                 + consumer_file.read_text(errors="replace")
                 + "\0".join(str(p) for p in self.classpath)
                 # Support code compiled into the harness: a change must rebuild cached jars.
-                + (_INSTANTIATE_HELPER if self.classpath else "")
+                + _INSTANTIATE_HELPER
             ).encode()
         ).hexdigest()[:16]
         cache_dir = Path.home() / ".eventbreaker" / "cache" / cache_key
@@ -666,7 +651,7 @@ class ScenarioExecutor:
         if freshly_created:
             self._create_project(project_dir, consumer_file)
 
-        # Always overwrite execution class and stubs in case analysis changed
+        # Always overwrite the execution class and helper in case analysis changed
         self._write_execution(
             project_dir, analysis, consumer_file, scenario.testConfig, scenario.scenarioType
         )
@@ -677,7 +662,7 @@ class ScenarioExecutor:
         )
 
         # Stale cache recovery: if the build failed on an inherited project dir,
-        # the stubs may be corrupted from a previous session. Delete and retry once.
+        # it may be left over from an older EventBreaker version. Delete and retry once.
         if result.status == "ERROR" and not freshly_created and not _jar_exists(project_dir):
             shutil.rmtree(project_dir, ignore_errors=True)
             self._create_project(project_dir, consumer_file)
@@ -694,15 +679,11 @@ class ScenarioExecutor:
     def _generate_support(
         self, project_dir: Path, analysis: ConsumerAnalysis, consumer_file: Path
     ) -> None:
-        # With a real classpath every type the consumer uses exists: no stubs,
-        # only the reflective instantiation helper.
-        if self.classpath:
-            gen = project_dir / "src" / "main" / "java" / "eventbreaker" / "generated"
-            gen.mkdir(parents=True, exist_ok=True)
-            (gen / "__EBInstantiate.java").write_text(_INSTANTIATE_HELPER)
-            return
-        _generate_stubs(project_dir, analysis, consumer_file)
-        _generate_chain_stubs(project_dir, analysis, consumer_file)
+        # Every type the consumer uses is on the classpath: only the reflective
+        # instantiation helper is needed.
+        gen = project_dir / "src" / "main" / "java" / "eventbreaker" / "generated"
+        gen.mkdir(parents=True, exist_ok=True)
+        (gen / "__EBInstantiate.java").write_text(_INSTANTIATE_HELPER)
 
     def _create_project(self, project_dir: Path, consumer_file: Path) -> None:
         project_dir.mkdir(parents=True)
@@ -713,9 +694,6 @@ class ScenarioExecutor:
         main_src = project_dir / "src" / "main" / "java"
         main_src.mkdir(parents=True)
 
-        # Tell Mockito to use subclass-based mocking (no JVM agent required).
-        # This works for interfaces (standard proxy) and non-final concrete
-        # classes (subclass) without any --add-opens or -javaagent flags.
         mockito_ext = (
             project_dir / "src" / "main" / "resources"
             / "mockito-extensions"
@@ -725,39 +703,18 @@ class ScenarioExecutor:
             # Real classpath: real code uses final classes (value objects, records,
             # Fineract's JsonCommand) that only the inline mock maker can fake. It
             # self-attaches an agent at startup — verified to work in the sandbox JRE.
-            "mock-maker-inline\n" if self.classpath else "mock-maker-subclass\n"
+            "mock-maker-inline\n"
         )
 
-        maven_root = _find_maven_root(consumer_file)
-        # Stand-in mode only: copy the consumer's module sources. With a real classpath the
-        # module is already compiled on it, and its other sources may need provided-scope
-        # jars (Guice, jsr305) that a runtime classpath leaves out.
-        if maven_root and not self.classpath:
-            origin_src = maven_root / "src" / "main" / "java"
-            if origin_src.exists():
-                for java_file in origin_src.rglob("*.java"):
-                    # Skip analyzer — it depends on JavaParser
-                    if "analyzer" not in java_file.parts:
-                        dest = main_src / java_file.relative_to(origin_src)
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        shutil.copy2(java_file, dest)
-
-        # Real classpath that already contains the compiled consumer: use it as
-        # built by the project (Lombok and other annotation processors applied).
+        # The project's compiled consumer is used as built (Lombok and other
+        # annotation processors applied); otherwise compile a copy of its source.
         pkg = _read_package(consumer_file) or ""
         fqn_path = "/".join([*pkg.split("."), consumer_file.stem]) + ".class" if pkg else consumer_file.stem + ".class"
-        if self.classpath and _classpath_contains(self.classpath, fqn_path):
+        if _classpath_contains(self.classpath, fqn_path):
             return
-
-        # Copy the consumer to its package directory when the steps above didn't provide
-        # it: it lives outside src/main/java (e.g. test resources), or real-classpath mode.
-        if self.classpath or maven_root is None or not _is_under(
-            consumer_file, maven_root / "src" / "main" / "java"
-        ):
-            pkg = _read_package(consumer_file) or ""
-            pkg_dir = main_src / Path(*pkg.split(".")) if pkg else main_src
-            pkg_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(consumer_file, pkg_dir / consumer_file.name)
+        pkg_dir = main_src / Path(*pkg.split(".")) if pkg else main_src
+        pkg_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(consumer_file, pkg_dir / consumer_file.name)
 
     def _write_execution(
         self,
@@ -775,7 +732,7 @@ class ScenarioExecutor:
         exec_dir.mkdir(parents=True, exist_ok=True)
         code = _generate_execution(
             analysis, consumer_file, test_config, scenario_type,
-            real_types=bool(self.classpath), available_classes=self._classes,
+            available_classes=self._classes,
         )
         (exec_dir / "EventBreakerExecution.java").write_text(code)
 
@@ -792,38 +749,20 @@ class ScenarioExecutor:
 
         # Step 1: compile + package into a self-contained fat JAR.
         # Skipped when a cached JAR already exists for this consumer.
-        # Uses an iterative fix loop: if javac reports missing methods on stubs,
-        # patch them in and retry (max 3 attempts).
         if not cached:
-            last_output = ""
-            built = False
-            for _ in range(3):
-                build = subprocess.run(
-                    ["mvn", "package", "--no-transfer-progress", "-DskipTests", "-e"],
-                    capture_output=True,
-                    text=True,
-                    cwd=project_dir,
-                )
-                last_output = build.stdout + "\n" + build.stderr
-                if build.returncode == 0:
-                    built = True
-                    break
-                fixable = (
-                    "cannot find symbol" in last_output
-                    or "cannot be applied to given types" in last_output
-                    or "actual and formal argument lists differ in length" in last_output
-                    or "incompatible types" in last_output
-                )
-                if fixable and not self.classpath and _patch_stubs_from_errors(project_dir, last_output, analysis, consumer_file):
-                    continue  # stubs were patched — retry
-                break  # genuine error, stop
-
-            if not built:
+            build = subprocess.run(
+                ["mvn", "package", "--no-transfer-progress", "-DskipTests", "-e"],
+                capture_output=True,
+                text=True,
+                cwd=project_dir,
+            )
+            if build.returncode != 0:
+                output = build.stdout + "\n" + build.stderr
                 return ObservationResult(
                     scenario=scenario.scenarioType,
                     status="ERROR",
-                    rawOutput=last_output,
-                    executionError=_extract_build_error(last_output),
+                    rawOutput=output,
+                    executionError=_extract_build_error(output),
                 )
 
         # Step 2: run the fat JAR — in Nebius Sandbox if credentials available,
@@ -836,7 +775,7 @@ class ScenarioExecutor:
                 # classes it can reach (uploading every dependency jar times out).
                 pkg = _read_package(consumer_file)
                 consumer_fqn = f"{pkg}.{analysis.className}" if pkg else analysis.className
-                upload = _sandbox_jar(jar, self.classpath, (consumer_fqn,)) if self.classpath else jar
+                upload = _sandbox_jar(jar, self.classpath, (consumer_fqn,))
                 stdout, stderr = SandboxExecutor().execute(upload)
                 output = stdout + "\n" + stderr
             except (RuntimeError, EnvironmentError) as e:
@@ -865,27 +804,22 @@ def _generate_execution(
     consumer_file: Path,
     test_config: "TestConfig | None",
     scenario_type: str = "UNKNOWN",
-    real_types: bool = False,
     available_classes: "set[str] | None" = None,
 ) -> str:
     """Generate the harness main class.
 
-    real_types: the consumer compiles against its project's real classpath.
-    Recorder mocks then return mocks by default (no stub return types needed),
-    the consumer is built through its real constructor by reflection, and the
-    recorders are injected into its dependency fields afterwards.
+    The consumer compiles against its project's real classpath. Recorder fakes
+    return fakes by default (no return-type guessing), the consumer is built
+    through its real constructor by reflection, and the recorders are injected
+    into its dependency fields afterwards.
     """
     consumer_pkg = _read_package(consumer_file) or ""
-    consumer_import = (
-        f"import {consumer_pkg}.{analysis.className};"
-        if consumer_pkg else ""
-    )
 
-    # Start with whatever the consumer itself imports.
+    # Start with whatever the consumer itself imports, minus imports only the
+    # compiled consumer needed (Lombok and other compile-only annotations are
+    # not on the runtime classpath).
     consumer_imports = _read_imports(consumer_file)
     if available_classes is not None:
-        # Real classpath: drop imports that only the compiled consumer needed
-        # (Lombok and other compile-only annotations are not on the runtime classpath).
         consumer_imports = [
             imp for imp in consumer_imports if _import_available(imp, available_classes)
         ]
@@ -923,20 +857,17 @@ def _generate_execution(
 
     extra_imports = "\n".join(consumer_imports + extra_pkg_imports)
 
-    # Real-types mode: listener parameters other than the event (e.g. Kafka's
-    # Acknowledgment) get recorder fakes too, so calls on them are observed.
-    extra_params, call_args = _listener_arguments(analysis) if real_types else ([], "event")
+    # Listener parameters other than the event (e.g. Kafka's Acknowledgment)
+    # get recorder fakes too, so calls on them are observed.
+    extra_params, call_args = _listener_arguments(analysis)
     recorders = list(analysis.dependencies) + extra_params
 
     mock_decl_lines = ["        Map<String, Integer> threwCounts = new LinkedHashMap<>();"]
     for d in recorders:
         dtype = d.type.split("<")[0].strip()
-        settings = (
-            f'eventbreaker.generated.__EBInstantiate.settings({dtype}.class, "{d.name}")'
-            if real_types else "withSettings()"
-        )
         mock_decl_lines.append(
-            f"        {d.type} {d.name} = mock({dtype}.class, {settings}\n"
+            f"        {d.type} {d.name} = mock({dtype}.class, "
+            f'eventbreaker.generated.__EBInstantiate.settings({dtype}.class, "{d.name}")\n'
             f'            .invocationListeners(report -> {{\n'
             f'                String __ebMn = ((org.mockito.invocation.Invocation) report.getInvocation()).getMethod().getName();\n'
             f'                callSequence.add("{d.name}." + __ebMn);\n'
@@ -945,131 +876,19 @@ def _generate_execution(
         )
     mock_declarations = "\n".join(mock_decl_lines)
 
-    # Final JDK types that Mockito cannot subclass — skip mock() for these.
-    # The dependency mock already returns null for them by default, which is fine
-    # since the result is passed to another mock anyway.
-    _FINAL_JDK = frozenset({
-        "String", "Integer", "Long", "Double", "Float", "Boolean",
-        "Byte", "Character", "Short", "BigDecimal", "BigInteger",
-        "UUID", "LocalDate", "LocalDateTime", "Instant",
-    })
-
-    dep_names = {d.name for d in analysis.dependencies}
-    stubs_lines: list[str] = []
-
-    # local_mocks: varName -> mockVarName for intermediate objects
-    # e.g. "order" -> "mockOrder" when order = orderRepository.find(...)
-    local_mocks: dict[str, str] = {}
-
-    for vi in analysis.variableInitializations:
-        call = vi.initializerMethodCall
-        if call and call.scope in dep_names:
-            vtype = vi.variableType or ""
-            raw_type = vtype.split("<")[0].strip()
-            if raw_type in _FINAL_JDK:
-                continue  # can't mock final JDK types; null return is acceptable
-            if raw_type in _PRIMITIVE_STUB_VALUES:
-                ret_val = _PRIMITIVE_STUB_VALUES[raw_type]
-            elif raw_type in _COLLECTION_STUB_VALUES:
-                ret_val = _COLLECTION_STUB_VALUES[raw_type]
-            else:
-                mock_var = f"mock{raw_type}"
-                local_mocks[vi.variableName] = mock_var
-                decl = f"        {vtype} {mock_var} = mock({raw_type}.class);"
-                if decl not in stubs_lines:
-                    stubs_lines.append(decl)
-                ret_val = mock_var
-            for matchers in _matcher_lists(analysis, call.scope, call.methodName):
-                stub_line = (
-                    f"        when({call.scope}.{call.methodName}({matchers}))"
-                    f".thenReturn({ret_val});"
-                )
-                if stub_line not in stubs_lines:
-                    stubs_lines.append(stub_line)
-
-    # Stub non-void methods called on intermediate mocks so consumers with
-    # conditional branches (e.g. if (order.getStatus().equals("READY")))
-    # don't NPE.  We only stub methods that are assigned to a variable
-    # (i.e. they appear in variableInitializations), which guarantees
-    # they are non-void.  No argument matchers — varargs stubs called with
-    # zero args match the no-matcher form correctly.
-    #
-    # Return value strategy: use the first string literal found in any
-    # .equals() call in the consumer, so conditions evaluate to true and
-    # all branches execute.  Falls back to "" if none found.
-    equals_literals: list[str] = []
-    for mc in analysis.methodCalls:
-        if mc.methodName == "equals" and mc.arguments:
-            lit = mc.arguments[0].strip('"').strip("'")
-            if lit:
-                equals_literals.append(lit)
-
-    for vi in analysis.variableInitializations:
-        call = vi.initializerMethodCall
-        if not call or call.scope not in local_mocks:
-            continue
-        if vi.variableType in _FINAL_JDK:
-            # String/Integer etc — can't return a mock, return a literal
-            ret_val = f'"{equals_literals[0]}"' if equals_literals else '""'
-        else:
-            continue  # non-void object types already handled by their own mock
-        mock_var = local_mocks[call.scope]
-        stub_line = (
-            f"        when({mock_var}.{call.methodName}())"
-            f".thenReturn({ret_val});"
-        )
-        if stub_line not in stubs_lines:
-            stubs_lines.append(stub_line)
-
-    # Method chains (event.getA().b(), dep.find(x).getB().c()): the chain root's
-    # method returns the shared __EBChain mock, which returns itself for every
-    # further chained call (RETURNS_SELF) so chains of any depth don't NPE.
+    # Stub boolean methods called directly on the event (e.g. event.isPriority())
+    # to return true, so conditional listeners take the side-effect branch.
     event_var = _get_event_var_name(analysis)
-    chain_roots, _chain_methods, _typed = _analyze_chains(analysis)
-    if chain_roots:
-        stubs_lines.insert(0,
-            "        eventbreaker.generated.__EBChain __ebChain ="
-            " mock(eventbreaker.generated.__EBChain.class, RETURNS_SELF);"
-        )
-    for root, methods in sorted(chain_roots.items()):
-        if root == event_var:
-            continue
-        for method in sorted(methods):
-            for matchers in _matcher_lists(analysis, root, method):
-                stubs_lines.append(
-                    f"        when({root}.{method}({matchers})).thenReturn(__ebChain);"
-                )
-
-    if real_types:
-        # Real return types + RETURNS_MOCKS: no return-value or chain stubs needed.
-        stubs_lines = []
-        chain_roots = {}
-
-    stubs = "\n".join(stubs_lines)
-
-    # Stub event method chains — must come AFTER 'event' is declared in the harness.
-    event_stub_lines: list[str] = []
-    for method in sorted(chain_roots.get(event_var, set())):
-        event_stub_lines.append(
-            f"        when(event.{method}()).thenReturn(__ebChain);"
-        )
-
-    # Stub boolean methods called directly on the event (e.g. event.isPriority()).
-    # Mockito defaults all booleans to false, which locks conditional consumers into
-    # the else-branch.  Return true so all branches execute and all risks are tested.
     _BOOL_PREFIX = re.compile(r'^(is|has|was|can|should|will)[A-Z_]')
-    seen_bool_stubs: set[str] = set()
+    event_stub_lines: list[str] = []
     for mc in analysis.methodCalls:
+        stub = f"        when(event.{mc.methodName}()).thenReturn(true);"
         if (
             mc.scope == event_var
             and (_BOOL_PREFIX.match(mc.methodName) or mc.methodName in _KNOWN_BOOLEAN_METHODS)
-            and mc.methodName not in seen_bool_stubs
+            and stub not in event_stub_lines
         ):
-            seen_bool_stubs.add(mc.methodName)
-            event_stub_lines.append(
-                f"        when(event.{mc.methodName}()).thenReturn(true);"
-            )
-
+            event_stub_lines.append(stub)
     event_stubs = "\n".join(event_stub_lines)
 
     dep_map_entries = "\n".join(
@@ -1086,50 +905,22 @@ def _generate_execution(
         "        threwCounts.clear();\n        callSequence.clear();"
     )
 
-    # Choose constructor injection vs. reflection field injection.
-    # If the consumer source contains an explicit constructor that accepts the
-    # dependencies, use it directly.  Otherwise (e.g. Spring field injection),
-    # create the consumer with its default no-arg constructor and inject fields
-    # via reflection — this avoids a compile error on a non-existent constructor.
-    if real_types:
-        # Object + Class.forName: the consumer class may be package-private.
-        fqn = f"{consumer_pkg}.{analysis.className}" if consumer_pkg else analysis.className
-        lines = [
-            f"        Object consumer = "
-            f'eventbreaker.generated.__EBInstantiate.create(Class.forName("{fqn}"));'
-        ]
-        lines += [
-            f'        eventbreaker.generated.__EBInstantiate.inject(consumer, "{d.name}", {d.name});'
-            for d in analysis.dependencies
-        ]
-        consumer_instantiation = "\n".join(lines)
-    elif _has_explicit_constructor(consumer_file, analysis.className):
-        constructor_args = ", ".join(d.name for d in analysis.dependencies)
-        consumer_instantiation = (
-            f"        {analysis.className} consumer = "
-            f"new {analysis.className}({constructor_args});"
-        )
-    else:
-        lines = [
-            f"        {analysis.className} consumer = new {analysis.className}();"
-        ]
-        for dep in analysis.dependencies:
-            lines += [
-                f"        {{",
-                f'            java.lang.reflect.Field _f = consumer.getClass().getDeclaredField("{dep.name}");',
-                f"            _f.setAccessible(true);",
-                f"            _f.set(consumer, {dep.name});",
-                f"        }}",
-            ]
-        consumer_instantiation = "\n".join(lines)
+    # Object + Class.forName: the consumer class may be package-private.
+    fqn = f"{consumer_pkg}.{analysis.className}" if consumer_pkg else analysis.className
+    lines = [
+        f"        Object consumer = "
+        f'eventbreaker.generated.__EBInstantiate.create(Class.forName("{fqn}"));'
+    ]
+    lines += [
+        f'        eventbreaker.generated.__EBInstantiate.inject(consumer, "{d.name}", {d.name});'
+        for d in analysis.dependencies
+    ]
+    consumer_instantiation = "\n".join(lines)
 
-    if real_types:
-        fault_injections = _build_named_faults(test_config, consumer_file) if test_config else ""
-    else:
-        fault_injections = _build_fault_injections(test_config, analysis) if test_config else ""
-    call_pattern = _build_call_pattern(analysis, test_config, call_args, real_types) if test_config else (
+    fault_injections = _build_named_faults(test_config, consumer_file) if test_config else ""
+    call_pattern = _build_call_pattern(analysis, test_config, call_args) if test_config else (
         f"        try {{\n"
-        f"            {_consumer_call(analysis, call_args, real_types)};\n"
+        f"            {_consumer_call(analysis, call_args)};\n"
         f"        }} catch (Exception __eb_ex) {{\n"
         f"            consumerThrew.set(true);\n            System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex);\n"
         f"        }}"
@@ -1137,17 +928,10 @@ def _generate_execution(
 
     return (
         _EXECUTION_TEMPLATE
-        .replace("CONSUMER_IMPORT", "" if real_types else consumer_import)
         .replace("EXTRA_IMPORTS", extra_imports)
         .replace("MOCK_DECLARATIONS", mock_declarations)
-        .replace("CHAIN_STUBS", event_stubs)
-        .replace("STUBS", stubs)
+        .replace("EVENT_STUBS", event_stubs)
         .replace("CONSUMER_INSTANTIATION", consumer_instantiation)
-        .replace(
-            "withSettings().defaultAnswer(EventBreakerExecution::eventAnswer)",
-            'eventbreaker.generated.__EBInstantiate.settings(EVENT_CLASS.class, "event")'
-            if real_types else "withSettings().defaultAnswer(EventBreakerExecution::eventAnswer)",
-        )
         .replace("EVENT_CLASS", analysis.eventType)
         .replace("DEP_MAP_ENTRIES", dep_map_entries)
         .replace("RESET_INVOCATIONS", reset_invocations)
@@ -1158,44 +942,6 @@ def _generate_execution(
 
 
 # ── TestConfig → Java builders ────────────────────────────────────────────────
-
-def _build_fault_injections(test_config: TestConfig, analysis: ConsumerAnalysis) -> str:
-    """Build Mockito stub lines that inject faults declared in the TestConfig.
-
-    Uses doThrow/doAnswer/doNothing syntax instead of when().thenX() so that
-    void-returning dependency methods compile correctly ('void' type not allowed
-    in when() expressions).
-
-    One stub line is emitted per call arity seen in the consumer — a single any()
-    only matches one-argument calls on varargs stubs.
-    """
-    if not test_config.faultInjections:
-        return ""
-    lines: list[str] = []
-    for fi in test_config.faultInjections:
-        target = f"{fi.dep}.{fi.method}"
-        for matchers in _matcher_lists(analysis, fi.dep, fi.method):
-            if fi.fault == "THROW":
-                lines.append(
-                    f'        doThrow(new RuntimeException("EventBreaker: THROW on {target}"))'
-                    f'.when({fi.dep}).{fi.method}({matchers});'
-                )
-            elif fi.fault == "THROW_ONCE":
-                # doAnswer(inv -> null) is safe for both void and non-void methods.
-                # doNothing() is only valid for void methods and causes a runtime error
-                # on Object-returning methods like findById, find, etc.
-                lines.append(
-                    f'        doThrow(new RuntimeException("EventBreaker: THROW_ONCE on {target}"))'
-                    f'.doAnswer(inv -> null).when({fi.dep}).{fi.method}({matchers});'
-                )
-            elif fi.fault == "DELAY":
-                delay_ms = fi.delayMs or 500
-                lines.append(
-                    f'        doAnswer(inv -> {{ Thread.sleep({delay_ms}); return null; }}'
-                    f').when({fi.dep}).{fi.method}({matchers});'
-                )
-    return "\n".join(lines)
-
 
 def _listener_arguments(analysis: ConsumerAnalysis) -> tuple[list[DependencyInfo], str]:
     """Recorder fakes for non-event listener parameters, and the call's argument list.
@@ -1264,44 +1010,17 @@ def _qualify(type_name: str, consumer_file: Path) -> str:
     return f"{pkg}.{type_name}" if pkg else type_name
 
 
-def _matcher_lists(analysis: ConsumerAnalysis, scope: str, method: str) -> list[str]:
-    """Return one argument-matcher list per distinct arity of scope.method(...).
-
-    Mockito 5 matches varargs element-by-element, so the matcher count must equal
-    the argument count at the call site. Falls back to a single any() when the
-    call isn't found in the analysis.
-    """
-    arities: set[int] = set()
-
-    def visit(calls: list) -> None:
-        for mc in calls:
-            if mc.scope == scope and mc.methodName == method:
-                arities.add(len(mc.arguments))
-            visit(mc.nestedCalls)
-
-    visit(analysis.methodCalls)
-    for vi in analysis.variableInitializations:
-        if vi.initializerMethodCall:
-            visit([vi.initializerMethodCall])
-    if not arities:
-        arities = {1}
-    return [", ".join(["any()"] * n) for n in sorted(arities)]
-
-
-def _consumer_call(analysis: ConsumerAnalysis, call_args: str, real_types: bool) -> str:
-    """The Java expression that invokes the listener method once."""
-    if real_types:
-        return (f'eventbreaker.generated.__EBInstantiate.call(consumer, "{analysis.methodName}", '
-                f"{call_args})")
-    return f"consumer.{analysis.methodName}({call_args})"
+def _consumer_call(analysis: ConsumerAnalysis, call_args: str) -> str:
+    """The Java expression that invokes the listener method once (reflectively: it may be package-private)."""
+    return (f'eventbreaker.generated.__EBInstantiate.call(consumer, "{analysis.methodName}", '
+            f"{call_args})")
 
 
 def _build_call_pattern(
     analysis: ConsumerAnalysis, test_config: TestConfig, call_args: str = "event",
-    real_types: bool = False,
 ) -> str:
     """Build the consumer invocation block matching the requested callPattern."""
-    call = _consumer_call(analysis, call_args, real_types)
+    call = _consumer_call(analysis, call_args)
     if test_config.callPattern == "SINGLE":
         return (
             f"        try {{\n"
@@ -1374,26 +1093,6 @@ def _parse_output(output: str, scenario: ChaosScenario) -> ObservationResult:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _find_maven_root(start: Path) -> Path | None:
-    current = start if start.is_dir() else start.parent
-    for _ in range(10):
-        if (current / "pom.xml").exists():
-            return current
-        parent = current.parent
-        if parent == current:
-            break
-        current = parent
-    return None
-
-
-def _is_under(path: Path, parent: Path) -> bool:
-    try:
-        path.relative_to(parent)
-        return True
-    except ValueError:
-        return False
-
-
 def _read_package(java_file: Path) -> str | None:
     for line in java_file.read_text(errors="replace").splitlines()[:20]:
         m = re.match(r"^\s*package\s+([\w.]+)\s*;", line)
@@ -1424,8 +1123,8 @@ def _extract_build_error(output: str) -> str:
         return (
             "Build failed: the consumer references types that EventBreaker "
             "could not find on the classpath.\n\n"
-            "Tip: run EventBreaker from the root of the Maven project that "
-            "contains the consumer so all dependency classes are available.\n\n"
+            "Tip: build the listener's module first (mvn compile / ./gradlew classes), "
+            "or pass the missing jars with --classpath.\n\n"
             f"Compiler errors:\n{detail}"
         )
 
@@ -1452,104 +1151,7 @@ def _read_imports(java_file: Path) -> list[str]:
     return imports
 
 
-def _has_explicit_constructor(java_file: Path, class_name: str) -> bool:
-    """Return True if the Java source contains an explicit constructor declaration."""
-    source = java_file.read_text(errors="replace")
-    return bool(re.search(rf"\bpublic\s+{re.escape(class_name)}\s*\(", source))
-
-
-# ── Stub generator ────────────────────────────────────────────────────────────
-
-# JDK built-in types that never need stubs.
-_JDK_TYPES: frozenset[str] = frozenset({
-    "void", "boolean", "int", "long", "double", "float", "byte", "char", "short",
-    "String", "Integer", "Long", "Double", "Float", "Boolean", "Byte", "Character",
-    "Short", "Object", "Number", "Comparable",
-    "List", "Map", "Set", "Collection", "Iterable", "Iterator",
-    "Optional", "Stream",
-    "Exception", "RuntimeException", "Throwable", "Error",
-    "Override", "Deprecated", "SuppressWarnings",
-})
-
-
-def _generate_stubs(
-    project_dir: Path,
-    analysis: ConsumerAnalysis,
-    consumer_file: Path,
-) -> None:
-    """Write minimal Java stub classes for every type the consumer references
-    that isn't already present in the temp project's source tree.
-
-    Stubs are concrete classes with a no-arg constructor — enough for the Java
-    compiler to resolve the name and for Mockito to subclass at runtime.
-    """
-    consumer_pkg = _read_package(consumer_file) or ""
-
-    # Build simple_name -> package map from the consumer's import statements.
-    import_pkg: dict[str, str] = {}
-    for imp in _read_imports(consumer_file):
-        m = re.match(r"import\s+([\w.]+)\.([\w]+)\s*;", imp)
-        if m:
-            import_pkg[m.group(2)] = m.group(1)
-
-    # Collect every type name the consumer analysis surfaces.
-    # generic_types: raw names that appeared with type parameters (e.g. "ProductRepository"
-    # from "ProductRepository<Product>") — their stub must declare <T>.
-    type_names: set[str] = set()
-    generic_types: set[str] = set()
-    type_names.add(analysis.eventType)
-    for dep in analysis.dependencies:
-        raw = dep.type.split("<")[0].strip()
-        type_names.add(raw)
-        if "<" in dep.type:
-            generic_types.add(raw)
-    for vi in analysis.variableInitializations:
-        if vi.variableType:
-            raw = vi.variableType.split("<")[0].strip()
-            type_names.add(raw)
-            if "<" in vi.variableType:
-                generic_types.add(raw)
-    for oc in analysis.objectCreations:
-        if oc.type:
-            type_names.add(oc.type.split("<")[0].strip())
-
-    # Never stub the consumer class itself — it already exists in the project.
-    type_names.discard(analysis.className)
-
-    main_src = project_dir / "src" / "main" / "java"
-
-    for name in type_names:
-        # Guard against anything with generics still slipping through.
-        name = name.split("<")[0].strip()
-        if not name or name in _JDK_TYPES:
-            continue
-
-        pkg = import_pkg.get(name, consumer_pkg)
-        pkg_parts = pkg.split(".") if pkg else []
-        dest = main_src.joinpath(*pkg_parts) / f"{name}.java" if pkg_parts else main_src / f"{name}.java"
-
-        if dest.exists():
-            continue
-
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(_stub_source(pkg, name, generic=name in generic_types))
-
-
-def _stub_source(pkg: str, name: str, generic: bool = False) -> str:
-    """Minimal compilable Java class — just enough for the compiler and Mockito.
-
-    Uses a varargs constructor so any call — new Foo(), new Foo(a), new Foo(a,b) —
-    compiles without needing to know the real constructor signature.
-    Mockito (Objenesis) does not call constructors when creating mocks, so this
-    is safe at runtime.
-
-    When generic=True the class is declared with <T> so parameterised usages like
-    Repository<Product> compile without "does not take parameters" errors.
-    """
-    pkg_line = f"package {pkg};\n\n" if pkg else ""
-    decl = f"{name}<T>" if generic else name
-    return f"{pkg_line}public class {decl} {{\n    public {name}(Object... args) {{}}\n}}\n"
-
+# ── Event helpers ──────────────────────────────────────────────────────────────
 
 _KNOWN_BOOLEAN_METHODS: frozenset[str] = frozenset({
     # Common Java method names that always return boolean regardless of prefix
@@ -1560,57 +1162,6 @@ _KNOWN_BOOLEAN_METHODS: frozenset[str] = frozenset({
 })
 
 
-# Harness return values for dependency calls assigned to primitive variables.
-# Non-zero / true so guard clauses (`if (points <= 0) return;`, `if (!sent) ...`)
-# take the side-effect path.
-_PRIMITIVE_STUB_VALUES = {
-    "int": "1", "long": "1L", "short": "(short) 1", "byte": "(byte) 1",
-    "double": "1.0", "float": "1.0f", "char": "'a'", "boolean": "true",
-}
-
-# Collection-typed results get real empty instances — a mocked List returns a
-# null iterator and NPEs on the first for-each or String.join.
-_COLLECTION_STUB_VALUES = {
-    "List": "new java.util.ArrayList<>()",
-    "Collection": "new java.util.ArrayList<>()",
-    "Iterable": "new java.util.ArrayList<>()",
-    "Set": "new java.util.HashSet<>()",
-    "Map": "new java.util.HashMap<>()",
-    "Optional": "java.util.Optional.empty()",
-}
-
-
-_JAVA_LANG_TYPES = frozenset({
-    "String", "Integer", "Long", "Double", "Float", "Boolean",
-    "Byte", "Character", "Short", "Object",
-})
-
-
-def _infer_return_type(method_name: str, default: str) -> str:
-    """Infer the correct return type for a stub method.
-
-    Uses Java naming conventions and a list of well-known boolean methods
-    so we don't generate `public Object contains(...)` which breaks
-    `if (store.contains(...))` compilation.
-    """
-    if default != "Object":
-        return default
-    if re.match(r"^(is|has|was|can|should|will|are|did|check|verify)[A-Z_]", method_name):
-        return "boolean"
-    if method_name in _KNOWN_BOOLEAN_METHODS:
-        return "boolean"
-    return "Object"
-
-
-def _default_return_value(ret_type: str) -> str:
-    """Return the appropriate zero/false/null literal for the given Java type."""
-    if ret_type == "boolean":
-        return "false"
-    if ret_type in {"int", "long", "double", "float", "byte", "char", "short"}:
-        return "0"
-    return "null"
-
-
 def _get_event_var_name(analysis: ConsumerAnalysis) -> str:
     """Extract the event parameter variable name from the consumer method signature."""
     for param in analysis.parameters:
@@ -1618,387 +1169,3 @@ def _get_event_var_name(analysis: ConsumerAnalysis) -> str:
         if len(parts) >= 2 and parts[0] == analysis.eventType:
             return parts[-1]
     return "event"
-
-
-def _analyze_chains(
-    analysis: ConsumerAnalysis,
-) -> tuple[dict[str, set[str]], set[str], dict[str, str]]:
-    """Return (chain_roots, chain_methods, typed_terminals).
-
-    chain_roots:     root variable (the event or a dependency) -> methods called on
-                     it whose results are further chained,
-                     e.g. {"event": {"getOrder"}, "customerService": {"getCustomer"}}.
-    chain_methods:   method names called on the result of a root call
-                     (e.g. withCustomer, getContactInfo, getEmail).
-    typed_terminals: chain method -> declared type, for chains assigned to a
-                     variable (String email = dep.a(x).getEmail() -> getEmail: String).
-    """
-    roots = {_get_event_var_name(analysis)} | {d.name for d in analysis.dependencies}
-    chain_roots: dict[str, set[str]] = {}
-    chain: set[str] = set()
-
-    def root_call(scope: str) -> tuple[str, str] | None:
-        m = re.match(r"^(\w+)\.(\w+)\(", scope)
-        if m and m.group(1) in roots:
-            return m.group(1), m.group(2)
-        return None
-
-    def collect(calls: list) -> None:
-        for call in calls:
-            rc = root_call(call.scope or "")
-            if rc:
-                chain_roots.setdefault(rc[0], set()).add(rc[1])
-                chain.add(call.methodName)
-            collect(call.nestedCalls)
-
-    collect(analysis.methodCalls)
-
-    typed: dict[str, str] = {}
-    for vi in analysis.variableInitializations:
-        c = vi.initializerMethodCall
-        if c and vi.variableType and root_call(c.scope or ""):
-            typed[c.methodName] = vi.variableType
-    return chain_roots, chain, typed
-
-
-def _chain_return_type(var_type: str, consumer_pkg: str, import_pkg: dict[str, str]) -> str:
-    """Java return type for a typed chain terminal declared on __EBChain."""
-    raw = var_type.split("<")[0].strip()
-    if raw in _PRIMITIVE_STUB_VALUES or raw in _JAVA_LANG_TYPES:
-        return raw
-    if raw in _COLLECTION_STUB_VALUES:
-        return f"java.util.{raw}"
-    pkg = import_pkg.get(raw, consumer_pkg)
-    return f"{pkg}.{raw}" if pkg else raw
-
-
-def _generate_chain_stubs(
-    project_dir: Path,
-    analysis: ConsumerAnalysis,
-    consumer_file: Path,
-) -> None:
-    """Generate __EBChain.java and retype chain-root methods on the event/dep stubs.
-
-    When the consumer contains chained calls like event.getA().doSomething() or
-    dep.find(id).getB().getC(), the root method must return a type that declares
-    the chained methods. __EBChain is that universal return type — it declares
-    every chained method and returns itself so the chain can extend arbitrarily
-    deep without NPE. Chain terminals assigned to a typed variable return that type.
-    """
-    chain_roots, chain_methods, typed = _analyze_chains(analysis)
-    if not chain_methods:
-        return  # no chains — nothing to do
-
-    consumer_pkg = _read_package(consumer_file) or ""
-    import_pkg: dict[str, str] = {}
-    for imp in _read_imports(consumer_file):
-        m = re.match(r"import\s+([\w.]+)\.([\w]+)\s*;", imp)
-        if m:
-            import_pkg[m.group(2)] = m.group(1)
-
-    # Write __EBChain.java to eventbreaker/generated (same package as the harness)
-    chain_dir = (
-        project_dir / "src" / "main" / "java" / "eventbreaker" / "generated"
-    )
-    chain_dir.mkdir(parents=True, exist_ok=True)
-    intermediate = {m for ms in chain_roots.values() for m in ms}
-    body_lines = []
-    for m in sorted(chain_methods):
-        if m in typed and m not in intermediate:
-            ret = _chain_return_type(typed[m], consumer_pkg, import_pkg)
-            body_lines.append(
-                f"    public {ret} {m}(Object... args) {{ return {_default_return_value(ret)}; }}"
-            )
-        else:
-            body_lines.append(f"    public __EBChain {m}(Object... args) {{ return this; }}")
-    (chain_dir / "__EBChain.java").write_text(
-        f"package eventbreaker.generated;\n\n"
-        f"public class __EBChain {{\n" + "\n".join(body_lines) + "\n}\n"
-    )
-
-    # Retype each chain-root method on its stub (event or dependency) to return __EBChain.
-    root_types = {_get_event_var_name(analysis): analysis.eventType}
-    root_types.update({d.name: d.type.split("<")[0].strip() for d in analysis.dependencies})
-    main_src = project_dir / "src" / "main" / "java"
-    for root, methods in chain_roots.items():
-        type_name = root_types[root]
-        pkg = import_pkg.get(type_name, consumer_pkg)
-        stub_path = main_src.joinpath(*pkg.split(".")) if pkg else main_src
-        stub_path = stub_path / f"{type_name}.java"
-        if stub_path.exists():
-            _retype_to_chain(stub_path, pkg, methods)
-
-
-def _retype_to_chain(stub_path: Path, pkg: str, methods: set[str]) -> None:
-    """Make each method on a generated stub return __EBChain (adding it if absent)."""
-    content = stub_path.read_text()
-    if "public " not in content or "(Object... args) {}" not in content:
-        return  # not one of our generated stubs — a real class, leave untouched
-
-    if "import eventbreaker.generated.__EBChain" not in content:
-        pkg_stmt = f"package {pkg};" if pkg else ""
-        if pkg_stmt and pkg_stmt in content:
-            content = content.replace(
-                pkg_stmt,
-                f"{pkg_stmt}\n\nimport eventbreaker.generated.__EBChain;",
-            )
-        else:
-            content = "import eventbreaker.generated.__EBChain;\n\n" + content
-
-    last_brace = content.rfind("}")
-    for method in sorted(methods):
-        method_decl = f"public __EBChain {method}("
-        if method_decl not in content:
-            # Replace Object return variant if already patched, else add fresh
-            old_variant = f"public Object {method}(Object... args) {{ return null; }}"
-            new_variant = f"public __EBChain {method}(Object... args) {{ return null; }}"
-            if old_variant in content:
-                content = content.replace(old_variant, new_variant)
-            else:
-                content = (
-                    content[:last_brace]
-                    + f"\n    {new_variant}\n"
-                    + content[last_brace:]
-                )
-                last_brace = content.rfind("}")
-
-    stub_path.write_text(content)
-
-
-def _patch_stubs_from_errors(
-    project_dir: Path,
-    compile_output: str,
-    analysis: ConsumerAnalysis,
-    consumer_file: Path | None = None,
-) -> bool:
-    """Parse 'cannot find symbol' javac errors and add missing methods to stubs.
-
-    Returns True if at least one stub was patched (caller should retry build).
-
-    Strategy:
-    - method errors: add `public <ReturnType> methodName(Object... args) { return null; }`
-      Return type is looked up from variableInitializations when available, else Object.
-    - constructor errors: add `public ClassName(Object... args) {}`
-    """
-    # Pre-compute known return types from analysis:
-    # variableInitializations tells us e.g. userStore.find() returns User.
-    known_returns: dict[tuple[str, str], str] = {}
-    for vi in analysis.variableInitializations:
-        c = vi.initializerMethodCall
-        if c and c.scope and c.methodName:
-            known_returns[(c.scope, c.methodName)] = vi.variableType
-
-    main_src = project_dir / "src" / "main" / "java"
-    lines = compile_output.splitlines()
-
-    # patches[fqn] = list of Java method lines to insert
-    patches: dict[str, list[str]] = {}
-
-    # incompatible_fixes[stub_file_path] = {method_name: correct_return_type}
-    # Built from "incompatible types: Object cannot be converted to X" errors.
-    incompatible_fixes: dict[Path, dict[str, str]] = {}
-
-    i = 0
-    while i < len(lines):
-        stripped = lines[i].strip()
-
-        # Pattern: "[ERROR] /path/File.java:[L,C] incompatible types: Object cannot be converted to T"
-        # Happens when _patch_stubs_from_errors() previously added a method returning Object
-        # but the call site requires a specific type (boolean, String, etc.).
-        # NOTE: javac reports FQNs like "java.lang.String" — capture ([\w.]+) then strip package.
-        incompat = re.match(
-            r"\[ERROR\]\s+(.+?\.java):\[(\d+),\d+\]\s+incompatible types.*"
-            r"java\.lang\.Object cannot be converted to ([\w.]+)",
-            stripped,
-        )
-        if incompat:
-            error_file_path = Path(incompat.group(1))
-            error_line_no = int(incompat.group(2))
-            target_type_raw = incompat.group(3)
-            # Strip java.lang prefix: "java.lang.String" → "String". Other packages keep
-            # the FQN ("java.util.List") because stubs carry no imports.
-            target_type = (
-                target_type_raw.rsplit(".", 1)[-1]
-                if target_type_raw.startswith("java.lang.") or "." not in target_type_raw
-                else target_type_raw
-            )
-            # Only fix non-Object targets; skip Object→Object (no-op)
-            if target_type not in {"Object"} and error_file_path.exists():
-                try:
-                    src_lines = error_file_path.read_text().splitlines()
-                    bad_line = src_lines[error_line_no - 1] if error_line_no <= len(src_lines) else ""
-                    # Find which stub file has a method whose name appears on the bad line
-                    for stub_file in main_src.rglob("*.java"):
-                        class_name = stub_file.stem
-                        if class_name in {analysis.className, "EventBreakerExecution", "__EBChain"}:
-                            continue
-                        stub_content = stub_file.read_text()
-                        for obj_m in re.finditer(r"public Object (\w+)\(", stub_content):
-                            mname = obj_m.group(1)
-                            if mname + "(" in bad_line:
-                                if stub_file not in incompatible_fixes:
-                                    incompatible_fixes[stub_file] = {}
-                                incompatible_fixes[stub_file][mname] = target_type
-                except Exception:
-                    pass
-            i += 1
-            continue
-
-        # Pattern: "[ERROR] /path/File.java:[L,C] bad operand types for binary operator '<='"
-        #          followed by "first type: java.lang.Object" / "second type: int".
-        # A stub getter returns Object but the call site uses it in arithmetic or a
-        # comparison (e.g. `event.getAmount() <= 0`). Retype the getter adjacent to
-        # the operator as the numeric operand type.
-        bad_op = re.match(
-            r"\[ERROR\]\s+(.+?\.java):\[(\d+),\d+\]\s+bad operand types for binary operator '([^']+)'",
-            stripped,
-        )
-        if bad_op:
-            error_file_path = Path(bad_op.group(1))
-            error_line_no = int(bad_op.group(2))
-            op = bad_op.group(3)
-            operand_types = []
-            for j in range(i + 1, min(i + 3, len(lines))):
-                t = re.search(r"(?:first|second) type:\s+([\w.]+)", lines[j])
-                if t:
-                    operand_types.append(t.group(1).rsplit(".", 1)[-1])
-            numeric = {"int", "long", "double", "float", "short", "byte"}
-            target_type = next((t for t in operand_types if t in numeric), "int")
-            if error_file_path.exists():
-                try:
-                    src_lines = error_file_path.read_text().splitlines()
-                    bad_line = src_lines[error_line_no - 1] if error_line_no <= len(src_lines) else ""
-                    op_re = re.escape(op)
-                    adjacent = set(re.findall(rf"(\w+)\([^()]*\)\s*{op_re}", bad_line))
-                    adjacent |= set(re.findall(rf"{op_re}\s*[\w.]*?(\w+)\([^()]*\)", bad_line))
-                    for stub_file in main_src.rglob("*.java"):
-                        if stub_file.stem in {analysis.className, "EventBreakerExecution", "__EBChain"}:
-                            continue
-                        stub_content = stub_file.read_text()
-                        for obj_m in re.finditer(r"public Object (\w+)\(", stub_content):
-                            if obj_m.group(1) in adjacent:
-                                incompatible_fixes.setdefault(stub_file, {})[obj_m.group(1)] = target_type
-                except Exception:
-                    pass
-            i += 1
-            continue
-
-        # Pattern 2: "constructor Foo in class pkg.Foo cannot be applied to given types"
-        # Handles multi-arg constructor calls on stubs that only have a no-arg constructor.
-        cannot_apply = re.search(
-            r"constructor\s+(\w+)\s+in\s+class\s+([\w.]+)\s+cannot be applied", stripped
-        )
-        if cannot_apply:
-            class_name = cannot_apply.group(1)
-            fqn = cannot_apply.group(2)
-            if fqn not in patches:
-                patches[fqn] = []
-            # Replace no-arg constructor with varargs in this stub
-            patches[fqn].append(f"    public {class_name}(Object... args) {{}}")
-            i += 1
-            continue
-
-        sym = re.match(r"symbol:\s+(method|constructor)\s+(\w+)", stripped)
-        if sym:
-            kind, name = sym.group(1), sym.group(2)
-            fqn = None
-            var_name = None
-            for j in range(i + 1, min(i + 5, len(lines))):
-                loc = lines[j].strip()
-                m1 = re.search(
-                    r"location:.*variable\s+(\w+)\s+of\s+type\s+([\w.]+)", loc
-                )
-                m2 = re.search(r"location:\s+class\s+([\w.]+)", loc)
-                if m1:
-                    var_name, fqn = m1.group(1), m1.group(2)
-                    break
-                if m2:
-                    fqn = m2.group(1)
-                    break
-
-            if fqn:
-                class_name = fqn.rsplit(".", 1)[-1]
-                if fqn not in patches:
-                    patches[fqn] = []
-                if kind == "method":
-                    raw_ret = known_returns.get((var_name, name), "Object") if var_name else "Object"
-                    ret = _infer_return_type(name, raw_ret)
-                    if ret.split("<")[0].strip() in _COLLECTION_STUB_VALUES:
-                        ret = f"java.util.{ret}"  # stubs carry no imports
-                    ret_val = _default_return_value(ret)
-                    patches[fqn].append(
-                        f"    public {ret} {name}(Object... args) {{ return {ret_val}; }}"
-                        if ret != "void" else
-                        f"    public void {name}(Object... args) {{}}"
-                    )
-                else:
-                    patches[fqn].append(
-                        f"    public {class_name}(Object... args) {{}}"
-                    )
-        i += 1
-
-    if not patches and not incompatible_fixes:
-        return False
-
-    # Never modify the real consumer file or the generated execution harness.
-    protected = {analysis.className, "EventBreakerExecution"}
-
-    patched = False
-
-    # Apply incompatible-type fixes: update existing methods from Object to the correct type.
-    for stub_file, fixes in incompatible_fixes.items():
-        if not stub_file.exists():
-            continue
-        content = stub_file.read_text()
-        for mname, target_type in fixes.items():
-            ret_val = _default_return_value(target_type)
-            old = f"public Object {mname}(Object... args) {{ return null; }}"
-            new = f"public {target_type} {mname}(Object... args) {{ return {ret_val}; }}"
-            if old in content and new not in content:
-                content = content.replace(old, new)
-                stub_file.write_text(content)
-                patched = True
-    for fqn, methods in patches.items():
-        parts = fqn.split(".")
-        if len(parts) < 2:
-            continue
-        pkg_parts, class_name = parts[:-1], parts[-1]
-        if class_name in protected:
-            continue
-        stub_file = main_src.joinpath(*pkg_parts) / f"{class_name}.java"
-        if not stub_file.exists():
-            continue
-
-        content = stub_file.read_text()
-        last_brace = content.rfind("}")
-        if last_brace == -1:
-            continue
-
-        # Deduplicate by method name — Maven reports the same error multiple
-        # times (once in [INFO] section, once in [ERROR] Caused-by section),
-        # so the patches list may contain duplicates.
-        seen_names: set[str] = set()
-        deduped: list[str] = []
-        for m in methods:
-            nm = m.split("(")[0].strip().split()[-1]
-            if nm not in seen_names:
-                seen_names.add(nm)
-                deduped.append(m)
-
-        # Only add methods not already present
-        new_methods = [
-            m for m in deduped
-            if m.split("(")[0].strip().split()[-1] + "(" not in content
-        ]
-        if new_methods:
-            content = (
-                content[:last_brace]
-                + "\n"
-                + "\n".join(new_methods)
-                + "\n"
-                + content[last_brace:]
-            )
-            stub_file.write_text(content)
-            patched = True
-
-    return patched

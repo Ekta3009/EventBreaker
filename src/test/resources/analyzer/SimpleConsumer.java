@@ -1,12 +1,12 @@
 package test;
 
-import com.eventbreaker.consumer.annotation.EventBreakerConsumer;
+import org.springframework.context.event.EventListener;
 
 public class SimpleConsumer {
 
     private InventoryStore inventoryStore;
 
-    @EventBreakerConsumer(eventType = "InventoryUpdated")
+    @EventListener
     public void handle(InventoryUpdated event) {
         inventoryStore.save(event.getItemId());
     }

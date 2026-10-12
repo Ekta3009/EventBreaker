@@ -1,6 +1,6 @@
 package consumers;
 
-import com.eventbreaker.consumer.annotation.EventBreakerConsumer;
+import org.springframework.context.event.EventListener;
 import com.eventbreaker.event.OrderCreated;
 import com.eventbreaker.event.OrderProcessed;
 import com.eventbreaker.model.Order;
@@ -24,7 +24,7 @@ public class OrderConsumer {
         this.eventPublisher = eventPublisher;
     }
 
-    @EventBreakerConsumer(eventType = "OrderCreated")
+    @EventListener
     public void consume(OrderCreated event) {
 
         Order order = orderRepository.get(event.getOrderId());

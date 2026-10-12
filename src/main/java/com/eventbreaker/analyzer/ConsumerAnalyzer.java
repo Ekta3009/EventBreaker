@@ -43,7 +43,6 @@ public class ConsumerAnalyzer {
 
     // Method-level annotations that mark an event listener (matched by simple name).
     private static final Set<String> LISTENER_ANNOTATIONS = Set.of(
-            "EventBreakerConsumer",
             "KafkaListener",
             "RabbitListener",
             "RabbitHandler",
@@ -216,11 +215,7 @@ public class ConsumerAnalyzer {
 
     private String extractEventType(MethodDeclaration method) {
 
-        if (method.getAnnotationByName("EventBreakerConsumer").isPresent()) {
-            return extractEventBreakerEventType(method);
-        }
-
-        // Real listeners: the event is the @Payload parameter, else the first
+        // The event is the @Payload parameter, else the first
         // parameter that is not framework-supplied (ack, channel, @Header ...).
         Parameter eventParam =
                 method.getParameters()
@@ -266,29 +261,6 @@ public class ConsumerAnalyzer {
             }
         }
         return type.asString();
-    }
-
-    private String extractEventBreakerEventType(MethodDeclaration method) {
-
-        return method.getAnnotationByName("EventBreakerConsumer")
-                .orElseThrow()
-                .asNormalAnnotationExpr()
-                .getPairs()
-                .stream()
-                .filter(pair ->
-                        pair.getNameAsString().equals("eventType")
-                )
-                .findFirst()
-                .map(pair ->
-                        pair.getValue()
-                                .asStringLiteralExpr()
-                                .asString()
-                )
-                .orElseThrow(() ->
-                        new IllegalArgumentException(
-                                "Consumer annotation is missing eventType"
-                        )
-                );
     }
 
     private List<DependencyInfo> extractDependencies(

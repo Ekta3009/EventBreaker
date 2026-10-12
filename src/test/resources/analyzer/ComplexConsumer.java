@@ -1,13 +1,13 @@
 package test;
 
-import com.eventbreaker.consumer.annotation.EventBreakerConsumer;
+import org.springframework.context.event.EventListener;
 
 public class ComplexConsumer {
 
     private OrderRepository orderRepository;
     private AuditService auditService;
 
-    @EventBreakerConsumer(eventType = "OrderReceived")
+    @EventListener
     public void handle(OrderReceived event) {
 
         Order order = orderRepository.find(event.getOrderId());

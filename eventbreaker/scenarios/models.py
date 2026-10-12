@@ -21,7 +21,7 @@ class ReturnValue(BaseModel):
 class TestConfig(BaseModel):
     callPattern: str                          # SINGLE | DUPLICATE | CONCURRENT
     faultInjections: list[FaultInjection] = []
-    returnValues: list[ReturnValue] = []      # real-classpath mode only
+    returnValues: list[ReturnValue] = []      # path setup: what fakes return
     observeOrdering: bool = False             # true if risk is about call order
     detectSwallowing: bool = False            # true if risk is about silent exception swallowing
 

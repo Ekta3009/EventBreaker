@@ -1,13 +1,13 @@
 package test;
 
-import com.eventbreaker.consumer.annotation.EventBreakerConsumer;
+import org.springframework.context.event.EventListener;
 
 public class ConditionalConsumer {
 
     private OrderRepository orderRepository;
     private NotificationService notificationService;
 
-    @EventBreakerConsumer(eventType = "OrderCreated")
+    @EventListener
     public void handle(OrderCreated event) {
 
         if (event.isPriority()) {

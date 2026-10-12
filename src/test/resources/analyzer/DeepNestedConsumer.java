@@ -1,12 +1,12 @@
 package test;
 
-import com.eventbreaker.consumer.annotation.EventBreakerConsumer;
+import org.springframework.context.event.EventListener;
 
 public class DeepNestedConsumer {
 
     private OrderRepository orderRepository;
 
-    @EventBreakerConsumer(eventType = "OrderUpdated")
+    @EventListener
     public void handle(OrderUpdated event) {
 
         orderRepository.save(

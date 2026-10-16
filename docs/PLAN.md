@@ -742,29 +742,40 @@ Regression: Fineract + Kill Bill call counts identical before/after (diffed); Fi
 
 ### [ ] STEP 13 — Accuracy (Oct 16–17)
 
-#### ▶ START HERE next session (stopped 2026-10-13 ~00:45)
+#### ▶ START HERE next session (stopped 2026-10-16 ~19:30)
+STEP 13 + STEP 14 done (INVENTORY runs 11 and 12); code uncommitted until the user commits (message given in session).
+Next: **STEP 15** (RESULTS.md, demo, owner one-pager, README, release wheel). STEP 14b (reach fixes) only after the MVP.
 
-State: hybrid diagnosis implemented, 136 tests green, measured twice (INVENTORY.md **run 10**). All code uncommitted
-until the user commits (message prepared in the session). **No code was changed after the measurement — the five
-items below are open decisions for the user. Present them with options; implement only what the user picks.**
+#### Decisions 2026-10-16 (user) — implemented, measurement run 11 done
 
-1. **Impact-label drift.** 3 votes agree within a run (3/3), but across runs the same call was `DATA` once and
-   `SECURITY` once → race findings flip MEDIUM ↔ HIGH (12/15 findings identical A-vs-B; all 3 differences are this).
-   Options: 5 votes instead of 3 / accept + disclose (cache keeps a report reproducible) / give the impact question
-   more listener context (generic, no test-set hints).
-2. **Scenario coverage.** F2 (Kafka `beforeHandleMessage` failure) was not tested this round — `listenerAnnotation`
-   changed Ultra's input, it was re-asked and produced different scenarios; F4 never generated. Option: code also
-   generates a THROW scenario for every dependency call (research pattern "code enumerates candidates, LLM judges"),
-   so coverage no longer depends on Ultra.
-3. **Race findings that repeat the duplicate finding** (Kafka, NoteListener: MEDIUM "concurrent" = same as the
-   duplicate). Comes from the gap choice "race without interference → duplicate rule without in-process cap".
-   Option: report a race only when the interference vote is YES.
-4. **Recompute/refresh work rated HIGH** (Kill Bill K3/K4: refresh notification counted as EXTERNAL_MESSAGE side
-   effect). Option: generic `REFRESH` effect label (recomputes from source of truth → repeat is LOW).
-5. **L2 / M2 now harmless** (entity saves labelled IDEMPOTENT_WRITE). EXPECTED rates both LOW → arguably acceptable.
+1. **Impact-label drift → three fixes, keep 3 votes.** Found: votes were asked at temperature 0, so the 3 seeds
+   returned near-identical answers (always 3/3) — 5 votes would only have been 5 copies. And the list of calls
+   to label came from the scenarios Ultra happened to generate, so the question changed between runs.
+   Now: votes at temperature 0.7 (`classify.VOTE_TEMPERATURE`, real samples), asked in parallel (no extra wall
+   time), and every dependency call from the static analysis is labelled (stable question). Go to 5 votes only
+   if run 11 still drifts.
+2. **Coverage → code adds a THROW scenario for every dependency call** no Ultra scenario already fails
+   (`scenarios/coverage.py`, scenario type `DEPENDENCY_FAILURE (dep.method)`). F2/F4 now always tested.
+3. **Race without interference → no finding** (the repeated work is the duplicate scenario's finding; the changes
+   are listed under harmless changes with a note).
+4. **New effect label `REFRESH`** (asks for derived state to be recomputed from the source of truth). Duplicate
+   with only an extra REFRESH → LOW; a lost REFRESH counts as lost work; threw after a REFRESH → no finding.
+5. **L2/M2 harmless → accepted** (EXPECTED rates both LOW); disclosed in RESULTS.
 
-After the decisions: implement → unit tests → one measurement round (A + B, ~45 min, ~$0.40) → update INVENTORY →
-user commits → STEP 14.
+**Run 11 (INVENTORY):** 10/14 found (was 8), 17 of 18–19 findings identical A vs B, no severity drift, over-rated 3
+(F4, K3, K4). Follow-up decisions (user, 2026-10-16): interference question → 5 votes + an unusable reply is re-asked
+once (done, 144 tests); REFRESH never chosen for K3 → accept + disclose, watch STEP 14; F4 HIGH vs expected LOW →
+keep the generic rule, record as a judgement disagreement in RESULTS. Verify the 5-vote change on Kafka +
+`handlePaymentInfoEvent` (A + `--fresh` B), then user commits.
+
+**Testing routine (user, 2026-10-16):** test rounds run on the local JVM (`NEBIUS_PROJECT_ID=` empty — `.env`
+never overrides it); the Nebius sandbox is used only for final result runs and the demo (each sandbox run
+installs the JRE first, ~30 s). Check a change on the 2–3 listeners it affects; the full 9-listener A/B round
+only before a commit. Later options, not done: `--score-only` (skip reviewer + text, ~80% of LLM cost),
+cheaper run B (re-ask only the votes), sandbox image with Java preinstalled.
+
+Tests: 143 green (new `test_coverage.py`, REFRESH + race rows in `test_rubric.py`, parallel/temperature votes).
+Next: read run 11 A/B → INVENTORY run 11 → user commits → STEP 14.
 
 #### Results so far (run 10 vs run 8/9)
 
@@ -796,20 +807,64 @@ after the save in every scenario since STEP 10); path-setup MOCK types ignore st
 the classpath; sandbox retries once on a transport error.
 
 #### Checklist
-- [~] Severity calibration — transport + in-process cap + rubric done; recompute/refresh (decision 4) open.
+- [x] Severity calibration — transport + in-process cap + rubric + REFRESH label (2026-10-16).
 - [x] One finding per root cause per scenario (rubric groups by scenario; all changes kept as evidence).
 - [ ] Optional: THROW with a declared checked exception type (K2); fail only the Nth call (parent insert).
-- [~] Stability — measured (12/15 identical); impact-label drift (decision 1) open.
+- [~] Stability — run 10: 12/15 identical; fixes for label drift done 2026-10-16, run 11 measures them.
+- [x] Coverage — code-generated failure scenario per dependency call (2026-10-16).
 
 ---
 
 ### [ ] STEP 14 — Breadth (Oct 18–20)
 
-- [ ] Kill Bill: remaining 17 listeners via `scan` (InvoiceListener ×6, PaymentBusEventHandler, BeatrixListener…)
-  — write EXPECTED first for the ones we score.
-- [ ] Eclipse hawkbit `AmqpMessageHandlerService` (RabbitMQ, EPL-2.0) — user clones; EXPECTED first.
+- [x] EXPECTED written first (2026-10-16, before any run): InvoiceListener (known limit G17 — logic behind a
+  constructor-built `retryableSubscriber`), BeatrixListener, PushNotificationListener, PaymentTagHandler,
+  KillbillEventHandler (negative control). Severities judged from the listener + callee where noted.
+- [x] Compile `invoice,beatrix,payment,profiles/killbill,jaxrs` (only `overdue` was built), then run these 5 classes
+  (local JVM) and score against EXPECTED — no prompt/rubric changes before scoring. *Done → INVENTORY run 12.*
+  *Fixes found on the way (user-approved 2026-10-16):* (1) harness import filter kept every `javax.*` import and accepted
+  a bare package match → `javax.annotation.Nullable` (jsr305, compile-only) broke BeatrixListener; now only JDK javax
+  packages pass and a class import must match a type; the class index also reads class folders. (2) Maven resolver
+  overrides `excludeGroupIds`/`excludeArtifactIds`/… with empty values — hawkbit sets `excludeGroupIds=org.eclipse`
+  for its license tool, which silently dropped all hawkbit modules from the classpath. 146 tests.
+  *First STEP 14 run (17:15–17:50):* mostly tool gaps — PushNotification harness name clash (`mapper`), PaymentTagHandler
+  crash hidden behind "No EVENTBREAKER_RESULT", hawkbit 18/18 errors (`@Header String` params were faked; Mockito cannot
+  fake String = **G20**), InvoiceListener race findings named calls that never ran. Fixed (user-approved): harness
+  locals prefixed `__eb`; harness reports `Throwable` + first frame and the CLI shows it; plain-value listener
+  params get values, settable by path setup as `param.<name>` (prompt section only for such listeners); a race
+  finding only names voted calls that actually ran. 150 tests. 5-vote check: Kafka A = B; `handlePaymentInfoEvent`
+  race still flips (4/5 yes in A, none in B). Beatrix runs now but most scenarios NOT REACHED; its MEDIUM race on a
+  READ/MINOR call contradicts EXPECTED B4 (false positive). Re-run of all new listeners in progress.
+  *hawkbit (user: option 1, timebox 21:00):* G19 static gate fixed generically — the project's own static helpers
+  (same first 3 package segments; found via static imports / `Imported.method(`) run for real inside a Mockito
+  `mockStatic` opened around each listener call (thread-local); only on IllegalStateException/NPE ("not
+  initialized") do they answer like fakes; path setup may override `<Class>.<method>…`; unfakeable classes print
+  `EB_STATIC_SKIPPED`. Also: plain params were read before the overrides were registered (fixed + test); MOCK of JDK
+  types was dropped (fixed); constructor-argument fakes are named after the source's parameters (`rabbitTemplate`)
+  and listed for path setup when they are not fields (G21). Manual check: duplicate THING_CREATED now measured
+  (findOrRegister ×2, cancel message ×2). 153 tests. Prompt sections only appear for listeners that need them;
+  Legacy (has project statics) needs a regression re-run.
+- [x] Eclipse hawkbit `AmqpMessageHandlerService` (RabbitMQ, EPL-2.0) — EXPECTED first; run 12: 2/18 reached (see STEP 14b).
 - [ ] If time: Apereo CAS `RegisteredServiceKafkaDistributedCacheListener` (Kafka) or DHIS2 `ApiAuditConsumer` (JMS).
-  GitHub search results: scratchpad (8 product repos of 1,598; only CAS / DHIS2 / KIE real products).
+  (Earlier GitHub search: 8 product repos of 1,598; only CAS / DHIS2 / KIE real products — raw results lost with the temp dir.)
+
+---
+
+### [ ] STEP 14b — Reach fixes (after the MVP is complete; user decision 2026-10-16)
+
+STEP 14 showed the tool rarely *drives* unseen listeners to the risky line: path setup can only answer with
+text / numbers / booleans / enums / "object of class X" / null, so code that needs anything else stops early
+("not reached"). All fixes are generic capabilities, not prompt tuning:
+- [ ] **Generic registry type** (PaymentTagHandler, G18): a fake of `Registry<PluginApi>` returns a fake `PluginApi`
+  (resolve the constructor/field's type arguments). ~20 min, no LLM.
+- [ ] **Checked exceptions on THROW** (Kill Bill K2, Push P1/P2, Beatrix B1): when the faulted method declares checked
+  exceptions, throw one of them, so the listener's own catch-and-swallow path is what gets tested. ~40 min.
+- [ ] **List answers** (Push P5, G23): value vocabulary `LIST:<value>` = one-element list holding that value. ~20 min.
+- [ ] **Event subtype** (Beatrix B2, G22): path setup may choose the event's concrete class (must be a subtype named in
+  the source); the harness fakes that class. ~45 min.
+**Honesty rule:** after these fixes the STEP 14 listeners are no longer unseen. RESULTS reports both numbers — before
+(STEP 14 first runs) and after — and, if time allows, a few untouched listeners (remaining Kill Bill, hawkbit
+`AmqpMessageDispatcherService`) with EXPECTED written first.
 
 ---
 

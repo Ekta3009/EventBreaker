@@ -71,6 +71,11 @@ def resolve(module: Module) -> list[Path]:
     return entries
 
 
+_MAVEN_EXCLUDE_PROPERTIES = ("excludeGroupIds", "excludeArtifactIds", "excludeClassifiers", "excludeTypes")
+# Bump when the resolver commands change, so cached classpaths are resolved again.
+_RESOLVER_VERSION = "2"
+
+
 def _maven(module: Module) -> list[Path]:
     classes = module.dir / "target" / "classes"
     if not classes.is_dir():
@@ -83,7 +88,11 @@ def _maven(module: Module) -> list[Path]:
             [_wrapper(module.dir, "mvnw") or "mvn", "-q", "--batch-mode", "-f", str(module.dir / "pom.xml"),
              # Runtime scope (compile + runtime), like Gradle's runtimeClasspath: test-scope
              # Mockito/JUnit would clash with the harness's own.
-             "dependency:build-classpath", "-DincludeScope=runtime", f"-Dmdep.outputFile={out}"],
+             "dependency:build-classpath", "-DincludeScope=runtime", f"-Dmdep.outputFile={out}",
+             # A project property of the same name (e.g. hawkbit's license-tool config
+             # excludeGroupIds=org.eclipse) would silently drop real dependencies. Empty on the
+             # command line wins; the project's files are not touched.
+             *(f"-D{p}=" for p in _MAVEN_EXCLUDE_PROPERTIES)],
             module.dir,
             hint="If it depends on sibling modules, run `mvn install -DskipTests` at the project root first.",
         )
@@ -135,7 +144,7 @@ def _wrapper(start: Path, name: str) -> str | None:
 
 def _cache_key(module: Module) -> str:
     """Module path + mtimes of every build file from the module up to the filesystem root."""
-    stamps = [str(module.dir)]
+    stamps = [_RESOLVER_VERSION, str(module.dir)]
     for d in (module.dir, *module.dir.parents):
         for f in _BUILD_FILES:
             if (d / f).exists():

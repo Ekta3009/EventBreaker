@@ -18,7 +18,7 @@ from tests.conftest import LISTENERS, listener_file
 
 MARKERS = [
     "EXTRA_IMPORTS", "MOCK_DECLARATIONS", "EVENT_STUBS", "CONSUMER_INSTANTIATION", "EVENT_CLASS",
-    "DEP_MAP_ENTRIES", "RESET_INVOCATIONS", "FAULT_INJECTIONS", "CALL_PATTERN", "SCENARIO_TYPE",
+    "DEP_MAP_ENTRIES", "RESET_INVOCATIONS", "FAULT_INJECTIONS", "VALUE_PARAMS", "CALL_PATTERN", "SCENARIO_TYPE",
 ]
 
 
@@ -125,7 +125,8 @@ class TestGeneratedHarness:
     def test_consumer_created_and_injected_reflectively(self, analyze):
         src = harness(analyze("OverdueListener", "handlePaymentInfoEvent"), "OverdueListener")
         assert ('__EBInstantiate.create(Class.forName('
-                '"org.killbill.billing.overdue.listener.OverdueListener"));') in src
+                '"org.killbill.billing.overdue.listener.OverdueListener"), ') in src
+        assert '"asyncPoster"' in src.split("__EBInstantiate.create(")[1].split(";")[0]  # named constructor fakes
         assert '__EBInstantiate.inject(consumer, "asyncPoster", asyncPoster);' in src
         assert '__EBInstantiate.call(consumer, "handlePaymentInfoEvent", event)' in src
 
@@ -134,7 +135,7 @@ class TestGeneratedHarness:
         src = harness(analysis, "OverdueListener")
         for d in analysis.dependencies:
             assert f'__EBInstantiate.settings({d.type.split("<")[0]}.class, "{d.name}")' in src
-            assert f'deps.put("{d.name}", {d.name});' in src
+            assert f'__ebDeps.put("{d.name}", {d.name});' in src
 
     def test_fault_and_path_setup_reach_the_harness(self, analyze):
         src = harness(analyze("OverdueListener", "handlePaymentInfoEvent"), "OverdueListener",
@@ -145,7 +146,7 @@ class TestGeneratedHarness:
 
     def test_acknowledgment_param_is_recorded_and_passed(self, analyze):
         src = harness(analyze("KafkaRemoteMessageListener"), "KafkaRemoteMessageListener")
-        assert 'deps.put("acknowledgment", acknowledgment);' in src
+        assert '__ebDeps.put("acknowledgment", acknowledgment);' in src
         assert '"onMessage", event, acknowledgment)' in src
 
     def test_event_boolean_getters_return_true(self, analyze):
@@ -185,3 +186,70 @@ def test_mock_class_not_on_classpath_is_skipped_not_compiled():
     available = {"org/killbill/billing/overdue/config/DefaultOverdueConfig"}
     out = _build_named_faults(tc, listener_file("OverdueListener"), available)
     assert "Calendar" not in out and "DefaultOverdueConfig.class" in out
+
+
+def test_library_javax_imports_need_the_classpath_jdk_ones_do_not():
+    from eventbreaker.scenarios.executor import _import_available
+    available = {"javax/inject/Inject", "javax/inject", "javax/annotation/PostConstruct", "javax/annotation",
+                 "org/acme/Outer", "org/acme/Outer/Inner", "org/acme"}
+    assert _import_available("import javax.sql.DataSource;", available)          # JDK
+    assert _import_available("import javax.xml.parsers.DocumentBuilder;", available)
+    assert not _import_available("import javax.xml.bind.annotation.XmlElement;", available)  # JAXB: not in JDK 11+
+    assert _import_available("import javax.inject.Inject;", available)           # library, present
+    assert not _import_available("import javax.annotation.Nullable;", available) # jsr305, compile-only
+    assert _import_available("import java.util.UUID;", set())
+    # A package match alone is not enough: javax/annotation exists, its Nullable does not.
+    assert not _import_available("import javax.annotation.Nullable;", available)
+    assert _import_available("import org.acme.Outer.Inner;", available)            # nested type
+    assert _import_available("import static org.acme.Outer.helper;", available)    # static member
+    assert _import_available("import org.acme.*;", available)                      # wildcard package
+    assert not _import_available("import org.other.*;", available)
+
+
+
+def test_plain_parameters_are_values_read_after_the_path_setup_overrides(tmp_path):
+    """A @Header String can't be faked; its value must be read after RETURNS.put("param.type", …)."""
+    from eventbreaker.models.consumer import ConsumerAnalysis, DependencyInfo
+    src_file = tmp_path / "DeviceListener.java"
+    src_file.write_text("package org.acme;\nclass DeviceListener {}\n")
+    analysis = ConsumerAnalysis(
+        className="DeviceListener", methodName="onMessage", eventType="Message",
+        dependencies=[DependencyInfo(name="devices", type="DeviceRepo")],
+        parameters=["final Message message", '@Header(name = "type") final String type'],
+    )
+    tc = TestConfig(callPattern="SINGLE", returnValues=[ReturnValue(target="param.type", returns="STRING:EVENT")])
+    src = _generate_execution(analysis, src_file, tc, "TEST")
+    put = src.index('RETURNS.put("param.type", "STRING:EVENT");')
+    read = src.index('String type = (String) eventbreaker.generated.__EBInstantiate.param("type", String.class);')
+    assert put < read < src.index('"onMessage", event, type)')
+    assert 'mock(String.class' not in src and '__ebDeps.put("type"' not in src
+
+
+
+def test_constructor_params_from_source_skip_new_and_calls():
+    from eventbreaker.scenarios.executor import constructor_params
+    src = """package org.acme;
+    class OrderListener extends Base {
+        private final Repo repo;
+        @Inject
+        public OrderListener(final Template template, @Named("x") final Repo repo, Map<String, List<Integer>> m) {
+            super(template);
+            this.repo = repo;
+        }
+        OrderListener() { this(new Template(), null, null); }
+        static OrderListener of() { return new OrderListener(null, null, null); }
+    }"""
+    assert constructor_params(src, "OrderListener") == [
+        ("Template", "template"), ("Repo", "repo"), ("Map<String, List<Integer>>", "m")]
+
+
+def test_project_static_helpers_only_from_the_project(tmp_path):
+    from eventbreaker.scenarios.executor import static_helpers
+    src = """package org.acme.orders.listener;
+    import static org.acme.security.Access.asSystem;
+    import org.acme.orders.util.Uris;
+    import org.acme.orders.model.Status;
+    import org.springframework.util.StringUtils;
+    class L { void on() { asSystem(() -> 1); Uris.parse("x"); StringUtils.hasText("y"); Status s = null; } }"""
+    # Root = first three segments (org.acme.orders): org.acme.security is not part of the project.
+    assert static_helpers(src) == ["org.acme.orders.util.Uris"]

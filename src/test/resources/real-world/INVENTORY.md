@@ -212,3 +212,58 @@ which moves the race rule between MEDIUM and HIGH. Votes inside one run agree; a
 failures, Kill Bill "silently skipped"). Lost vs before: F2 (scenario not generated — the risk prompt changed because
 the analysis now carries `listenerAnnotation`, so Ultra was re-asked), L2 + M2 (LOW duplicates on saves the labeller
 calls idempotent). Extras: concurrent findings that repeat the duplicate one (Kafka, NoteListener).
+
+## Run 11 — 2026-10-16, STEP 13 decisions (runs A and B; B = `--fresh`, every Nemotron answer re-asked)
+
+Changes since run 10 (user decisions 2026-10-16): label votes at temperature 0.7 in parallel (run 10's temperature-0
+votes were near-copies), every dependency call from the static analysis is labelled (stable question), code adds a
+THROW scenario for every dependency call Ultra did not already fail, race finding only when the interference vote
+says yes, new effect label REFRESH. **Local JVM** (not the sandbox): run A 5 min (partly cached), run B 13 min — vs
+~45 min for A+B on the sandbox in run 10. 9 listener methods, 0 errors.
+
+**Run-to-run (A vs B): 7/9 listeners identical; 17 findings shared, A has 19, B 18.** Severity drift from run 10 is
+gone (LoginAttempt race HIGH in both). Remaining differences are all the interference vote: Kafka race 3/3 "interferes"
+in A, majority "no" in B; Overdue `handlePaymentInfoEvent` race in both but on a different call (A: 1 yes / 1 no / 1
+unusable → tie → cautious yes). Impact labels of READ calls still drift (e.g. `shouldDispatch` MINOR ↔ EXTERNAL_MESSAGE)
+but no longer change any severity.
+
+| Listener | Findings (A / B where different) | vs EXPECTED |
+|---|---|---|
+| fineract `KafkaRemoteMessageListener` | HIGH swallowed `handle`; HIGH swallowed `beforeHandleMessage`; HIGH `afterHandleMessage` threw after `handle`; MEDIUM duplicate `handle`; A only: MEDIUM concurrent | F1 ✅ · **F2 ✅ (code-generated scenario)** · F3 ✅ · **F4 found, ⬆ HIGH vs LOW** · concurrent = extra (A only) |
+| fineract `LoginAttemptEventListener.onAuthenticationFailure` | HIGH concurrent lost update on the failed-login counter | L1 ✅ exact (both runs) · L2 ✖ (accepted: idempotent save) · L3 ✔ |
+| fineract `…onAuthenticationSuccess` | none | ✔ |
+| fineract `NoteListener` ×3 | LOW duplicate `createNote` | N1 ✅ exact · N2 ✖ (cross-method, G16) · race extras gone |
+| fineract `LegacyMeetingAttendanceListener` | MEDIUM concurrent check-then-create | M1 ✅ exact · M2 ✖ (accepted) · M3 ✔ |
+| killbill `handlePaymentInfoEvent` | HIGH swallowed `getAccountById` / `getChildrenAccounts` / `createInternalTenantContext`; HIGH duplicate insert; MEDIUM concurrent | K1 ✅ (3 calls, same catch) · K3 ⬆ HIGH vs LOW · K4 ⬆ MEDIUM vs LOW · K2 ✖ (checked exception) |
+| killbill `handleTagInsert` | same as above without the race | K1 ✅ · K3 ⬆ |
+
+**Score: 10 / 14 found** (run 10: 8) — F2 and F4 back via code-generated scenarios. **Over-rated 3** (F4, K3, K4).
+Not found: L2/M2 (accepted, decision 5), N2 (tool scope), K2 (needs checked-exception THROW). Negative controls 3/3.
+REFRESH did not fire: Super labels `asyncPoster.insertOverdueNotification` SIDE_EFFECT / EXTERNAL_MESSAGE in both runs.
+Follow-up (same day): interference question → 5 votes, an unusable reply re-asked once. Re-check A + `--fresh` B:
+Kafka identical (no race in either); `handlePaymentInfoEvent` race still flips (A 4/5 yes, B none) — the question is
+genuinely borderline there (EXPECTED K4: LOW). Disclose in RESULTS.
+
+## Run 12 — 2026-10-16, STEP 14 generalization test (new listeners, EXPECTED written first)
+
+Kill Bill: `BeatrixListener`, `InvoiceListener` ×6, `KillbillEventHandler`, `PaymentTagHandler`, `PushNotificationListener`
+(release 0.25.4, modules compiled for this run). hawkbit `AmqpMessageHandlerService.onMessage` (master `7d4cdcc98`).
+Local JVM. Never used for tuning before this run. Tool gaps found on the way were fixed only where the user approved
+(see PLAN STEP 14); the scores below are after those fixes and **before** STEP 14b (reach fixes, deferred).
+
+| Listener | Reached | Findings | vs EXPECTED |
+|---|---|---|---|
+| killbill `InvoiceListener` ×6 | partly (logic behind constructor-built `retryableSubscriber`, G17) | HIGH duplicate `retryableSubscriber.handleEvent` ×3, MEDIUM ×1 | I1/I2 ✖ (G17, predicted) · I3 ✔ none · handleEvent findings = extra (entry point of the real risk) |
+| killbill `KillbillEventHandler` | — (no dependencies) | none | ✔ negative control |
+| killbill `BeatrixListener` | 2/7 | MEDIUM concurrent on `createInternalCallContext` | B1/B2 ✖ not reached (event must be a subtype, G22) · B3 ✔ · **B4 ✖ false positive** |
+| killbill `PushNotificationListener` | 3/9 | none | P3 ✔ (retry-scheduled trap held) · P1/P2/P4 ✖ need checked-exception THROW · P5 ✖ not reached (needs a list with a URL, G23) |
+| killbill `PaymentTagHandler` | 0 — constructor crashes | — | not scored (G18: generic registry returns a plain object) |
+| hawkbit `AmqpMessageHandlerService` | 2/18 | none | H7 ✔ (delete / ping: none) · H1–H6 ✖ not reached — path setup did not find the full combination (tenant not soft-deleted, virtual host, reply-to, JSON body); a hand-made setup reaches the handlers |
+
+**Score on unseen listeners: 0 of the detectable expected risks found, 1 false positive (B4), negative controls 4/4**
+(KillbillEventHandler, Push P3, Invoice I3, hawkbit H7). The misses are reach failures (the run never got to the risky
+line), not wrong judgements: every scenario that did reach gave the expected verdict except B4. Labels on hawkbit's calls
+match EXPECTED's reasoning (find-or-register IDEMPOTENT_WRITE, status add SIDE_EFFECT).
+
+Regression after the STEP 14 fixes: `LegacyMeetingAttendanceListener` (only scored listener with project static
+helpers) 4/4 reached, same finding as run 11.

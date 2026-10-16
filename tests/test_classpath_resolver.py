@@ -1,5 +1,6 @@
 """Auto classpath: which module a listener belongs to, how the build is asked, and caching."""
 import os
+from pathlib import Path
 
 import pytest
 
@@ -68,3 +69,19 @@ def test_cache_reused_until_a_build_file_changes(tmp_path, monkeypatch):
     os.utime(tmp_path / "pom.xml", ns=(1, 1))
     resolve(module)
     assert len(calls) == 2
+
+
+def test_maven_overrides_project_exclude_properties(tmp_path, monkeypatch):
+    """A project's own excludeGroupIds (hawkbit sets it for its license tool) must not drop dependencies."""
+    (tmp_path / "target/classes").mkdir(parents=True)
+    jar = tmp_path / "dep.jar"
+    seen = {}
+
+    def fake_run(cmd, cwd, hint):
+        seen["cmd"] = cmd
+        out = next(a for a in cmd if a.startswith("-Dmdep.outputFile=")).split("=", 1)[1]
+        Path(out).write_text(str(jar))
+
+    monkeypatch.setattr(resolver, "_run", fake_run)
+    assert resolver._maven(Module(tmp_path, "maven", tmp_path)) == [tmp_path / "target/classes", jar]
+    assert "-DexcludeGroupIds=" in seen["cmd"] and "-DincludeScope=runtime" in seen["cmd"]

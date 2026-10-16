@@ -8,11 +8,13 @@ and — for concurrent scenarios — the voted interference answer. Same inputs,
 |---------------------------------------------------------------------------|------------------------------|
 | Failure, listener did not throw, a write / side effect went missing or failed | HIGH (work silently lost) |
 | Failure, listener threw, a SIDE_EFFECT completed before the failure       | HIGH if broker, else MEDIUM  |
-| Failure, listener threw, only READ / IDEMPOTENT_WRITE completed           | NONE                         |
+| Failure, listener threw, only READ / REFRESH / IDEMPOTENT_WRITE completed | NONE                         |
 | Duplicate, extra SIDE_EFFECT                                              | HIGH if MONEY/SECURITY/EXTERNAL_MESSAGE, else MEDIUM; LOW if in-process |
-| Race without interference, extra SIDE_EFFECT                              | as duplicate, without the in-process cap |
-| Duplicate / race, extra calls only READ / IDEMPOTENT_WRITE                | NONE                         |
-| Race, the runs can interfere                                              | HIGH if an involved call is MONEY/SECURITY, else MEDIUM |
+| Duplicate, extra REFRESH (no extra SIDE_EFFECT)                           | LOW (extra work, same result)|
+| Duplicate, extra calls only READ / IDEMPOTENT_WRITE                       | NONE                         |
+| Race, the runs can interfere (on calls that actually ran)                 | HIGH if an involved call is MONEY/SECURITY, else MEDIUM |
+| Race, the voted calls never ran in this scenario                          | NONE (not measured)          |
+| Race, the runs cannot interfere                                           | NONE (repeated work is the duplicate scenario's finding) |
 | Changes covered by no finding                                             | listed as harmless changes   |
 """
 from dataclasses import dataclass, field
@@ -21,7 +23,7 @@ from eventbreaker.diagnosis.classify import Interference, Label
 from eventbreaker.models.observation import ObservationResult
 from eventbreaker.scenarios.models import ChaosScenario
 
-_WRITES = {"IDEMPOTENT_WRITE", "SIDE_EFFECT"}
+_WRITES = {"IDEMPOTENT_WRITE", "REFRESH", "SIDE_EFFECT"}
 _SERIOUS_IMPACT = {"MONEY", "SECURITY", "EXTERNAL_MESSAGE"}
 _RACE_HIGH_IMPACT = {"MONEY", "SECURITY"}
 _IMPACT_ORDER = ("MONEY", "SECURITY", "EXTERNAL_MESSAGE", "DATA", "MINOR")
@@ -58,13 +60,9 @@ def assess(
     if tc.callPattern == "SINGLE" and tc.faultInjections:
         drafts = _failure(scenario, result, changes, labels, transport)
     elif tc.callPattern == "DUPLICATE":
-        drafts = _repeated(changes, labels, transport, "repeated")
+        drafts = _repeated(changes, labels, transport)
     elif tc.callPattern == "CONCURRENT":
-        drafts = (
-            _race(changes, labels, interference)
-            if interference is not None and interference.interferes
-            else _repeated(changes, labels, transport, "concurrent")
-        )
+        drafts = _race(result, changes, labels, interference) if interference and interference.interferes else []
     else:
         drafts = []
     covered = {e for d in drafts for e in d.evidence}
@@ -106,24 +104,37 @@ def _failure(scenario, result, changes, labels, transport) -> list[Draft]:
                   evidence)]
 
 
-def _repeated(changes, labels, transport, kind) -> list[Draft]:
+def _repeated(changes, labels, transport) -> list[Draft]:
     side = [c for c in changes if c.kind == "EXTRA" and _label(labels, c.target).effect == "SIDE_EFFECT"]
     if not side:
-        return []
+        refresh = [c for c in changes if c.kind == "EXTRA" and _label(labels, c.target).effect == "REFRESH"]
+        if not refresh:
+            return []
+        return [Draft("repeated", "LOW", refresh[0].target,
+                      "Severity LOW: a refresh was requested twice — extra work, the recomputed result is the same.",
+                      [c.describe() for c in refresh])]
     worst = min(side, key=lambda c: _IMPACT_ORDER.index(_label(labels, c.target).impact))
     impact = _label(labels, worst.target).impact
-    if transport == "in-process" and kind == "repeated":
+    if transport == "in-process":
         severity, why = "LOW", "an in-process event is not redelivered, so it only runs twice if published twice"
     elif impact in _SERIOUS_IMPACT:
         severity, why = "HIGH", f"a side effect with {impact} impact was done twice"
     else:
         severity, why = "MEDIUM", f"a side effect with {impact} impact was done twice"
-    return [Draft(kind, severity, worst.target, f"Severity {severity}: {why}.",
+    return [Draft("repeated", severity, worst.target, f"Severity {severity}: {why}.",
                   [c.describe() for c in changes if c in side])]
 
 
-def _race(changes, labels, interference: Interference) -> list[Draft]:
-    involved = interference.calls or [c.target for c in changes]
+def _race(result, changes, labels, interference: Interference) -> list[Draft]:
+    # The vote reads the source, so it can name calls this run never reached (e.g. code behind
+    # a dependency that is a fake here). Only calls that actually ran are evidence.
+    ran = {o.target for o in result.observations if o.callCount > 0}
+    if interference.calls:
+        involved = [c for c in interference.calls if c in ran]
+        if not involved:
+            return []
+    else:
+        involved = [c.target for c in changes]
     impacts = {_label(labels, t).impact for t in involved}
     severity = "HIGH" if impacts & _RACE_HIGH_IMPACT else "MEDIUM"
     return [Draft(

@@ -16,6 +16,7 @@ LABELS = {
     "ledger.append": Label("SIDE_EFFECT", "MONEY"),
     "mail.send": Label("SIDE_EFFECT", "EXTERNAL_MESSAGE"),
     "stats.bump": Label("SIDE_EFFECT", "MINOR"),
+    "totals.recalculate": Label("REFRESH", "DATA"),
 }
 
 
@@ -128,10 +129,33 @@ def test_race_with_interference_on_data_only_is_medium():
     assert go(sc("CONCURRENT"), r, interference=i, baseline=base).drafts[0].severity == "MEDIUM"
 
 
-def test_race_without_interference_falls_back_to_the_duplicate_rule_without_in_process_cap():
-    i = Interference(False, [], "independent", "3/3")
-    [d] = go(sc("CONCURRENT"), DUP, "in-process", interference=i).drafts
-    assert (d.kind, d.severity) == ("concurrent", "HIGH")  # two real requests at once: not capped
+def test_race_without_interference_is_no_finding():
+    # The repeated work is the duplicate scenario's finding; the race scenario would only repeat it.
+    a = go(sc("CONCURRENT"), DUP, interference=Interference(False, [], "independent", "3/3"))
+    assert a.drafts == [] and len(a.harmless) == 3
+
+
+# ── Refresh / recompute ──────────────────────────────────────────────────────
+
+def test_duplicate_refresh_is_low():
+    base = run(E(target="orders.find", callCount=1), E(target="totals.recalculate", callCount=1))
+    r = run(E(target="orders.find", callCount=2), E(target="totals.recalculate", callCount=2))
+    [d] = go(sc("DUPLICATE"), r, baseline=base).drafts
+    assert (d.kind, d.severity, d.affectedMethod) == ("repeated", "LOW", "totals.recalculate")
+
+
+def test_duplicate_side_effect_outranks_refresh():
+    base = run(E(target="totals.recalculate", callCount=1), E(target="ledger.append", callCount=1))
+    r = run(E(target="totals.recalculate", callCount=2), E(target="ledger.append", callCount=2))
+    [d] = go(sc("DUPLICATE"), r, baseline=base).drafts
+    assert (d.severity, d.affectedMethod) == ("HIGH", "ledger.append")
+
+
+def test_swallowed_failure_losing_a_refresh_is_high():
+    base = run(E(target="orders.find", callCount=1), E(target="totals.recalculate", callCount=1))
+    r = run(E(target="orders.find", callCount=1, threw=True), seq=["orders.find"])
+    [d] = go(sc("SINGLE", "orders.find"), r, baseline=base).drafts
+    assert d.severity == "HIGH" and "totals.recalculate" in d.basis
 
 
 def test_listener_outcome_is_always_the_last_evidence_line():
@@ -143,3 +167,16 @@ def test_unlabelled_call_is_treated_cautiously_as_a_side_effect():
     base = run(E(target="queue.put", callCount=1))
     [d] = go(sc("DUPLICATE"), run(E(target="queue.put", callCount=2)), baseline=base).drafts
     assert d.affectedMethod == "queue.put" and d.severity == "MEDIUM"
+
+
+def test_race_on_calls_that_never_ran_is_no_finding():
+    # The vote names a call the scenario never reached (logic behind a fake): nothing was measured.
+    i = Interference(True, ["billing.charge"], "read then charge", "5/5")
+    a = go(sc("CONCURRENT"), DUP, interference=i)
+    assert a.drafts == []
+
+
+def test_race_keeps_only_the_voted_calls_that_ran():
+    i = Interference(True, ["billing.charge", "ledger.append"], "x", "4/5")
+    [d] = go(sc("CONCURRENT"), DUP, interference=i).drafts
+    assert d.affectedMethod == "ledger.append" and d.severity == "HIGH"

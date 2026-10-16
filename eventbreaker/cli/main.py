@@ -26,6 +26,7 @@ from eventbreaker.models.observation import ObservationResult, ReliabilityFindin
 from eventbreaker.report import reporter
 from eventbreaker.scenarios.models import ChaosScenario, TestConfig
 from eventbreaker.scenarios.executor import ScenarioExecutor
+from eventbreaker.scenarios.coverage import dependency_calls, failure_scenarios
 from eventbreaker.scenarios.experiment import ExperimentPlan, check_feasibility
 
 app = typer.Typer(
@@ -172,8 +173,13 @@ def analyze_consumer(
         f"[bold green]✓ {len(scenarios)} reliability risk(s) identified"
         f"[/bold green]"
         + (" [dim](cached response — use --fresh to re-ask Nemotron)[/dim]" if from_cache else "")
-        + "\n"
     )
+    # Coverage must not depend on which risks Nemotron happened to propose.
+    added = failure_scenarios(analysis, scenarios)
+    scenarios = scenarios + added
+    if added:
+        console.print(f"[dim]+ {len(added)} failure scenario(s) added by code for untested dependency calls[/dim]")
+    console.print()
 
     _print_scenarios(scenarios)
 
@@ -312,7 +318,9 @@ def analyze_consumer(
     # ── Step 5: Nemotron diagnosis for every reproduced scenario ──────────────
     # Closed questions first: what each dependency call does (3 votes), shared by all scenarios.
     reproduced = [(sc, r) for sc, r in executions if r.status == "REPRODUCED" and r.observations]
-    methods = {o.target for _, r in reproduced for o in r.observations} | {
+    # Every dependency call, not only those the scenarios hit: the question (and so its
+    # answer) stays the same from run to run.
+    methods = set(dependency_calls(analysis)) | {o.target for _, r in reproduced for o in r.observations} | {
         o.target for b in baselines.values() for o in b.observations
     }
     labels = {}

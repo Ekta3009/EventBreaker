@@ -17,6 +17,7 @@ from openai import OpenAI
 from eventbreaker.agent import usage
 from eventbreaker.models.consumer import ConsumerAnalysis
 from eventbreaker.models.observation import ObservationResult
+from eventbreaker.scenarios.executor import constructor_params, static_helpers, value_params
 from eventbreaker.scenarios.models import ChaosScenario, ReturnValue
 
 _MODEL = "nvidia/nemotron-3-super-120b-a12b"
@@ -144,14 +145,41 @@ def _prompt(
     if not target:
         return ""
     deps = "\n".join(f"  {d.name}: {d.type}" for d in analysis.dependencies)
+    # Only listeners with plain-value parameters get this section, so other prompts (and their
+    # cached answers) are unchanged.
+    params = value_params(analysis)
+    param_lines = (
+        "Other listener parameters (plain values; set one with target \"param.<name>\", default as for fakes):\n"
+        + "\n".join(f"  param.{p.name}: {p.type}" for p in params) + "\n"
+    ) if params else ""
+    statics = [f.rsplit(".", 1)[-1] for f in static_helpers(source_code)]
+    static_lines = (
+        "Static helpers of the project (run for real; if one fails because no application is running, it "
+        "answers like a fake; override with target \"<Class>.<method>[.<getter>…]\"): "
+        + ", ".join(statics) + "\n"
+    ) if statics else ""
+    ctor_only = _constructor_only(analysis, source_code)
+    ctor_lines = (
+        "Constructor arguments that are not fields (faked too; override as \"<name>.<getter>…\"):\n"
+        + "\n".join(f"  {name}: {ptype}" for ptype, name in ctor_only) + "\n"
+    ) if ctor_only else ""
     return (
         f"Listener method: {analysis.className}.{analysis.methodName}({analysis.eventType} event)\n"
         f"Dependencies (field: type):\n{deps}\n"
-        f"TARGET call that must be reached: {target}\n"
+        + param_lines
+        + static_lines
+        + ctor_lines
+        + f"TARGET call that must be reached: {target}\n"
         f"Scenario concern: {scenario.expectedConcern}\n\n"
         + (f"{feedback}\n\n" if feedback else "")
         + f"Source:\n{source_code}"
     )
+
+
+def _constructor_only(analysis: ConsumerAnalysis, source_code: str) -> list[tuple[str, str]]:
+    """Constructor parameters that are not injected fields (e.g. passed to super, or used to look a service up)."""
+    fields = {d.name for d in analysis.dependencies}
+    return [(t, n) for t, n in constructor_params(source_code, analysis.className) if n not in fields]
 
 
 def _cache_file(user: str) -> Path:
@@ -173,7 +201,9 @@ def _parse(raw: str, analysis: ConsumerAnalysis, source_code: str) -> list[Retur
         items = json.loads(match.group(0))
     except json.JSONDecodeError:
         return None
-    roots = {d.name for d in analysis.dependencies} | {"event"}
+    roots = ({d.name for d in analysis.dependencies} | {"event"} | ({"param"} if value_params(analysis) else set())
+             | {f.rsplit(".", 1)[-1] for f in static_helpers(source_code)}
+             | {name for _, name in _constructor_only(analysis, source_code)})
     # Names inside string literals and comments are not types the consumer uses.
     code = re.sub(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/', " ", source_code, flags=re.S)
     values: list[ReturnValue] = []

@@ -81,3 +81,30 @@ def test_parse_ignores_type_names_inside_strings_and_comments():
     src = 'class C { String m = "No Calendar found"; // Calendar\n /* Calendar */ Meeting x; }'
     raw = '[{"target": "repo.find", "returns": "MOCK:Calendar"}, {"target": "repo.get", "returns": "MOCK:Meeting"}]'
     assert [v.returns for v in _parse(raw, analysis, src)] == ["MOCK:Meeting"]
+
+
+# Synthetic device-message listener: onMessage(Message message, @Header String type, @Header String tenant)
+HEADERS = ConsumerAnalysis(
+    className="DeviceListener", methodName="onMessage", eventType="Message",
+    dependencies=[DependencyInfo(name="devices", type="DeviceRepo")],
+    parameters=["final Message message", '@Header(name = "type", required = false) final String type',
+                "@Header(name = \"tenant\") final String tenant"],
+)
+
+
+def test_plain_listener_parameters_are_settable_as_param_targets():
+    from eventbreaker.scenarios.executor import _listener_arguments, value_params
+    assert [(p.name, p.type) for p in value_params(HEADERS)] == [("type", "String"), ("tenant", "String")]
+    assert _listener_arguments(HEADERS)[1] == "event, type, tenant"
+    values = _parse('[{"target": "param.type", "returns": "STRING:EVENT"}, {"target": "param.ghost.x", "returns": "1"}]',
+                    HEADERS, "")
+    assert ("param.type", "STRING:EVENT") in [(v.target, v.returns) for v in values]
+
+
+def test_param_section_only_for_listeners_with_plain_parameters():
+    scenario = sc(dep="devices", method="save")
+    assert "param.type: String" in path_setup._prompt(HEADERS, "src", scenario, None)
+    plain = ConsumerAnalysis(className="C", methodName="m", eventType="E",
+                             dependencies=[DependencyInfo(name="devices", type="DeviceRepo")])
+    assert "param." not in path_setup._prompt(plain, "src", scenario, None)
+    assert "param.x" not in [v.target for v in _parse('[{"target": "param.x", "returns": "1"}]', plain, "")]

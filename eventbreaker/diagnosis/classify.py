@@ -1,14 +1,17 @@
-"""Closed questions to Nemotron Super, asked 3× with different seeds and decided by majority vote.
+"""Closed questions to Nemotron Super, asked in parallel (3 votes per call label, 5 for interference) and decided by majority vote.
 
 Hosted models are not deterministic even at temperature 0, and they are least reliable on
 open-ended judgement. So the model only answers small questions with fixed answers:
   - per dependency method: what it does to external state, and how bad it is if it goes wrong;
   - per concurrent scenario: can two simultaneous runs of the listener interfere?
 Severity is then computed by code from these labels (see rubric.py).
+Votes are sampled at VOTE_TEMPERATURE: at temperature 0 every seed returns nearly the same
+answer, so the "votes" would be copies and one unlucky answer would decide the label.
 """
 import json
 import re
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from eventbreaker.agent import llm
@@ -17,9 +20,11 @@ from eventbreaker.scenarios.models import ChaosScenario
 
 _MODEL = llm.SUPER
 VOTES = 3
+INTERFERENCE_VOTES = 5   # the interference answer varies more between samples (run 11), so more votes
+VOTE_TEMPERATURE = 0.7
 
 # Most cautious first: ties resolve to the label that reports more, not less.
-EFFECTS = ("SIDE_EFFECT", "IDEMPOTENT_WRITE", "READ")
+EFFECTS = ("SIDE_EFFECT", "REFRESH", "IDEMPOTENT_WRITE", "READ")
 IMPACTS = ("MONEY", "SECURITY", "EXTERNAL_MESSAGE", "DATA", "MINOR")
 
 
@@ -50,6 +55,8 @@ For each "dependencyField.method" listed, give:
   READ             returns data and changes nothing
   IDEMPOTENT_WRITE changes state, but repeating it with the same input leaves the same state
                    (overwrite, set, upsert, clear, delete-if-present)
+  REFRESH          asks for derived state to be recomputed from the source of truth (refresh,
+                   recalculate, re-evaluate, sync); repeating it means extra work, the result is the same
   SIDE_EFFECT      repeating it changes state again or is visible outside (insert, append, increment,
                    send, publish, enqueue, charge, reserve)
 - impact — the worst consequence if this call's work is lost or done twice:
@@ -86,11 +93,7 @@ def label_calls(
         + f"\n\nSource code:\n{source_code}"
     )
     messages = [{"role": "system", "content": _LABEL_PROMPT}, {"role": "user", "content": user}]
-    samples = [
-        _json_object(llm.chat(_MODEL, messages, "classify", valid=lambda r: _json_object(r) is not None,
-                              fresh=fresh, seed=seed)) or {}
-        for seed in range(1, VOTES + 1)
-    ]
+    samples = [s or {} for s in _ask_votes(messages, "classify", fresh)]
     return {m: _vote_label([s.get(m) for s in samples]) for m in methods}
 
 
@@ -106,11 +109,7 @@ def check_interference(
         f"Source code:\n{source_code}"
     )
     messages = [{"role": "system", "content": _INTERFERENCE_PROMPT}, {"role": "user", "content": user}]
-    samples = [
-        _json_object(llm.chat(_MODEL, messages, "interference", valid=lambda r: _json_object(r) is not None,
-                              fresh=fresh, seed=seed))
-        for seed in range(1, VOTES + 1)
-    ]
+    samples = _ask_votes(messages, "interference", fresh, INTERFERENCE_VOTES)
     votes = [s for s in samples if s is not None and isinstance(s.get("interferes"), bool)]
     yes = [s for s in votes if s["interferes"]]
     # Ties (or no usable vote) resolve to "interferes": reporting a possible race is the cautious side.
@@ -121,8 +120,25 @@ def check_interference(
         interferes=interferes,
         calls=[c for c, n in calls.most_common() if n * 2 >= len(chosen)] or [c for c, _ in calls.most_common(1)],
         reason=str(chosen[0].get("reason", "")) if chosen else "no usable answer",
-        agreement=f"{len(chosen)}/{VOTES}",
+        agreement=f"{len(chosen)}/{INTERFERENCE_VOTES}",
     )
+
+
+def _ask_votes(messages: list[dict], purpose: str, fresh: bool, votes: int = VOTES) -> list[dict | None]:
+    """`votes` independent samples (seeds 1..votes), asked in parallel; None for an unusable reply.
+
+    An unusable reply is asked once more (it is not cached, so this is a new sample) — otherwise a
+    missing vote can turn a 2-to-1 majority into a tie.
+    """
+    def ask(seed: int) -> dict | None:
+        for _ in range(2):
+            answer = _json_object(llm.chat(_MODEL, messages, purpose, valid=lambda r: _json_object(r) is not None,
+                                           fresh=fresh, seed=seed, temperature=VOTE_TEMPERATURE))
+            if answer is not None:
+                return answer
+        return None
+    with ThreadPoolExecutor(max_workers=votes) as pool:
+        return list(pool.map(ask, range(1, votes + 1)))
 
 
 def _vote_label(answers: list) -> Label:

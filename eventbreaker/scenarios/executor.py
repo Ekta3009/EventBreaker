@@ -118,8 +118,10 @@ public class EventBreakerExecution {
     public static void main(String[] args) {
         try {
             run();
-        } catch (Exception e) {
-            System.out.println("EVENTBREAKER_ERROR:" + e.getMessage());
+        } catch (Throwable e) {  // Errors too: a missing class is a NoClassDefFoundError
+            StackTraceElement[] at = e.getStackTrace();
+            System.out.println("EVENTBREAKER_ERROR:" + e
+                + (at.length > 0 ? " at " + at[0] : ""));
             System.exit(1);
         }
     }
@@ -152,6 +154,12 @@ RESET_INVOCATIONS
         // ── Fault injections ───────────────────────────────────────────────
 FAULT_INJECTIONS
 
+        // ── Plain listener parameters (read after the path setup's "param.*" overrides) ──
+VALUE_PARAMS
+
+        // ── Project static helpers: real, fake answer only if the app isn't running ──
+STATIC_HELPERS
+
         // doThrow/doAnswer setup above fires invocation listeners — clear so
         // callSequence only contains actual scenario-time calls.
         callSequence.clear();
@@ -161,38 +169,38 @@ FAULT_INJECTIONS
 CALL_PATTERN
 
         // ── Collect invocation counts from every recorder ──────────────────
-        Map<String, Object> deps = new LinkedHashMap<>();
+        Map<String, Object> __ebDeps = new LinkedHashMap<>();
 DEP_MAP_ENTRIES
 
-        ObjectMapper mapper = new ObjectMapper();
-        ArrayNode observations = mapper.createArrayNode();
+        ObjectMapper __ebMapper = new ObjectMapper();
+        ArrayNode __ebObservations = __ebMapper.createArrayNode();
 
-        for (Map.Entry<String, Object> entry : deps.entrySet()) {
-            Collection<Invocation> invocations =
-                Mockito.mockingDetails(entry.getValue()).getInvocations();
-            Map<String, Integer> counts = new LinkedHashMap<>();
-            for (Invocation inv : invocations) {
-                counts.merge(inv.getMethod().getName(), 1, Integer::sum);
+        for (Map.Entry<String, Object> __ebEntry : __ebDeps.entrySet()) {
+            Collection<Invocation> __ebInvocations =
+                Mockito.mockingDetails(__ebEntry.getValue()).getInvocations();
+            Map<String, Integer> __ebCounts = new LinkedHashMap<>();
+            for (Invocation __ebInv : __ebInvocations) {
+                __ebCounts.merge(__ebInv.getMethod().getName(), 1, Integer::sum);
             }
-            for (Map.Entry<String, Integer> mc : counts.entrySet()) {
-                ObjectNode obs = mapper.createObjectNode();
-                obs.put("target", entry.getKey() + "." + mc.getKey());
-                obs.put("callCount", mc.getValue());
-                obs.put("threw", threwCounts.getOrDefault(entry.getKey() + "." + mc.getKey(), 0) > 0);
-                observations.add(obs);
+            for (Map.Entry<String, Integer> __ebMc : __ebCounts.entrySet()) {
+                ObjectNode __ebObs = __ebMapper.createObjectNode();
+                __ebObs.put("target", __ebEntry.getKey() + "." + __ebMc.getKey());
+                __ebObs.put("callCount", __ebMc.getValue());
+                __ebObs.put("threw", threwCounts.getOrDefault(__ebEntry.getKey() + "." + __ebMc.getKey(), 0) > 0);
+                __ebObservations.add(__ebObs);
             }
         }
 
-        ObjectNode result = mapper.createObjectNode();
-        result.put("scenario", "SCENARIO_TYPE");
-        result.put("consumerThrew", consumerThrew.get());
-        ArrayNode seqNode = mapper.createArrayNode();
-        callSequence.forEach(seqNode::add);
-        result.set("callSequence", seqNode);
-        result.set("observations", observations);
+        ObjectNode __ebResult = __ebMapper.createObjectNode();
+        __ebResult.put("scenario", "SCENARIO_TYPE");
+        __ebResult.put("consumerThrew", consumerThrew.get());
+        ArrayNode __ebSeq = __ebMapper.createArrayNode();
+        callSequence.forEach(__ebSeq::add);
+        __ebResult.set("callSequence", __ebSeq);
+        __ebResult.set("observations", __ebObservations);
 
         System.out.println(
-            "EVENTBREAKER_RESULT:" + mapper.writeValueAsString(result)
+            "EVENTBREAKER_RESULT:" + __ebMapper.writeValueAsString(__ebResult)
         );
     }
 }
@@ -207,9 +215,13 @@ package eventbreaker.generated;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.mockito.Mockito;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
 import static org.mockito.Mockito.*;
@@ -233,7 +245,7 @@ public final class __EBInstantiate {
     private __EBInstantiate() {}
 
     /** Calls the constructor with the most parameters, passing a fake (or default) for each. */
-    public static <T> T create(Class<T> cls) throws Exception {
+    public static <T> T create(Class<T> cls, String... names) throws Exception {
         Constructor<?> best = null;
         for (Constructor<?> c : cls.getDeclaredConstructors()) {
             if (best == null || c.getParameterCount() > best.getParameterCount()) best = c;
@@ -241,7 +253,10 @@ public final class __EBInstantiate {
         best.setAccessible(true);
         Class<?>[] types = best.getParameterTypes();
         Object[] args = new Object[types.length];
-        for (int i = 0; i < types.length; i++) args[i] = valueFor(types[i], "ctor" + i);
+        // Named after the source's parameter names when they line up, so path setup can
+        // override what a constructor-only fake returns (e.g. rabbitTemplate.getMessageConverter…).
+        boolean named = names.length == types.length;
+        for (int i = 0; i < types.length; i++) args[i] = valueFor(types[i], named ? names[i] : "ctor" + i);
         return cls.cast(best.newInstance(args));
     }
 
@@ -250,6 +265,48 @@ public final class __EBInstantiate {
      * which generated code in another package cannot reference directly.
      */
     public static void call(Object target, String method, Object... args) throws Exception {
+        // Static fakes only apply on the thread that opens them: open them around every call.
+        List<org.mockito.MockedStatic<?>> statics = openStatics();
+        try {
+            callListener(target, method, args);
+        } finally {
+            for (org.mockito.MockedStatic<?> st : statics) st.close();
+        }
+    }
+
+    /**
+     * The project's own classes whose static methods the listener calls (e.g. a tenant/security
+     * helper or a singleton holder). They run for real; only when one fails because no
+     * application is running (IllegalStateException "not initialized", NullPointerException)
+     * does it answer like a fake. Path setup can override them as "<SimpleName>.<method>".
+     */
+    public static final Set<String> STATICS = ConcurrentHashMap.newKeySet();
+
+    private static List<org.mockito.MockedStatic<?>> openStatics() {
+        List<org.mockito.MockedStatic<?>> opened = new ArrayList<>();
+        for (String name : STATICS) {
+            try {
+                Class<?> cls = Class.forName(name);
+                if (cls.isEnum() || cls.isInterface() || cls.isAnnotation()) continue;
+                String simple = cls.getSimpleName();
+                opened.add(Mockito.mockStatic(cls, inv -> {
+                    String path = simple + "." + inv.getMethod().getName();
+                    if (RETURNS.containsKey(path) || FAULTS.containsKey(path)) return answer(inv, path);
+                    try {
+                        return inv.callRealMethod();
+                    } catch (IllegalStateException | NullPointerException e) {
+                        return answer(inv, path);
+                    }
+                }));
+            } catch (Throwable e) {
+                // not loadable or not fakeable: leave it real, but say so in the run's output
+                System.err.println("EB_STATIC_SKIPPED " + name + ": " + e);
+            }
+        }
+        return opened;
+    }
+
+    private static void callListener(Object target, String method, Object... args) throws Exception {
         for (Class<?> c = target.getClass(); c != null; c = c.getSuperclass()) {
             for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
                 if (m.getName().equals(method) && m.getParameterCount() == args.length) {
@@ -429,6 +486,23 @@ public final class __EBInstantiate {
         return Object.class;
     }
 
+    /**
+     * Value for a plain listener parameter (String header, id, flag…): the path setup's
+     * "param.<name>" override if any, else the same defaults fakes return.
+     */
+    public static Object param(String name, Class<?> t) {
+        String path = "param." + name;
+        Class<?> boxed = t == boolean.class ? Boolean.class : t == int.class ? Integer.class
+                : t == long.class ? Long.class : t == double.class ? Double.class : t;
+        if (RETURNS.containsKey(path)) return convert(RETURNS.get(path), boxed, path);
+        if (boxed == Boolean.class) return true;
+        if (boxed == Integer.class) return 1;
+        if (boxed == Long.class) return 1L;
+        if (boxed == Double.class) return 1d;
+        if (t == java.math.BigDecimal.class) return java.math.BigDecimal.ONE;
+        return valueFor(t, path);
+    }
+
     private static Object valueFor(Class<?> t, String path) {
         if (t == boolean.class) return false;
         if (t == char.class) return (char) 0;
@@ -454,18 +528,32 @@ public final class __EBInstantiate {
 """
 
 
+# javax packages that ship with the JDK. Others (javax.annotation.Nullable from jsr305,
+# javax.inject, javax.persistence…) are libraries and must be on the classpath.
+_JDK_JAVAX = tuple(f"javax.{p}." for p in (
+    "accessibility", "annotation.processing", "crypto", "imageio", "lang.model", "management", "naming",
+    "net", "print", "rmi", "script", "security", "smartcardio", "sound", "sql", "swing", "tools",
+    "transaction.xa", "xml.catalog", "xml.crypto", "xml.datatype", "xml.namespace", "xml.parsers",
+    "xml.stream", "xml.transform", "xml.validation", "xml.xpath",
+)) + ("javax.xml.XMLConstants",)  # not javax.xml.bind / javax.xml.ws: removed from the JDK in Java 11
+
+
 def _import_available(import_line: str, available: set[str]) -> bool:
     """True if an import resolves to a JDK type or a class/package on the classpath."""
     m = re.match(r"import\s+(static\s+)?([\w.]+?)(\.\*)?\s*;", import_line.strip())
     if not m:
         return True
     name = m.group(2)
-    if name.startswith(("java.", "javax.", "jdk.")):
+    if name.startswith(("java.", "jdk.")) or name.startswith(_JDK_JAVAX):
         return True
     parts = name.split(".")
-    # Class (or a static member / nested type of one): try successively shorter prefixes.
+    if m.group(3):  # wildcard: the package (or class, for nested types) must exist
+        return "/".join(parts) in available
+    # Class (or a static member / nested type of one): try successively shorter prefixes,
+    # but only ones naming a type — a bare package match (javax/annotation exists, its
+    # Nullable does not) is not enough.
     for i in range(len(parts), 0, -1):
-        if "/".join(parts[:i]) in available:
+        if parts[i - 1][:1].isupper() and "/".join(parts[:i]) in available:
             return True
     return False
 
@@ -473,16 +561,24 @@ def _import_available(import_line: str, available: set[str]) -> bool:
 def _class_index(classpath: list[Path]) -> set[str]:
     """Every class ("a/b/C") and package ("a/b") available on the classpath."""
     index: set[str] = set()
-    for jar in classpath:
-        if not jar.is_file():
+
+    def add(name: str) -> None:
+        cls = name[:-6].replace("$", "/")
+        index.add(cls)
+        index.add(cls.rsplit("/", 1)[0])
+
+    for entry in classpath:
+        if entry.is_dir():  # the project's own compiled classes (target/classes, build/classes/…)
+            for f in entry.rglob("*.class"):
+                add(f.relative_to(entry).as_posix())
+            continue
+        if not entry.is_file():
             continue
         try:
-            with zipfile.ZipFile(jar) as z:
+            with zipfile.ZipFile(entry) as z:
                 for n in z.namelist():
                     if n.endswith(".class"):
-                        cls = n[:-6].replace("$", "/")
-                        index.add(cls)
-                        index.add(cls.rsplit("/", 1)[0])
+                        add(n)
         except zipfile.BadZipFile:
             continue
     return index
@@ -869,9 +965,14 @@ def _generate_execution(
     # Listener parameters other than the event (e.g. Kafka's Acknowledgment)
     # get recorder fakes too, so calls on them are observed.
     extra_params, call_args = _listener_arguments(analysis)
-    recorders = list(analysis.dependencies) + extra_params
+    recorders = list(analysis.dependencies) + [p for p in extra_params if not _is_value_param(p)]
 
     mock_decl_lines = ["        Map<String, Integer> threwCounts = new LinkedHashMap<>();"]
+    value_param_lines = [
+        f"        {p.type.strip()} {p.name} = ({_BOXED.get(p.type.strip(), p.type.strip())}) "
+        f'eventbreaker.generated.__EBInstantiate.param("{p.name}", {p.type.strip()}.class);'
+        for p in extra_params if _is_value_param(p)
+    ]
     for d in recorders:
         dtype = d.type.split("<")[0].strip()
         mock_decl_lines.append(
@@ -901,7 +1002,7 @@ def _generate_execution(
     event_stubs = "\n".join(event_stub_lines)
 
     dep_map_entries = "\n".join(
-        f'        deps.put("{d.name}", {d.name});'
+        f'        __ebDeps.put("{d.name}", {d.name});'
         for d in recorders
     )
 
@@ -914,11 +1015,13 @@ def _generate_execution(
         "        threwCounts.clear();\n        callSequence.clear();"
     )
 
+    ctor = constructor_params(consumer_file.read_text(errors="replace"), analysis.className)
+    ctor_names = "".join(f', "{name}"' for _, name in ctor)
     # Object + Class.forName: the consumer class may be package-private.
     fqn = f"{consumer_pkg}.{analysis.className}" if consumer_pkg else analysis.className
     lines = [
         f"        Object consumer = "
-        f'eventbreaker.generated.__EBInstantiate.create(Class.forName("{fqn}"));'
+        f'eventbreaker.generated.__EBInstantiate.create(Class.forName("{fqn}"){ctor_names});'
     ]
     lines += [
         f'        eventbreaker.generated.__EBInstantiate.inject(consumer, "{d.name}", {d.name});'
@@ -945,6 +1048,12 @@ def _generate_execution(
         .replace("DEP_MAP_ENTRIES", dep_map_entries)
         .replace("RESET_INVOCATIONS", reset_invocations)
         .replace("FAULT_INJECTIONS", fault_injections)
+        .replace("VALUE_PARAMS", "\n".join(value_param_lines))
+        .replace("STATIC_HELPERS", "\n".join(
+            f'        eventbreaker.generated.__EBInstantiate.STATICS.add("{fqn}");'
+            for fqn in static_helpers(consumer_file.read_text(errors="replace"))
+            if available_classes is None or fqn.replace(".", "/") in available_classes
+        ))
         .replace("CALL_PATTERN", call_pattern)
         .replace("SCENARIO_TYPE", scenario_type)
     )
@@ -952,14 +1061,93 @@ def _generate_execution(
 
 # ── TestConfig → Java builders ────────────────────────────────────────────────
 
+# Listener parameters of these types get a value, not a fake (Mockito cannot fake them).
+_VALUE_PARAM_TYPES = {
+    "String", "CharSequence", "UUID", "BigDecimal", "boolean", "Boolean", "int", "Integer", "long", "Long",
+    "double", "Double", "java.lang.String", "java.util.UUID", "java.math.BigDecimal",
+}
+_BOXED = {"boolean": "Boolean", "int": "Integer", "long": "Long", "double": "Double"}
+
+
+def constructor_params(source: str, class_name: str) -> list[tuple[str, str]]:
+    """(type, name) of the class's constructor with the most parameters, from the source.
+
+    The harness calls that same constructor; its fakes are named after these parameters.
+    """
+    best: list[tuple[str, str]] = []
+    for m in re.finditer(rf"(?<![\w.]){re.escape(class_name)}\s*\(", source):
+        # Skip "new ClassName(" and method calls; a constructor is preceded by a modifier, annotation or brace.
+        before = source[:m.start()].rstrip()
+        if before.endswith(("new", ".")) or not re.search(r"(public|protected|private|[;{}]|\))$", before):
+            continue
+        depth, i = 1, m.end()
+        while i < len(source) and depth:
+            depth += {"(": 1, ")": -1}.get(source[i], 0)
+            i += 1
+        params = _split_params(source[m.end():i - 1])
+        if len(params) > len(best):
+            best = params
+    return best
+
+
+def _split_params(text: str) -> list[tuple[str, str]]:
+    parts, depth, cur = [], 0, ""
+    for ch in text:
+        depth += {"(": 1, "<": 1, ")": -1, ">": -1}.get(ch, 0)
+        if ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    parts.append(cur)
+    out = []
+    for raw in parts:
+        cleaned = re.sub(r"@[\w.]+(\([^)]*\))?", " ", raw).replace("final ", " ").split()
+        if len(cleaned) >= 2:
+            out.append((" ".join(cleaned[:-1]), cleaned[-1]))
+    return out
+
+
+def static_helpers(source: str) -> list[str]:
+    """Project classes whose static methods the listener's class calls ("org.acme.ctx.Tenant.current()").
+
+    Project = same first three package segments as the listener (org.eclipse.hawkbit…); library and
+    JDK statics stay untouched. Found via static imports and imported classes used as `Name.method(`.
+    """
+    pkg = re.search(r"^\s*package\s+([\w.]+)\s*;", source, re.M)
+    if not pkg:
+        return []
+    root = ".".join(pkg.group(1).split(".")[:3]) + "."
+    code = re.sub(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/', " ", source, flags=re.S)
+    found: list[str] = []
+    for cls in re.findall(r"^\s*import\s+static\s+([\w.]+)\.\w+\s*;", source, re.M):
+        if cls.startswith(root):
+            found.append(cls)
+    for fqn in re.findall(r"^\s*import\s+([\w.]+)\s*;", source, re.M):
+        simple = fqn.rsplit(".", 1)[-1]
+        if fqn.startswith(root) and re.search(rf"(?<![\w.]){simple}\.[a-z]\w*\s*\(", code):
+            found.append(fqn)
+    return list(dict.fromkeys(found))
+
+
+def value_params(analysis: ConsumerAnalysis) -> list[DependencyInfo]:
+    """Plain-value listener parameters (e.g. hawkbit's @Header String type), settable as "param.<name>"."""
+    return [p for p in _listener_arguments(analysis)[0] if _is_value_param(p)]
+
+
+def _is_value_param(p: DependencyInfo) -> bool:
+    return p.type.strip() in _VALUE_PARAM_TYPES
+
+
 def _listener_arguments(analysis: ConsumerAnalysis) -> tuple[list[DependencyInfo], str]:
-    """Recorder fakes for non-event listener parameters, and the call's argument list.
+    """Non-event listener parameters, and the call's argument list.
 
     "(@Payload ContextualMessage msg, Acknowledgment ack)" → ([ack: Acknowledgment], "event, ack").
     The event goes to the parameter whose type is the event type; every other
-    parameter gets a recorder named after it (prefixed if it clashes with a field).
+    parameter is named after itself (prefixed if it clashes with a field). Plain values
+    (_is_value_param) become values, everything else a recorder fake.
     """
-    taken = {d.name for d in analysis.dependencies} | {"event", "consumer", "deps"}
+    taken = {d.name for d in analysis.dependencies} | {"event", "consumer"}
     extra: list[DependencyInfo] = []
     args: list[str] = []
     event_used = False
@@ -1002,7 +1190,8 @@ def _build_named_faults(
             # Class literal, resolved through the consumer's imports/package. A class that
             # isn't on the classpath would break the build: skip that override instead.
             fqn = _qualify(rv.returns[5:].strip(), consumer_file)
-            if available_classes is not None and fqn.replace(".", "/") not in available_classes:
+            jdk = fqn.startswith(("java.", "jdk.")) or fqn.startswith(_JDK_JAVAX)
+            if available_classes is not None and not jdk and fqn.replace(".", "/") not in available_classes:
                 continue
             value = f"{fqn}.class"
         else:
@@ -1093,12 +1282,16 @@ def _parse_output(output: str, scenario: ChaosScenario) -> ObservationResult:
                 ),
             )
 
+    # The harness reports its own crash (before the listener ran, or while collecting results).
+    crash = next((l.strip()[len("EVENTBREAKER_ERROR:"):] for l in output.splitlines()
+                  if l.strip().startswith("EVENTBREAKER_ERROR:")), None)
     return ObservationResult(
         scenario=scenario.scenarioType,
         status="ERROR",
         observations=[],
         rawOutput=output,
         executionError=(
+            f"The harness crashed: {crash}" if crash else
             "No EVENTBREAKER_RESULT found. "
             "The build or execution may have failed — check rawOutput."
         ),

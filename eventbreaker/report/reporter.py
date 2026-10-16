@@ -168,8 +168,9 @@ def generate(
     if harmless:
         sections.append(
             "\n### Harmless changes\n"
-            "_Measured differences from the fault-free run that no finding covers "
-            "(e.g. reads repeated). Listed so nothing measured is hidden._\n\n"
+            "_Measured differences from the fault-free run that no finding covers (e.g. reads repeated, "
+            "or work repeated by two simultaneous runs that cannot interfere — repeats are judged by the "
+            "duplicate-delivery scenario). Listed so nothing measured is hidden._\n\n"
         )
         for scenario_type, items in harmless.items():
             sections.append(f"- **{scenario_type}:** {'; '.join(items)}\n")

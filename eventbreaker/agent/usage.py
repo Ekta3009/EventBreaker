@@ -5,6 +5,7 @@ totals so the CLI can print what a run cost. Prices are Nebius Token Factory
 list prices (USD per 1M tokens) — estimates; the provider's bill is authoritative.
 """
 import csv
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -16,6 +17,7 @@ _PRICES = {  # model -> (input, output) USD per 1M tokens
 }
 
 session = {"calls": 0, "input": 0, "output": 0, "cost": 0.0}
+_lock = threading.Lock()  # votes are asked in parallel
 
 
 def record(model: str, usage, purpose: str) -> None:
@@ -26,19 +28,20 @@ def record(model: str, usage, purpose: str) -> None:
         price_in, price_out = _PRICES.get(model, (0.0, 0.0))
         cost = (tokens_in * price_in + tokens_out * price_out) / 1_000_000
 
-        session["calls"] += 1
-        session["input"] += tokens_in
-        session["output"] += tokens_out
-        session["cost"] += cost
+        with _lock:
+            session["calls"] += 1
+            session["input"] += tokens_in
+            session["output"] += tokens_out
+            session["cost"] += cost
 
-        USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        new = not USAGE_FILE.exists()
-        with USAGE_FILE.open("a", newline="") as f:
-            w = csv.writer(f)
-            if new:
-                w.writerow(["timestamp", "model", "purpose", "input_tokens", "output_tokens", "est_cost_usd"])
-            w.writerow([datetime.now().isoformat(timespec="seconds"), model, purpose,
-                        tokens_in, tokens_out, f"{cost:.6f}"])
+            USAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            new = not USAGE_FILE.exists()
+            with USAGE_FILE.open("a", newline="") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(["timestamp", "model", "purpose", "input_tokens", "output_tokens", "est_cost_usd"])
+                w.writerow([datetime.now().isoformat(timespec="seconds"), model, purpose,
+                            tokens_in, tokens_out, f"{cost:.6f}"])
     except Exception:
         pass
 

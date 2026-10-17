@@ -155,7 +155,7 @@ class TestGeneratedHarness:
         assert not re.search(r"when\(event\.", src)
         from eventbreaker.scenarios.executor import _INSTANTIATE_HELPER as helper
         # The fakes' default answer: a path-setup value first, then true for booleans.
-        assert helper.index("if (RETURNS.containsKey(path)) return convert(") < helper.index(
+        assert helper.index("if (RETURNS.containsKey(path)) {\n            Object spec") < helper.index(
             "if (rt == boolean.class || rt == Boolean.class) return true;")
 
 
@@ -258,3 +258,91 @@ def test_project_static_helpers_only_from_the_project(tmp_path):
     class L { void on() { asSystem(() -> 1); Uris.parse("x"); StringUtils.hasText("y"); Status s = null; } }"""
     # Root = first three segments (org.acme.orders): org.acme.security is not part of the project.
     assert static_helpers(src) == ["org.acme.orders.util.Uris"]
+
+
+def test_fakes_remember_their_declared_generic_type():
+    # Registry<PluginApi>.getServiceForName(..) returns T: Java erases T at runtime, so the helper records the
+    # declared type of every fake (injected field, constructor argument, returned value) to resolve T.
+    from eventbreaker.scenarios.executor import _INSTANTIATE_HELPER as helper
+    assert "declare(value, f.getGenericType());" in helper                 # injected dependency fields
+    assert "declare(args[i], generic[i]);" in helper                      # constructor arguments
+    assert "declare(value, m.getGenericReturnType());" in helper          # fakes returned by fakes
+    assert helper.count("generics(inv).resolveGenericReturnType(") == 2   # return type + element type use it
+
+
+def test_cast_targets_found_for_event_dependencies_and_constructor_args(tmp_path):
+    from eventbreaker.models.consumer import ConsumerAnalysis, DependencyInfo
+    from eventbreaker.scenarios.executor import cast_targets
+    src = tmp_path / "L.java"
+    src.write_text("""package com.acme;
+import com.acme.events.AccountCreated;
+public class L {
+    private final Plugin plugin;
+    public L(Registry<Plugin> registry) { this.plugin = registry.get(); }
+    public void on(final BusEvent busEvent) {
+        AccountCreated a = (AccountCreated) busEvent;          // event cast: imported type
+        ((InvoicePlugin) plugin).run();                        // dependency cast: same-package type
+        Object o = (Other) this.plugin;                        // this.<field>
+        String s = (String) busEvent.getName();                // a call result, not the root: ignored
+        // (Ignored) plugin  -- comments are ignored
+        Registry r = (Registry) registry;                      // constructor argument
+    }
+}
+""")
+    a = ConsumerAnalysis(className="L", methodName="on", eventType="BusEvent",
+                         parameters=["final BusEvent busEvent"],
+                         dependencies=[DependencyInfo(name="plugin", type="Plugin")])
+    assert cast_targets(a, src) == {
+        "event": ["com.acme.events.AccountCreated"],
+        "plugin": ["com.acme.InvoicePlugin", "com.acme.Other"],
+        "registry": ["com.acme.Registry"],
+    }
+
+
+def test_fakes_are_built_cast_aware(analyze):
+    # Dependencies and the event are faked through typeFor(..), after CASTS is filled.
+    src = harness(analyze("SimpleConsumer"), "SimpleConsumer")
+    assert "__EBInstantiate.typeFor(" in src and "(EVENT_CLASS)" not in src
+    from eventbreaker.scenarios.executor import _EXECUTION_TEMPLATE as t
+    assert t.index("CAST_TYPES") < t.index("MOCK_DECLARATIONS")
+
+
+def test_list_values_are_one_element_collections():
+    from eventbreaker.scenarios.executor import _INSTANTIATE_HELPER as helper
+    assert 'list.startsWith("LIST:")' in helper and "listOf(convert(list.substring(5), elementType(inv)" in helper
+
+
+def test_injected_failures_throw_the_declared_checked_exception():
+    from eventbreaker.scenarios.executor import _INSTANTIATE_HELPER as helper
+    assert 'throw failure(inv.getMethod(), "EventBreaker: " + fault + " on " + path);' in helper
+    assert "m.getExceptionTypes()" in helper and "return new RuntimeException(message);" in helper
+
+
+def test_enum_builtins_are_not_static_helpers():
+    from eventbreaker.scenarios.executor import static_helpers
+    src = """package org.acme.app;
+import org.acme.app.api.MessageType;
+import org.acme.app.ctx.Tenant;
+class L { void on(String t) { MessageType.valueOf(t); MessageType.values(); Tenant.current(); } }
+"""
+    assert static_helpers(src) == ["org.acme.app.ctx.Tenant"]   # valueOf/values only → an enum's built-ins
+
+
+def test_inherited_source_finds_project_parents(tmp_path):
+    from eventbreaker.scenarios.executor import inherited_source
+    (tmp_path / "pom.xml").write_text("<project/>")
+    pkg = tmp_path / "src" / "main" / "java" / "org" / "acme"
+    pkg.mkdir(parents=True)
+    (pkg / "Listener.java").write_text("package org.acme;\npublic class Listener extends Base { }\n")
+    (pkg / "Base.java").write_text("package org.acme;\nabstract class Base extends Root { String header() { return null; } }\n")
+    (pkg / "Root.java").write_text("package org.acme;\nabstract class Root extends java.util.AbstractList<String> { }\n")
+    text = inherited_source(pkg / "Listener.java")
+    assert "// Base.java" in text and "// Root.java" in text and text.index("Base.java") < text.index("Root.java")
+    assert inherited_source(pkg / "Root.java") == ""   # parent outside the project: nothing
+
+
+def test_primitive_arrays_bytes_and_nested_classes():
+    from eventbreaker.scenarios.executor import _INSTANTIATE_HELPER as helper
+    assert "if (rt.isArray()) {" in helper                                   # byte[] body: one element, not null
+    assert "rt == byte[].class ? text.getBytes(" in helper                   # STRING:<json> sets a byte[] body
+    assert helper.count("load(name)") == 2 and 'n.substring(0, dot) + "$"' in helper   # statics + casts

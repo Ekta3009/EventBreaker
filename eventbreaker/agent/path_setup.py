@@ -35,9 +35,11 @@ concrete classes, early returns.
 Target syntax: "<dep>.<method>" for a dependency call, or a getter path starting at a dependency or "event",
 e.g. "event.getTagDefinition.getName" (method names only, no parentheses or arguments).
 Value vocabulary: true | false | <number> | STRING:<text> | ENUM:<CONSTANT_NAME> | MOCK:<ConcreteClassSimpleName> | NULL
+| LIST:<value> (a one-element list/set holding a true/false/number/STRING/ENUM value, e.g. LIST:STRING:https://example.com/hook)
 Return ONLY a JSON array: [{"target": "...", "returns": "...", "why": "<one short reason>"}]. Return [] if no override is needed."""
 
-_VALUE = re.compile(r"^(true|false|NULL|-?\d+(\.\d+)?|STRING:.*|ENUM:[A-Za-z_]\w*|MOCK:[A-Za-z_][\w.]*)$")
+_SCALAR = r"true|false|-?\d+(\.\d+)?|STRING:.*|ENUM:[A-Za-z_]\w*"
+_VALUE = re.compile(rf"^({_SCALAR}|NULL|MOCK:[A-Za-z_][\w.]*|LIST:({_SCALAR}))$")
 
 
 def target_calls(scenario: ChaosScenario) -> list[str]:
@@ -70,6 +72,28 @@ def reusable_setup(
     return min(reaching, key=len) if reaching else None
 
 
+def _called(run: ObservationResult) -> set[str]:
+    return {o.target for o in run.observations if o.callCount > 0}
+
+
+def deeper_setup(
+    targets: list[str], values: list[ReturnValue], tried: list[tuple[list[ReturnValue], ObservationResult]],
+) -> list[ReturnValue] | None:
+    """A setup whose baseline makes every call this one's does and more, still reaching every target; else None.
+
+    A failure only shows what it loses if the run gets far enough for that work to happen at all:
+    with an empty callback list no webhook is ever sent, so "the lookup failed" loses nothing measurable.
+    Requiring a superset of calls keeps the scenario on the same path; it only adds downstream work.
+    """
+    current = next((b for v, b in tried if v == values), None)
+    if current is None or current.status != "REPRODUCED":
+        return None
+    base = _called(current)
+    deeper = [(v, b) for v, b in tried
+              if b.status == "REPRODUCED" and not not_reached(b, targets) and _called(b) > base]
+    return max(deeper, key=lambda vb: (len(_called(vb[1])), -len(vb[0])))[0] if deeper else None
+
+
 def reach_feedback(values: list[ReturnValue], result: ObservationResult, missing: list[str]) -> str:
     """What happened with the previous setup — sent back to Nemotron for one retry."""
     tried = ", ".join(f"{v.target} → {v.returns}" for v in values) or "(no overrides)"
@@ -92,14 +116,15 @@ def reach_feedback(values: list[ReturnValue], result: ObservationResult, missing
 
 def plan_path(
     analysis: ConsumerAnalysis, source_code: str, scenario: ChaosScenario,
-    feedback: str | None = None,
+    feedback: str | None = None, inherited: str = "",
 ) -> list[ReturnValue]:
     """Return validated ReturnValue overrides for this scenario ([] if none needed or on any failure).
 
     feedback: what happened when a previous setup was executed (see reach_feedback);
     used for one retry when the target was not reached.
+    inherited: source of the listener's parent classes in the same project (see inherited_source).
     """
-    user = _prompt(analysis, source_code, scenario, feedback)
+    user = _prompt(analysis, source_code, scenario, feedback, inherited)
     if not user:
         return []
     cache_file = _cache_file(user)
@@ -129,16 +154,17 @@ def plan_path(
 
 
 def forget_plan(
-    analysis: ConsumerAnalysis, source_code: str, scenario: ChaosScenario, feedback: str,
+    analysis: ConsumerAnalysis, source_code: str, scenario: ChaosScenario, feedback: str, inherited: str = "",
 ) -> None:
     """Drop a cached retry answer that did not reach the target, so the next run asks again."""
-    user = _prompt(analysis, source_code, scenario, feedback)
+    user = _prompt(analysis, source_code, scenario, feedback, inherited)
     if user:
         _cache_file(user).unlink(missing_ok=True)
 
 
 def _prompt(
     analysis: ConsumerAnalysis, source_code: str, scenario: ChaosScenario, feedback: str | None,
+    inherited: str = "",
 ) -> str:
     """The user prompt for this scenario ("" when it has no target call)."""
     target = _target(scenario)
@@ -173,6 +199,9 @@ def _prompt(
         f"Scenario concern: {scenario.expectedConcern}\n\n"
         + (f"{feedback}\n\n" if feedback else "")
         + f"Source:\n{source_code}"
+        # Only listeners with a project parent class get this section, so other prompts are unchanged.
+        + (f"\n\nInherited code (the listener's parent classes; methods it calls without a receiver may be "
+           f"here):\n{inherited}" if inherited else "")
     )
 
 
@@ -210,7 +239,10 @@ def _parse(raw: str, analysis: ConsumerAnalysis, source_code: str) -> list[Retur
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
             continue
-        target = str(item.get("target", "")).replace("()", "").strip()
+        # Method names only: the model sometimes writes the call with its argument ("get(\"topic\")").
+        target = str(item.get("target", "")).strip()
+        while re.search(r"\([^()]*\)", target):
+            target = re.sub(r"\([^()]*\)", "", target)
         returns = str(item.get("returns", "")).strip()
         if target.split(".")[0] not in roots or "." not in target or not _VALUE.match(returns):
             continue

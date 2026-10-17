@@ -17,7 +17,7 @@ from eventbreaker.analyzer.bridge import analyze, scan
 from eventbreaker.agent.nemotron import identify_risks
 from eventbreaker.classpath.resolver import ClasspathError, find_module, resolve
 from eventbreaker.agent.path_setup import (
-    forget_plan, not_reached, plan_path, reach_feedback, reusable_setup, target_calls,
+    deeper_setup, forget_plan, not_reached, plan_path, reach_feedback, reusable_setup, target_calls,
 )
 from eventbreaker.diagnosis.analyzer import KIND_LABELS, diagnose, merge_findings
 from eventbreaker.diagnosis.classify import label_calls
@@ -25,7 +25,7 @@ from eventbreaker.diagnosis.reviewer import review
 from eventbreaker.models.observation import ObservationResult, ReliabilityFinding
 from eventbreaker.report import reporter
 from eventbreaker.scenarios.models import ChaosScenario, TestConfig
-from eventbreaker.scenarios.executor import ScenarioExecutor
+from eventbreaker.scenarios.executor import ScenarioExecutor, inherited_source
 from eventbreaker.scenarios.coverage import dependency_calls, failure_scenarios
 from eventbreaker.scenarios.experiment import ExperimentPlan, check_feasibility
 
@@ -245,6 +245,7 @@ def analyze_consumer(
             )
 
     planned = [sc for sc, _ in feasible if sc.testConfig is not None]
+    inherited = inherited_source(file)   # parent classes' code, so path setup sees inherited helpers
     for scenario in planned:
         # A setup another scenario already proved reaches this target costs no LLM call.
         values = reusable_setup(target_calls(scenario), tried())
@@ -253,7 +254,7 @@ def analyze_consumer(
             show_setup(scenario, values, " (reused)")
             continue
         with console.status(f"[bold green]Planning path setup: {scenario.scenarioType}..."):
-            values = plan_path(analysis, source_code, scenario)
+            values = plan_path(analysis, source_code, scenario, inherited=inherited)
         missing = missing_for(scenario, values)
         if missing:
             # One retry: show Nemotron what its setup actually did.
@@ -263,12 +264,12 @@ def analyze_consumer(
             )
             feedback = reach_feedback(values, baselines[_values_key(values)], missing)
             with console.status(f"[bold green]Revising path setup: {scenario.scenarioType}..."):
-                retry = plan_path(analysis, source_code, scenario, feedback=feedback)
+                retry = plan_path(analysis, source_code, scenario, feedback=feedback, inherited=inherited)
             if retry and retry != values:
                 values = retry
                 missing = missing_for(scenario, values)
             if missing:
-                forget_plan(analysis, source_code, scenario, feedback)
+                forget_plan(analysis, source_code, scenario, feedback, inherited)
         scenario.testConfig.returnValues = values
         show_setup(scenario, values)
 
@@ -279,6 +280,14 @@ def analyze_consumer(
             if values is not None:
                 scenario.testConfig.returnValues = values
                 show_setup(scenario, values, " (reused from another scenario)")
+
+    # A failure is only measurable if the run gets far enough for its effects to go missing:
+    # prefer a setup that does everything this one does and more (e.g. a callback URL, so sends happen).
+    for scenario in planned:
+        values = deeper_setup(target_calls(scenario), scenario.testConfig.returnValues, tried())
+        if values is not None:
+            scenario.testConfig.returnValues = values
+            show_setup(scenario, values, " (deeper setup from another scenario)")
 
     for scenario, plan in feasible:
         targets = target_calls(scenario)

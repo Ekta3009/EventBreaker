@@ -108,3 +108,34 @@ def test_param_section_only_for_listeners_with_plain_parameters():
                              dependencies=[DependencyInfo(name="devices", type="DeviceRepo")])
     assert "param." not in path_setup._prompt(plain, "src", scenario, None)
     assert "param.x" not in [v.target for v in _parse('[{"target": "param.x", "returns": "1"}]', plain, "")]
+
+
+def test_list_values_accepted_for_scalars_only():
+    from eventbreaker.agent.path_setup import _VALUE
+    assert _VALUE.match("LIST:STRING:https://example.com/hook") and _VALUE.match("LIST:3")
+    assert not _VALUE.match("LIST:MOCK:Foo") and not _VALUE.match("LIST:NULL")
+
+
+def test_deeper_setup_only_adds_downstream_work():
+    from eventbreaker.agent.path_setup import deeper_setup
+    def run(*called):
+        return ObservationResult(scenario="B", observations=[E(target=t, callCount=1) for t in called])
+    empty = []
+    url = [ReturnValue(target="tenantApi.getValues", returns="LIST:STRING:https://x")]
+    other = [ReturnValue(target="event.getType", returns="ENUM:B")]
+    shallow = run("tenantApi.getValues", "mapper.write")
+    deep = run("tenantApi.getValues", "mapper.write", "http.send")            # superset: same path, more work
+    branch = run("tenantApi.getValues", "audit.log", "http.send", "x.y")      # more calls, but a different path
+    tried = [(empty, shallow), (url, deep), (other, branch)]
+    assert deeper_setup(["tenantApi.getValues"], empty, tried) == url
+    assert deeper_setup(["tenantApi.getValues"], url, tried) is None          # already the deepest
+    assert deeper_setup(["http.other"], empty, tried) is None                 # must still reach the target
+
+
+def test_targets_written_with_arguments_are_normalised():
+    a = ConsumerAnalysis(className="L", methodName="on", eventType="Message",
+                         dependencies=[DependencyInfo(name="repo", type="Repo")])
+    raw = """[{"target": "event.getMessageProperties.getHeaders.get(\\"topic\\")", "returns": "STRING:UPDATE"},
+              {"target": "repo.find(event.getId()).getStatus()", "returns": "ENUM:ACTIVE"}]"""
+    assert [v.target for v in _parse(raw, a, "class L {}")] == [
+        "event.getMessageProperties.getHeaders.get", "repo.find.getStatus"]

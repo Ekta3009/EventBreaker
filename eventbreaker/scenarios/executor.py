@@ -8,6 +8,7 @@ import tempfile
 import zipfile
 from pathlib import Path
 
+from eventbreaker.classpath.resolver import project_root
 from eventbreaker.models.consumer import ConsumerAnalysis, DependencyInfo
 from eventbreaker.models.observation import ObservationEntry, ObservationResult
 from eventbreaker.sandbox.executor import SandboxExecutor
@@ -124,6 +125,7 @@ public class EventBreakerExecution {
     }
 
     private static void run() throws Exception {
+CAST_TYPES
 
         // ── Instrumented dependencies (recorders, not simulators) ──────────
         //
@@ -138,7 +140,7 @@ CONSUMER_INSTANTIATION
         // ── Create the event ───────────────────────────────────────────────
         // Numeric getters return 1 and boolean getters return true, so guard
         // clauses like `if (event.getAmount() <= 0) return;` don't short-circuit.
-        EVENT_CLASS event = mock(EVENT_CLASS.class,
+        EVENT_CLASS event = (EVENT_CLASS) mock(eventbreaker.generated.__EBInstantiate.typeFor(EVENT_CLASS.class, "event"),
             eventbreaker.generated.__EBInstantiate.settings(EVENT_CLASS.class, "event"));
 
         // ── Reset counters — exclude stubbing-phase invocations ────────────
@@ -252,7 +254,11 @@ public final class __EBInstantiate {
         // Named after the source's parameter names when they line up, so path setup can
         // override what a constructor-only fake returns (e.g. rabbitTemplate.getMessageConverter…).
         boolean named = names.length == types.length;
-        for (int i = 0; i < types.length; i++) args[i] = valueFor(types[i], named ? names[i] : "ctor" + i);
+        java.lang.reflect.Type[] generic = best.getGenericParameterTypes();
+        for (int i = 0; i < types.length; i++) {
+            args[i] = valueFor(types[i], named ? names[i] : "ctor" + i);
+            if (generic.length == types.length) declare(args[i], generic[i]);
+        }
         return cls.cast(best.newInstance(args));
     }
 
@@ -282,7 +288,7 @@ public final class __EBInstantiate {
         List<org.mockito.MockedStatic<?>> opened = new ArrayList<>();
         for (String name : STATICS) {
             try {
-                Class<?> cls = Class.forName(name);
+                Class<?> cls = load(name);
                 if (cls.isEnum() || cls.isInterface() || cls.isAnnotation()) continue;
                 String simple = cls.getSimpleName();
                 opened.add(Mockito.mockStatic(cls, inv -> {
@@ -300,6 +306,20 @@ public final class __EBInstantiate {
             }
         }
         return opened;
+    }
+
+    /** Class.forName that also finds nested classes written in source form (Action.ActionStatusCreate). */
+    private static Class<?> load(String name) throws ClassNotFoundException {
+        String n = name;
+        while (true) {
+            try {
+                return Class.forName(n);
+            } catch (ClassNotFoundException e) {
+                int dot = n.lastIndexOf('.');
+                if (dot < 0) throw e;
+                n = n.substring(0, dot) + "$" + n.substring(dot + 1);
+            }
+        }
     }
 
     private static void callListener(Object target, String method, Object... args) throws Exception {
@@ -329,6 +349,7 @@ public final class __EBInstantiate {
                 if (Modifier.isStatic(f.getModifiers())) return;
                 f.setAccessible(true);
                 f.set(target, value);
+                declare(value, f.getGenericType());
                 return;
             } catch (NoSuchFieldException ignored) {
                 // keep walking up the hierarchy
@@ -344,7 +365,68 @@ public final class __EBInstantiate {
      */
     public static org.mockito.MockSettings settings(Class<?> t, String path) {
         org.mockito.MockSettings s = withSettings().defaultAnswer(answerFor(path));
-        return t.isInterface() ? s.withoutAnnotations() : s;
+        Class<?> actual = typeFor(t, path);
+        List<Class<?>> extra = new ArrayList<>();
+        for (Class<?> c : casts(t, path)) {
+            if (c.isInterface() && !c.isAssignableFrom(actual)) extra.add(c);
+        }
+        if (!extra.isEmpty()) s = s.extraInterfaces(extra.toArray(new Class<?>[0]));
+        return actual.isInterface() ? s.withoutAnnotations() : s;
+    }
+
+    /**
+     * Root name ("event", a dependency field, a constructor argument) -> the types the listener's
+     * source casts it to, e.g. (InvoiceCreationInternalEvent) event. Filled before any fake exists.
+     */
+    public static final Map<String, List<String>> CASTS = new ConcurrentHashMap<>();
+
+    /** Cast targets for this root that are real subtypes of its declared type (final classes too: inline mock maker). */
+    private static List<Class<?>> casts(Class<?> t, String path) {
+        List<Class<?>> out = new ArrayList<>();
+        for (String name : CASTS.getOrDefault(path, List.of())) {
+            try {
+                Class<?> c = load(name);
+                if (c != t && t.isAssignableFrom(c)) out.add(c);
+            } catch (Throwable ignored) {
+                // a nested or unresolvable name: no extra type
+            }
+        }
+        return out;
+    }
+
+    /**
+     * The class to fake for a root: the first concrete class it is cast to, else its declared type.
+     * Interfaces it is cast to are added by settings(), so every cast in the source succeeds.
+     */
+    public static Class<?> typeFor(Class<?> t, String path) {
+        for (Class<?> c : casts(t, path)) if (!c.isInterface()) return c;
+        return t;
+    }
+
+    /**
+     * Declared generic type of a fake, e.g. OSGIServiceRegistration<PaymentControlPluginApi>
+     * for a field, constructor parameter or return value. Java erases the type argument at
+     * runtime, so without it registry.getServiceForName(..) (returns T) would answer a plain
+     * Object fake and the caller's assignment would fail.
+     */
+    private static final Map<Object, java.lang.reflect.Type> DECLARED =
+            java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<>());
+
+    private static void declare(Object fake, java.lang.reflect.Type type) {
+        if (fake != null && type instanceof java.lang.reflect.ParameterizedType
+                && Mockito.mockingDetails(fake).isMock()) {
+            DECLARED.put(fake, type);
+        }
+    }
+
+    /** Type variables of the faked type, resolved from its declared generic type when known. */
+    private static org.mockito.internal.util.reflection.GenericMetadataSupport generics(InvocationOnMock inv) {
+        java.lang.reflect.Type declared = DECLARED.get(inv.getMock());
+        if (declared != null) {
+            return org.mockito.internal.util.reflection.GenericMetadataSupport.inferFrom(declared);
+        }
+        Class<?> mocked = Mockito.mockingDetails(inv.getMock()).getMockCreationSettings().getTypeToMock();
+        return org.mockito.internal.util.reflection.GenericMetadataSupport.inferFrom(mocked);
     }
 
     /** The default answer for the fake reachable at this path. */
@@ -357,7 +439,7 @@ public final class __EBInstantiate {
         if (fault != null) {
             int n = CALLS.computeIfAbsent(path, k -> new AtomicInteger()).incrementAndGet();
             if (fault.equals("THROW") || (fault.equals("THROW_ONCE") && n == 1)) {
-                throw new RuntimeException("EventBreaker: " + fault + " on " + path);
+                throw failure(inv.getMethod(), "EventBreaker: " + fault + " on " + path);
             }
             if (fault.startsWith("DELAY:")) {
                 Thread.sleep(Long.parseLong(fault.substring(6)));
@@ -366,7 +448,13 @@ public final class __EBInstantiate {
         java.lang.reflect.Method m = inv.getMethod();
         Class<?> rt = returnType(inv);
         if (rt == void.class) return null;
-        if (RETURNS.containsKey(path)) return convert(RETURNS.get(path), rt, path);
+        if (RETURNS.containsKey(path)) {
+            Object spec = RETURNS.get(path);
+            if (spec instanceof String list && list.startsWith("LIST:")) {
+                return listOf(convert(list.substring(5), elementType(inv), path), rt);
+            }
+            return convert(spec, rt, path);
+        }
         // <S extends T> S save(S entity): the method returns what it was given (JPA save /
         // saveAndFlush / merge, fluent builders). An Object fake would fail the caller's cast.
         java.lang.reflect.Type grt = m.getGenericReturnType();
@@ -383,9 +471,11 @@ public final class __EBInstantiate {
         if (rt == float.class || rt == Float.class) return 1.0f;
         if (rt == short.class || rt == Short.class) return (short) 1;
         if (rt == byte.class || rt == Byte.class) return (byte) 1;
-        if (rt.isArray() && !rt.getComponentType().isPrimitive()) {
+        if (rt.isArray()) {   // one element; a primitive array (byte[] message body) holds a zero
             Object arr = java.lang.reflect.Array.newInstance(rt.getComponentType(), 1);
-            java.lang.reflect.Array.set(arr, 0, valueFor(rt.getComponentType(), path));
+            if (!rt.getComponentType().isPrimitive()) {
+                java.lang.reflect.Array.set(arr, 0, valueFor(rt.getComponentType(), path));
+            }
             return arr;
         }
         if (rt == java.util.List.class || rt == java.util.Collection.class
@@ -398,7 +488,46 @@ public final class __EBInstantiate {
         if (rt == java.util.Optional.class) {
             return java.util.Optional.ofNullable(valueFor(elementType(inv), path));
         }
-        return valueFor(rt, path);
+        Object value = valueFor(rt, path);
+        declare(value, m.getGenericReturnType());   // e.g. getRegistry() returning Registry<PluginApi>
+        return value;
+    }
+
+    /**
+     * The exception an injected failure throws: the method's first declared checked exception
+     * (e.g. JsonProcessingException, EventBusException), so the listener's own catch block for it
+     * is what gets tested; a RuntimeException when it declares none or none can be built.
+     */
+    private static Throwable failure(java.lang.reflect.Method m, String message) {
+        for (Class<?> ex : m.getExceptionTypes()) {
+            if (RuntimeException.class.isAssignableFrom(ex) || Error.class.isAssignableFrom(ex)) continue;
+            Throwable t = newThrowable(ex, message);
+            if (t != null) return t;
+        }
+        return new RuntimeException(message);
+    }
+
+    /** Builds ex with a message constructor (any visibility), else a no-arg one, else a fake of it. */
+    private static Throwable newThrowable(Class<?> ex, String message) {
+        if (!java.lang.reflect.Modifier.isAbstract(ex.getModifiers())) {
+            for (Class<?>[] sig : new Class<?>[][] {{String.class}, {String.class, Throwable.class}, {}}) {
+                try {
+                    Constructor<?> c = ex.getDeclaredConstructor(sig);
+                    c.setAccessible(true);
+                    Object[] args = sig.length == 0 ? new Object[0]
+                            : sig.length == 1 ? new Object[] {message} : new Object[] {message, null};
+                    return (Throwable) c.newInstance(args);
+                } catch (ReflectiveOperationException | RuntimeException ignored) {
+                    // try the next constructor
+                }
+            }
+        }
+        try {   // abstract, or no usable constructor: a fake that still has the type the catch block expects
+            Throwable fake = (Throwable) mock(ex, withSettings().defaultAnswer(CALLS_REAL_METHODS));
+            return fake;
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 
     /**
@@ -422,10 +551,7 @@ public final class __EBInstantiate {
         // AbstractPersistable<Long> has getId() declared as <ID extends Serializable> -> Long.
         if (m.getGenericReturnType() instanceof java.lang.reflect.TypeVariable<?>) {
             try {
-                Class<?> mocked = org.mockito.Mockito.mockingDetails(inv.getMock())
-                        .getMockCreationSettings().getTypeToMock();
-                Class<?> resolved = org.mockito.internal.util.reflection.GenericMetadataSupport
-                        .inferFrom(mocked).resolveGenericReturnType(m).rawType();
+                Class<?> resolved = generics(inv).resolveGenericReturnType(m).rawType();
                 if (resolved != null && best.isAssignableFrom(resolved)) best = resolved;
             } catch (RuntimeException ignored) {
                 // keep Object
@@ -434,11 +560,21 @@ public final class __EBInstantiate {
         return best;
     }
 
+    /** A one-element collection of the return type's kind (Set, else List) holding value. */
+    private static Object listOf(Object value, Class<?> rt) {
+        java.util.List<Object> one = new java.util.ArrayList<>();
+        one.add(value);
+        return java.util.Set.class.isAssignableFrom(rt) ? new java.util.HashSet<>(one) : one;
+    }
+
     private static Object convert(Object spec, Class<?> rt, String path) {
         if (spec instanceof Class<?> c) return valueFor(c, path);
         String s = (String) spec;
         if (s.equals("NULL")) return null;
-        if (s.startsWith("STRING:")) return s.substring(7);
+        if (s.startsWith("STRING:")) {   // a byte[] (e.g. a message body) gets the text's bytes
+            String text = s.substring(7);
+            return rt == byte[].class ? text.getBytes(java.nio.charset.StandardCharsets.UTF_8) : text;
+        }
         if (s.startsWith("ENUM:")) {
             String name = s.substring(5);
             for (Object c : rt.getEnumConstants()) if (((Enum<?>) c).name().equals(name)) return c;
@@ -459,10 +595,7 @@ public final class __EBInstantiate {
      */
     private static Class<?> elementType(InvocationOnMock inv) {
         try {
-            Class<?> mocked = org.mockito.Mockito.mockingDetails(inv.getMock())
-                    .getMockCreationSettings().getTypeToMock();
-            var ret = org.mockito.internal.util.reflection.GenericMetadataSupport
-                    .inferFrom(mocked).resolveGenericReturnType(inv.getMethod());
+            var ret = generics(inv).resolveGenericReturnType(inv.getMethod());
             for (java.lang.reflect.Type t : ret.actualTypeArguments().values()) {
                 if (t instanceof Class<?> c && c != Object.class) return c;
                 if (t instanceof java.lang.reflect.ParameterizedType pt) return (Class<?>) pt.getRawType();
@@ -515,7 +648,7 @@ public final class __EBInstantiate {
             return constants.length > 0 ? constants[0] : null;
         }
         try {
-            return mock(t, settings(t, path));
+            return mock(typeFor(t, path), settings(t, path));
         } catch (RuntimeException e) {
             return null;  // final / unmockable type
         }
@@ -972,7 +1105,7 @@ def _generate_execution(
     for d in recorders:
         dtype = d.type.split("<")[0].strip()
         mock_decl_lines.append(
-            f"        {d.type} {d.name} = mock({dtype}.class, "
+            f"        {d.type} {d.name} = ({d.type}) mock(eventbreaker.generated.__EBInstantiate.typeFor({dtype}.class, \"{d.name}\"), "
             f'eventbreaker.generated.__EBInstantiate.settings({dtype}.class, "{d.name}")\n'
             f'            .invocationListeners(report -> {{\n'
             f'                String __ebMn = ((org.mockito.invocation.Invocation) report.getInvocation()).getMethod().getName();\n'
@@ -1021,6 +1154,11 @@ def _generate_execution(
 
     return (
         _EXECUTION_TEMPLATE
+        .replace("CAST_TYPES", "\n".join(
+            f'        eventbreaker.generated.__EBInstantiate.CASTS.put("{root}", java.util.List.of('
+            + ", ".join(f'"{t}"' for t in types) + "));"
+            for root, types in cast_targets(analysis, consumer_file).items()
+        ))
         .replace("EXTRA_IMPORTS", extra_imports)
         .replace("MOCK_DECLARATIONS", mock_declarations)
         .replace("CONSUMER_INSTANTIATION", consumer_instantiation)
@@ -1047,6 +1185,33 @@ _VALUE_PARAM_TYPES = {
     "double", "Double", "java.lang.String", "java.util.UUID", "java.math.BigDecimal",
 }
 _BOXED = {"boolean": "Boolean", "int": "Integer", "long": "Long", "double": "Double"}
+
+
+_CAST = re.compile(r"\(\s*([A-Z][\w.]*)\s*\)\s*(?:this\s*\.\s*)?([a-z_]\w*)\b(?!\s*[.(\[])")
+
+
+def cast_targets(analysis: ConsumerAnalysis, consumer_file: Path) -> dict[str, list[str]]:
+    """Fake roots the listener casts to a more specific type: {"event": [fqn, …], "<dep>": […]}.
+
+    `(InvoiceCreationInternalEvent) event` or `((InvoicePaymentControlPluginApi) plugin).call()`: the
+    fake for that root must also be of that type, or the cast fails before the risky call.
+    Only names cast directly (not a call result such as `(X) a.getB()`) are collected; the Java
+    side keeps only loadable subtypes of the declared type.
+    """
+    source = consumer_file.read_text(encoding="utf-8")
+    code = re.sub(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/', " ", source, flags=re.S)
+    event_name = next(
+        (p.split()[-1] for p in analysis.parameters if analysis.eventType in p.split()[:-1]), "event")
+    roots = {d.name: d.name for d in analysis.dependencies}
+    roots.update({name: name for _, name in constructor_params(source, analysis.className)})
+    roots[event_name] = "event"
+    found: dict[str, list[str]] = {}
+    for type_name, name in _CAST.findall(code):
+        root = roots.get(name)
+        fqn = _qualify(type_name, consumer_file)
+        if root and fqn not in found.setdefault(root, []):
+            found[root].append(fqn)
+    return {r: t for r, t in found.items() if t}
 
 
 def constructor_params(source: str, class_name: str) -> list[tuple[str, str]]:
@@ -1105,9 +1270,38 @@ def static_helpers(source: str) -> list[str]:
             found.append(cls)
     for fqn in re.findall(r"^\s*import\s+([\w.]+)\s*;", source, re.M):
         simple = fqn.rsplit(".", 1)[-1]
-        if fqn.startswith(root) and re.search(rf"(?<![\w.]){simple}\.[a-z]\w*\s*\(", code):
+        called = set(re.findall(rf"(?<![\w.]){simple}\.([a-z]\w*)\s*\(", code))
+        # Only valueOf()/values(): an enum's built-ins, which the harness never fakes (MessageType.valueOf(type)).
+        if fqn.startswith(root) and called - {"valueOf", "values"}:
             found.append(fqn)
     return list(dict.fromkeys(found))
+
+
+def inherited_source(consumer_file: Path, max_chars: int = 12000) -> str:
+    """Source of the listener's parent classes from the same project (closest first), or "".
+
+    Shared logic often lives in a base class (reading headers, converting the message body); path
+    setup cannot plan values for code it cannot see. Looked up in the listener's own source root,
+    then in any src/main/java of the project. Stops at a parent outside the project.
+    """
+    root = project_root(consumer_file)
+    current, parts, seen = consumer_file, [], set()
+    while len(parts) < 3:
+        source = current.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r"\bclass\s+\w+(?:\s*<[^{]*?>)?\s+extends\s+([\w.]+)", source)
+        if not m:
+            break
+        rel = _qualify(m.group(1), current).replace(".", "/") + ".java"
+        pkg = _read_package(current) or ""
+        src_root = current.parents[len(pkg.split(".")) if pkg else 0]
+        found = src_root / rel if (src_root / rel).exists() else next(
+            (p for p in (root.glob(f"**/src/main/java/{rel}") if root else []) if "/build/" not in str(p)), None)
+        if found is None or found in seen:
+            break
+        seen.add(found)
+        parts.append(f"// {found.name}\n{found.read_text(encoding='utf-8', errors='replace')}")
+        current = found
+    return "\n\n".join(parts)[:max_chars]
 
 
 def value_params(analysis: ConsumerAnalysis) -> list[DependencyInfo]:

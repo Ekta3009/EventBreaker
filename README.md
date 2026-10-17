@@ -16,8 +16,6 @@ AI-planned, measurement-backed reliability testing for Java event listeners.
 [Example](#example-input-and-output) · [Getting started](#getting-started) · [Usage](#usage) ·
 [Tech stack](#tech-stack) · [Evaluation](#evaluation)
 
-![EventBreaker findings for Apache Fineract's Kafka listener](docs/images/terminal-findings.png)
-
 </div>
 
 ---

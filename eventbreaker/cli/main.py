@@ -145,8 +145,8 @@ def analyze_consumer(
     # ── Step 2: Nemotron risk identification ──────────────────────────────────
     if not os.environ.get("NEBIUS_API_KEY"):
         console.print(
-            "[yellow]⚠  NEBIUS_API_KEY not set — "
-            "skipping AI risk identification.[/yellow]\n"
+            "[bold yellow]NEBIUS_API_KEY not set — "
+            "skipping AI risk identification.[/bold yellow]\n"
             "Export it to run the full analysis: "
             "[dim]export NEBIUS_API_KEY=<your-key>[/dim]"
         )
@@ -300,7 +300,7 @@ def analyze_consumer(
                 result.status = "NOT_REACHED"
         console.print(f"[dim]  {reporter.describe_test(scenario).replace('`', '')}[/dim]")
         colour, mark = {
-            "REPRODUCED": ("green", "✓"), "NOT_REACHED": ("yellow", "⚠"),
+            "REPRODUCED": ("green", "✓"), "NOT_REACHED": ("yellow", "○"),
         }.get(result.status, ("red", "✗"))
         console.print(
             f"[bold {colour}]{mark} {scenario.scenarioType} — {result.status.replace('_', ' ')}"
@@ -407,10 +407,10 @@ def analyze_consumer(
             and baselines[_setup_key(sc)].status == "REPRODUCED"
         },
     )
-    report_path = reporter.save(report_md, analysis)
+    report_path = reporter.save(report_md, analysis, reporter.reports_dir(file))
     console.print(
-        f"\n[bold green]✓ Report saved →[/bold green] "
-        f"[yellow]{report_path}[/yellow]\n"
+        f"\n[bold green]✓ Report saved →[/bold green] [yellow]{report_path}[/yellow]\n"
+        f"[dim]  Open it: open -a \"IntelliJ IDEA\" \"{report_path}\"  (or any Markdown viewer)[/dim]\n"
     )
     return {
         "report": report_path,
@@ -518,7 +518,7 @@ def _print_scan_summary(summary: list[tuple]) -> None:
             + (f", [red]{outcome['errors']} error[/red]" if outcome["errors"] else "")
         )
         t.add_row(name, ran, str(sev.count("HIGH")), str(sev.count("MEDIUM")), str(sev.count("LOW")),
-                  str(outcome["report"]))
+                  str(outcome["report"]).replace(str(Path.home()), "~", 1))
     console.print(Panel(t, title="[bold]Scan summary[/bold]", border_style="cyan"))
 
 
@@ -645,9 +645,9 @@ def _print_observations(result: ObservationResult, analysis=None) -> None:
         if count is None:
             obs_table.add_row(target, "[dim]0[/dim]", "[red]SKIPPED[/red]")
         elif count > 1:
-            obs_table.add_row(target, f"[red]{count}[/red]", f"[red]⚠ called {count}×[/red]")
+            obs_table.add_row(target, f"[red]{count}[/red]", f"[bold red]called {count}×[/bold red]")
         elif target in threw_targets:
-            obs_table.add_row(target, f"[yellow]{count}[/yellow]", "[yellow]⚠ threw[/yellow]")
+            obs_table.add_row(target, f"[yellow]{count}[/yellow]", "[bold magenta]threw[/bold magenta]")
         else:
             obs_table.add_row(target, f"[green]{count}[/green]", "[green]✓[/green]")
 

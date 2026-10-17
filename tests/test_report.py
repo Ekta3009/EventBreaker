@@ -19,21 +19,42 @@ def test_describe_duplicate():
 
 
 def test_status_threw_is_visible_even_at_one_call():
-    assert _call_status(E(target="h.handle", callCount=1, threw=True), 1, None) == "⚠ threw"
+    assert _call_status(E(target="h.handle", callCount=1, threw=True), 1, None) == "**threw**"
 
 
 def test_status_against_baseline():
-    assert _call_status(E(target="p.insert", callCount=1), 1, 3) == "⚠ 2 missing"
-    assert _call_status(E(target="p.insert", callCount=6), 6, 3) == "⚠ 3 extra"
+    assert _call_status(E(target="p.insert", callCount=1), 1, 3) == "**2 missing**"
+    assert _call_status(E(target="p.insert", callCount=6), 6, 3) == "**3 extra**"
     assert _call_status(E(target="p.insert", callCount=3), 3, 3) == "✓"
-    assert _call_status(None, 0, 1) == "⚠ 1 missing"
+    assert _call_status(None, 0, 1) == "**1 missing**"
 
 
-def test_save_never_overwrites(tmp_path):
+def test_save_keeps_history_and_latest(tmp_path):
     from eventbreaker.models.consumer import ConsumerAnalysis
     from eventbreaker.report.reporter import save
     a = ConsumerAnalysis(className="KafkaRemoteMessageListener", methodName="onMessage", eventType="E")
     first, second = save("one", a, tmp_path), save("two", a, tmp_path)
-    assert first != second
-    assert first.name.startswith("KafkaRemoteMessageListener.onMessage-")
-    assert (first.read_text(), second.read_text()) == ("one", "two")
+    folder = tmp_path / "KafkaRemoteMessageListener.onMessage"
+    assert first == second == folder / "latest.md"
+    assert second.read_text() == "two"                       # latest = newest run
+    dated = [p for p in folder.iterdir() if p.name != "latest.md"]
+    assert sorted(p.read_text() for p in dated) == ["one", "two"]   # history kept, never overwritten
+
+
+def test_reports_go_to_the_project_root(tmp_path, monkeypatch):
+    from eventbreaker.report.reporter import reports_dir
+    # Multi-module Maven project: root pom + module pom; the listener sits in the module.
+    (tmp_path / "pom.xml").write_text("<project/>")
+    module = tmp_path / "billing"
+    src = module / "src" / "main" / "java" / "x"
+    src.mkdir(parents=True)
+    (module / "pom.xml").write_text("<project/>")
+    listener = src / "L.java"
+    listener.write_text("class L {}")
+    elsewhere = tmp_path.parent
+    monkeypatch.chdir(elsewhere)
+    assert reports_dir(listener) == tmp_path / "eventbreaker-reports"
+    # A loose copy outside any project: the current directory.
+    loose = tmp_path / "loose.java"
+    loose.write_text("class L {}")
+    assert reports_dir(loose) == elsewhere / "eventbreaker-reports"

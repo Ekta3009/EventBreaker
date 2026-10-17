@@ -1,6 +1,9 @@
 from __future__ import annotations
 from pydantic import BaseModel
 
+# Fields the analyzer JAR emits but nothing reads (assignments, variable names, raw initializers) are
+# left out; Pydantic ignores unknown keys.
+
 
 class MethodCallInfo(BaseModel):
     expression: str
@@ -22,18 +25,9 @@ class DependencyInfo(BaseModel):
     type: str
 
 
-class AssignmentInfo(BaseModel):
-    target: str
-    value: str
-    expression: str
-
-
 class VariableInitializationInfo(BaseModel):
-    variableName: str
     variableType: str
-    initializer: str
     initializerMethodCall: MethodCallInfo | None = None
-    initializerObjectCreation: ObjectCreationInfo | None = None
 
 
 class ConsumerAnalysis(BaseModel):
@@ -44,7 +38,6 @@ class ConsumerAnalysis(BaseModel):
     dependencies: list[DependencyInfo] = []
     methodCalls: list[MethodCallInfo] = []
     objectCreations: list[ObjectCreationInfo] = []
-    assignments: list[AssignmentInfo] = []
     variableInitializations: list[VariableInitializationInfo] = []
     otherListenerMethods: list[str] = []   # listener methods in the class not analysed this run
     listenerAnnotation: str = ""           # e.g. KafkaListener, EventListener, Subscribe

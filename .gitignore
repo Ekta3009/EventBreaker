@@ -52,3 +52,9 @@ eventbreaker-reports/
 *.jpg
 *.jpeg
 
+!docs/images/*.png
+
+### Local working notes (not part of the published repo) ###
+docs/*
+!docs/images/
+src/test/resources/real-world/*.md

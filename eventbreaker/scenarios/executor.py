@@ -86,10 +86,7 @@ CLASSPATH_DEPENDENCIES
 # Uses plain string replacement (UPPER_CASE markers) to avoid
 # escaping conflicts between Python f-strings and Java braces.
 # Mockito is used purely as an invocation recorder.
-#
-# Marker ordering rules (to avoid substring replacement bugs):
-#   CHAIN_STUBS must be replaced before STUBS (CHAIN_STUBS contains "STUBS")
-#   FAULT_INJECTIONS and CALL_PATTERN carry the scenario-specific code.
+# FAULT_INJECTIONS and CALL_PATTERN carry the scenario-specific code.
 
 _EXECUTION_TEMPLATE = """\
 package eventbreaker.generated;
@@ -143,7 +140,6 @@ CONSUMER_INSTANTIATION
         // clauses like `if (event.getAmount() <= 0) return;` don't short-circuit.
         EVENT_CLASS event = mock(EVENT_CLASS.class,
             eventbreaker.generated.__EBInstantiate.settings(EVENT_CLASS.class, "event"));
-EVENT_STUBS
 
         // ── Reset counters — exclude stubbing-phase invocations ────────────
         // when(...).thenReturn(...) triggers one invocation on the stub target.
@@ -986,21 +982,6 @@ def _generate_execution(
         )
     mock_declarations = "\n".join(mock_decl_lines)
 
-    # Stub boolean methods called directly on the event (e.g. event.isPriority())
-    # to return true, so conditional listeners take the side-effect branch.
-    event_var = _get_event_var_name(analysis)
-    _BOOL_PREFIX = re.compile(r'^(is|has|was|can|should|will)[A-Z_]')
-    event_stub_lines: list[str] = []
-    for mc in analysis.methodCalls:
-        stub = f"        when(event.{mc.methodName}()).thenReturn(true);"
-        if (
-            mc.scope == event_var
-            and (_BOOL_PREFIX.match(mc.methodName) or mc.methodName in _KNOWN_BOOLEAN_METHODS)
-            and stub not in event_stub_lines
-        ):
-            event_stub_lines.append(stub)
-    event_stubs = "\n".join(event_stub_lines)
-
     dep_map_entries = "\n".join(
         f'        __ebDeps.put("{d.name}", {d.name});'
         for d in recorders
@@ -1042,7 +1023,6 @@ def _generate_execution(
         _EXECUTION_TEMPLATE
         .replace("EXTRA_IMPORTS", extra_imports)
         .replace("MOCK_DECLARATIONS", mock_declarations)
-        .replace("EVENT_STUBS", event_stubs)
         .replace("CONSUMER_INSTANTIATION", consumer_instantiation)
         .replace("EVENT_CLASS", analysis.eventType)
         .replace("DEP_MAP_ENTRIES", dep_map_entries)
@@ -1357,23 +1337,3 @@ def _read_imports(java_file: Path) -> list[str]:
         elif re.match(r"^(public\s+)?(class|interface|enum|record)\s+", stripped):
             break
     return imports
-
-
-# ── Event helpers ──────────────────────────────────────────────────────────────
-
-_KNOWN_BOOLEAN_METHODS: frozenset[str] = frozenset({
-    # Common Java method names that always return boolean regardless of prefix
-    "contains", "containsKey", "containsValue",
-    "exists", "isEmpty", "isBlank", "isPresent", "isAbsent",
-    "startsWith", "endsWith", "matches", "equals", "equalsIgnoreCase",
-    "remove", "add",  # Collection.remove/add return boolean
-})
-
-
-def _get_event_var_name(analysis: ConsumerAnalysis) -> str:
-    """Extract the event parameter variable name from the consumer method signature."""
-    for param in analysis.parameters:
-        parts = param.strip().split()
-        if len(parts) >= 2 and parts[0] == analysis.eventType:
-            return parts[-1]
-    return "event"

@@ -23,8 +23,7 @@ A = ConsumerAnalysis(
         call("ledger", "append"),                              # repeat
     ],
     variableInitializations=[VariableInitializationInfo(
-        variableName="o", variableType="Order", initializer="orders.find(id)",
-        initializerMethodCall=call("orders", "find"))],
+        variableType="Order", initializerMethodCall=call("orders", "find"))],
 )
 
 

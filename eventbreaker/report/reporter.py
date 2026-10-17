@@ -1,6 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 
+from eventbreaker.classpath.resolver import project_root
 from eventbreaker.models.consumer import ConsumerAnalysis
 from eventbreaker.diagnosis.analyzer import KIND_LABELS
 from eventbreaker.models.observation import ObservationEntry, ObservationResult, ReliabilityFinding
@@ -87,7 +88,7 @@ def generate(
         sections.append(f"**Status:** {result.status.replace('_', ' ')}  \n")
         if result.notReached:
             sections.append(
-                "**⚠ Not reached:** the listener never called "
+                "**Not reached:** the listener never called "
                 + ", ".join(f"`{t}`" for t in result.notReached)
                 + " — execution stopped earlier (a guard, branch or exception), so this scenario"
                 " neither confirms nor rules out the risk.  \n"
@@ -216,35 +217,51 @@ def generate(
     return "".join(sections)
 
 
-REPORTS_DIR = Path("eventbreaker-reports")
+REPORTS_DIR_NAME = "eventbreaker-reports"
+LATEST = "latest.md"
 
 
-def save(report: str, analysis: ConsumerAnalysis, output_dir: Path = REPORTS_DIR) -> Path:
-    """Write the report to <dir>/<Class>.<method>-<YYYYMMDD-HHMMSS>.md — never overwrites."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    base = f"{analysis.className}.{analysis.methodName}-{stamp}"
-    path = output_dir / f"{base}.md"
+def reports_dir(listener: Path) -> Path:
+    """Where a listener's reports go: <project root>/eventbreaker-reports, wherever the command is run from.
+
+    Listeners outside a Maven/Gradle project (loose copies) fall back to ./eventbreaker-reports.
+    """
+    root = project_root(listener)
+    return (root if root else Path.cwd()) / REPORTS_DIR_NAME
+
+
+def save(report: str, analysis: ConsumerAnalysis, output_dir: Path) -> Path:
+    """Write the report to <dir>/<Class>.<method>/latest.md and keep a dated copy beside it.
+
+    latest.md is always the newest run; <YYYY-MM-DD_HH-MM-SS>.md files keep the history.
+    Returns the path of latest.md.
+    """
+    folder = output_dir / f"{analysis.className}.{analysis.methodName}"
+    folder.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    dated = folder / f"{stamp}.md"
     n = 2
-    while path.exists():  # two runs in the same second
-        path = output_dir / f"{base}-{n}.md"
+    while dated.exists():  # two runs in the same second
+        dated = folder / f"{stamp}-{n}.md"
         n += 1
-    path.write_text(report, encoding="utf-8")
-    return path
+    dated.write_text(report, encoding="utf-8")
+    latest = folder / LATEST
+    latest.write_text(report, encoding="utf-8")
+    return latest
 
 
 def _call_status(obs: ObservationEntry | None, count: int, baseline: int | None) -> str:
     """Status cell: threw / missing / extra vs the fault-free baseline (or plain counts without one)."""
     parts: list[str] = []
     if obs is not None and obs.threw:
-        parts.append("⚠ threw")
+        parts.append("**threw**")
     if baseline is not None:
         if count < baseline:
-            parts.append(f"⚠ {baseline - count} missing")
+            parts.append(f"**{baseline - count} missing**")
         elif count > baseline:
-            parts.append(f"⚠ {count - baseline} extra")
+            parts.append(f"**{count - baseline} extra**")
     elif count == 0:
         parts.append("SKIPPED")
     elif count > 1:
-        parts.append(f"⚠ called {count}×")
+        parts.append(f"**called {count}×**")
     return ", ".join(parts) or "✓"

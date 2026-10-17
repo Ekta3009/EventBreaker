@@ -55,6 +55,19 @@ def find_module(listener: Path) -> Module | None:
     return None
 
 
+def project_root(listener: Path) -> Path | None:
+    """Top directory of the listener's project (Gradle settings dir, outermost Maven pom), or None."""
+    module = find_module(listener)
+    if module is None:
+        return None
+    if module.tool == "gradle":
+        return module.root
+    root = module.dir
+    while root.parent != root and any((root.parent / f).exists() for f in _MAVEN_FILES):
+        root = root.parent
+    return root
+
+
 def resolve(module: Module) -> list[Path]:
     """The module's compiled classes + dependency jars (cached until a build file changes)."""
     cache_file = _CACHE_DIR / f"{_cache_key(module)}.txt"

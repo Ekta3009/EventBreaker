@@ -1,150 +1,218 @@
+<div align="center">
+
 # EventBreaker
 
-**Break your event consumers before production does.**
+**Break your event listeners before production does.**
 
-EventBreaker is an AI-powered reliability analysis and fault-injection tool for Java event-driven applications. Point it at an event listener in your Maven or Gradle project (`@KafkaListener`, `@RabbitListener`, `@JmsListener`, `@SqsListener`, `@EventListener`, Guava `@Subscribe`, …) and it automatically identifies reliability risks, proves them with real JVM execution, and generates grounded fix recommendations — all in a single command.
+AI-planned, measurement-backed reliability testing for Java event listeners.
 
-Built for the **Nebius × NVIDIA Global AI Hackathon 2026**.
+![Python](https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white)
+![Java](https://img.shields.io/badge/java-21%2B-E76F00?logo=openjdk&logoColor=white)
+![NVIDIA Nemotron](https://img.shields.io/badge/NVIDIA-Nemotron-76B900?logo=nvidia&logoColor=white)
+![Nebius](https://img.shields.io/badge/Nebius-Token%20Factory%20%2B%20Sandbox-0B5FFF)
+![License: MIT](https://img.shields.io/badge/license-MIT-yellow)
+
+[Overview](#overview) · [Architecture](#architecture) · [Design decisions](#design-decisions) ·
+[Example](#example-input-and-output) · [Getting started](#getting-started) · [Usage](#usage) ·
+[Tech stack](#tech-stack) · [Evaluation](#evaluation)
+
+![EventBreaker findings for Apache Fineract's Kafka listener](docs/images/terminal-findings.png)
+
+</div>
 
 ---
 
-## The Problem
+## Overview
 
-Event-driven systems using Kafka, SQS, RabbitMQ, or similar brokers deliver events **at least once**. That guarantee is one of the most common sources of silent production bugs:
+Message brokers deliver events **at least once**. Sooner or later, every listener receives the same event twice, two
+copies at the same moment, or a dependency that fails halfway through. The bugs this causes are silent: a payment
+captured twice, a failure logged and swallowed while the offset is still acknowledged, a counter update lost to a race.
 
-- The same payment gets charged twice because the consumer was never tested for duplicate delivery
-- An inventory reservation fires on every retry with no deduplication check
-- An order is saved multiple times while a downstream publish silently fails — data is inconsistent and no exception was raised
+EventBreaker finds these bugs in your existing code, with no annotations or test code to write:
 
-These bugs are invisible in unit tests, hard to reproduce locally, and expensive in production. EventBreaker finds and proves them before you ship.
+- **Plans** the tests with NVIDIA Nemotron, which reads the listener and picks the scenarios worth trying.
+- **Runs your real compiled class** on your module's real classpath, with every dependency replaced by a recording fake.
+- **Measures** each scenario against a fault-free baseline run.
+- **Reports** only what it measured, with the evidence, a severity set by fixed rules, and a suggested fix.
+
+Supported listeners: `@KafkaListener`, `@RabbitListener` / `@RabbitHandler`, `@JmsListener`, `@SqsListener`,
+`@StreamListener`, Spring `@EventListener` / `@TransactionalEventListener`, Guava / Kill Bill `@Subscribe`.
 
 ---
 
-## How It Works
+## Architecture
 
+```mermaid
+flowchart LR
+    IN["Listener source<br/>+ Maven / Gradle module"]:::input
+
+    subgraph S1["1 · Understand"]
+        direction TB
+        SA["Static analyzer<br/><i>JavaParser</i><br/>dependencies, calls, order"]:::code
+        CP["Classpath resolver<br/><i>mvn / gradle</i><br/>real classes + jars"]:::code
+    end
+
+    subgraph S2["2 · Plan"]
+        direction TB
+        RI["Risk identification<br/><b>Nemotron Ultra</b><br/>fills a fixed TestConfig"]:::llm
+        CV["Coverage<br/><i>code</i><br/>a failure test per<br/>dependency call"]:::code
+        PS["Path setup<br/><b>Nemotron Super</b><br/>fake return values<br/>to reach the risky call"]:::llm
+        RI --> CV --> PS
+    end
+
+    subgraph S3["3 · Execute"]
+        direction TB
+        HG["Harness generator<br/><i>code</i><br/>TestConfig → Java"]:::code
+        RUN["Real listener class<br/>baseline run +<br/>scenario run<br/><i>Nebius sandbox</i>"]:::exec
+        HG --> RUN
+    end
+
+    subgraph S4["4 · Diagnose"]
+        direction TB
+        LB["Call labels<br/><b>Nemotron Super</b><br/>majority of 3–5 votes"]:::llm
+        RB["Severity rubric<br/><i>code</i><br/>changes + labels → severity"]:::code
+        WR["Finding text + fix<br/><b>Nemotron Super</b>"]:::llm
+        RV["Review<br/><b>Nemotron Ultra</b>"]:::llm
+        LB --> RB --> WR --> RV
+    end
+
+    OUT["Markdown report<br/>findings · evidence · fixes"]:::output
+
+    IN --> S1 --> S2 --> S3 -- "changes vs baseline" --> S4 --> OUT
+    S3 -. "not reached: retry once" .-> S2
+
+    classDef input fill:#FFE066,stroke:#B8860B,color:#222
+    classDef code fill:#4DABF7,stroke:#1864AB,color:#fff
+    classDef llm fill:#76B900,stroke:#3B5D00,color:#fff
+    classDef exec fill:#FF6B6B,stroke:#C92A2A,color:#fff
+    classDef output fill:#B197FC,stroke:#5F3DC4,color:#fff
 ```
-eventbreaker analyze OrderListener.java
-         │
-         ▼
-  [Static Analyzer]             JavaParser reads the consumer AST.
-  Java JAR → ConsumerAnalysis   Extracts: dependencies, method calls,
-                                call order, event type, injection style.
-                                No LLM involved — deterministic.
-         │
-         ▼
-  [Agent 1: Risk Identifier]    NVIDIA Nemotron-3-Ultra-550B via
-  Nemotron Ultra 550B           Nebius Token Factory reasons about
-                                the consumer's specific code and returns
-                                risks WITH a structured TestConfig:
-                                callPattern + faultInjections[].
-                                The LLM decides WHAT to test.
-                                It never writes Java.
-         │
-         ▼
-  [Python Feasibility Check]    Pure Python validates TestConfig
-  No LLM — deterministic        against ConsumerAnalysis.
-                                Flags theoretical risks (no harness
-                                support) without an LLM call.
-         │
-         ▼
-  [Executor]                    Assembles a Java harness from
-  Parameter-driven assembly     ConsumerAnalysis + TestConfig.
-                                All dep/method names come from
-                                static analysis — always compiles.
-                                Runs in local JVM or Nebius Sandbox.
-         │
-         ▼
-  [Observations]                call counts per dep.method
-  Richer signal                 + call sequence (ordering)
-                                + consumerThrew (swallowing detection)
-         │
-         ▼
-  [Agent 2: Diagnostician]      NVIDIA Nemotron-3-Super-120B via
-  Nemotron Super 120B           Nebius Token Factory diagnoses
-                                observed signals — grounded in
-                                evidence, not speculation.
-         │
-         ▼
-  [Report]                      Rich terminal output
-                                + eventbreaker-report.md
+
+<sub>Green = NVIDIA Nemotron via Nebius Token Factory · Blue = deterministic code · Red = Nebius sandbox (or local JVM)</sub>
+
+### How one scenario is measured
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant EB as EventBreaker
+    participant H as Generated harness
+    participant L as Your listener (real class)
+    participant F as Fake dependencies
+
+    EB->>H: build from TestConfig (e.g. DUPLICATE, or THROW on repo.save)
+    rect rgb(220, 245, 255)
+    note over H,F: Baseline: same setup, no faults
+    H->>L: deliver event once
+    L->>F: calls (recorded)
+    end
+    rect rgb(255, 228, 228)
+    note over H,F: Scenario: duplicate / concurrent delivery or injected fault
+    H->>L: deliver event (×2, in parallel, or once with a fault)
+    L->>F: calls (recorded, faults injected)
+    F-->>L: exception / delay
+    end
+    H-->>EB: call counts, call order, what threw, did the listener throw
+    EB->>EB: changes = scenario − baseline → labels → rubric → finding
 ```
 
 ---
 
-## Why This Architecture
+## Design decisions
 
-The key insight: **the LLM should decide what to test, not how to implement the test in Java.**
-
-Previous approaches asked the LLM to generate raw Java code injected into a harness it couldn't see — producing compile errors, wrong variable names, and hallucinated Mockito API calls that required constant prompt patching.
-
-EventBreaker's vocabulary-based architecture separates concerns:
-
-| Concern | Who handles it |
-|---|---|
-| What risks exist in this consumer? | Nemotron Ultra (reasoning) |
-| How to test each risk? | Structured TestConfig vocabulary |
-| Translating TestConfig to Java? | Python executor (deterministic) |
-| What do the observations mean? | Nemotron Super (diagnosis) |
-
-The TestConfig vocabulary has three **call patterns** and three **fault types** that compose into hundreds of specific test configurations — without the LLM writing a single line of Java.
+| # | Decision | Why |
+|---|---|---|
+| 1 | **The model fills a fixed test vocabulary instead of writing Java.** A `TestConfig` is a call pattern (`SINGLE`, `DUPLICATE`, `CONCURRENT`) plus faults (`THROW`, `THROW_ONCE`, `DELAY`) on named dependency calls. | Generated harnesses always compile, model mistakes cannot reach the JVM, and every test is easy to read in the report. |
+| 2 | **Run the real class on the real classpath.** Only the listener's dependencies are faked. | The listener's own branches, catches and acknowledgement logic are what get tested, not a model's summary of them. |
+| 3 | **Every finding is a measured change against a fault-free baseline.** | No change means no finding. This removes "the code looks risky" speculation. |
+| 4 | **Models label, code decides.** Nemotron labels what each dependency call does and what it touches; a fixed rubric turns the measured changes plus those labels into severity. | Same measurements, same verdict. The severity reason is printed in every finding. |
+| 5 | **Labels are voted.** 3 votes (5 for concurrency questions), run in parallel at temperature 0.7. | A single answer can flip between runs; a majority is stable, and the vote count shows how close it was. |
+| 6 | **Code guarantees coverage.** A failure scenario is added for every dependency call the model did not already test. | Coverage does not depend on what the model happened to think of. |
+| 7 | **Two model tiers.** Nemotron Ultra handles the hard reasoning (planning, review); Nemotron Super handles the many small calls (path setup, labels, text). | Quality where it matters, speed and cost everywhere else. |
+| 8 | **Isolated execution.** Listener code runs in a Nebius sandbox; the local JVM is used for development. | Running someone else's code in a sandbox is safer. |
+| 9 | **Model answers are cached on disk.** | Re-running an unchanged listener is instant, free and gives the same result. |
 
 ---
 
-## NVIDIA + Nebius Integration
+## Example input and output
 
-| Role | Model / Service |
-|---|---|
-| Risk identification + test planning | NVIDIA Nemotron-3-Ultra-550B via Nebius Token Factory |
-| Reliability diagnosis | NVIDIA Nemotron-3-Super-120B via Nebius Token Factory |
-| Sandboxed Java execution | Nebius ConTree SDK — isolated Alpine + JDK container |
-| Inference API | Nebius Token Factory (`api.tokenfactory.nebius.com`) |
+**Input:** Apache Fineract's `KafkaRemoteMessageListener` (Apache-2.0), unchanged:
 
-**Why multiple Nemotron tiers?**
-Ultra (550B total / 55B active) is used for risk identification — it reasons about unfamiliar consumer code it has never seen and produces structured TestConfig output. Super (120B total / 12B active) handles diagnosis — faster, sufficient for interpreting structured observation data. Nano remains available for any lightweight pre-screening.
+```java
+@KafkaListener(topics = "${fineract.remote-job-message-handler.kafka.topic.name}")
+public void onMessage(@Payload ContextualMessage contextualMessage, Acknowledgment acknowledgment) {
+    try {
+        StepExecutionRequest stepExecutionRequest = inputInterceptor.beforeHandleMessage(contextualMessage);
+        stepExecutionRequestHandler.handle(stepExecutionRequest);
+    } catch (Exception e) {
+        log.error("Exception while processing Kafka message", e);
+    } finally {
+        inputInterceptor.afterHandleMessage();
+    }
+    acknowledgment.acknowledge();
+}
+```
 
-This directly follows the Nebius best practice: reach for Ultra when serious reasoning is required, let Super handle the faster everyday calls.
+```bash
+eventbreaker scan . --only KafkaRemoteMessageListener.onMessage
+```
+
+**Output, step by step:**
+
+**1. Plan:** Nemotron Ultra names the risks and turns each into a test; code adds a failure test for the one
+dependency call the model did not cover.
+
+![Risks identified by Nemotron Ultra](docs/images/terminal-risks.png)
+
+**2. Measure:** each scenario runs the real listener class; calls are counted and compared with a fault-free run.
+
+![Measured calls per scenario](docs/images/terminal-observations.png)
+
+**3. Diagnose:** the rubric sets each severity from the measured changes; Nemotron writes the explanation and fix,
+and Nemotron Ultra reviews it.
+
+![Findings with severity, evidence and fix](docs/images/terminal-findings.png)
+
+**4. Report:** everything is saved as Markdown in the tested project (`eventbreaker-reports/<Listener>/latest.md`).
+
+![Finding in the Markdown report](docs/images/report-finding.png)
 
 ---
 
-## Requirements
+## Getting started
 
-- Python 3.12+
-- Java 21+ and Maven 3.8+ (on your `PATH`)
-- A Nebius API key with access to Nebius Token Factory
-- A Nebius Project ID (optional — enables sandboxed execution via Nebius ConTree)
+### Prerequisites
 
----
+| Tool | Version | Used for |
+|---|---|---|
+| Python | 3.12+ | the CLI |
+| Java (JDK) | 21+ | building and running the test harness |
+| Maven | 3.8+ | analyzer build, harness build, Maven classpaths |
+| Nebius account | Token Factory API key | Nemotron models (and optionally the sandbox) |
 
-## Installation
+### Install
 
 ```bash
 git clone https://github.com/Ekta3009/EventBreaker
 cd EventBreaker
-
-# Build the Java static analyzer fat JAR
-mvn package -q
-
-# Install the CLI (the analyzer JAR ships inside the package)
-pipx install .          # or, for development: python -m venv .venv && .venv/bin/pip install -e .
+mvn package -q                     # builds the static analyzer JAR, packaged with the CLI
+pipx install .                     # or: python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 eventbreaker --version
 ```
 
----
-
-## Configuration
+### Configure
 
 ```bash
-cp .env.example .env
+cat > .env <<'EOF'
+NEBIUS_API_KEY=your_key_here
+# NEBIUS_PROJECT_ID=your_project_id   # optional: run listener code in a Nebius sandbox
+EOF
 ```
 
-```bash
-# .env
-NEBIUS_API_KEY=your_nebius_api_key_here
-
-# Optional — runs Java harnesses in an isolated Nebius Sandbox
-# instead of the local JVM. Strongly recommended for untrusted consumers.
-NEBIUS_PROJECT_ID=your_project_id_here
-```
+| Variable | Required | Effect |
+|---|---|---|
+| `NEBIUS_API_KEY` | yes | Nemotron Ultra + Super via Nebius Token Factory |
+| `NEBIUS_PROJECT_ID` | no | if set, listener code runs in a Nebius sandbox; if unset, on the local JVM |
 
 A `.env` in (or above) the directory you run from is loaded automatically; exported variables work too.
 
@@ -152,113 +220,137 @@ A `.env` in (or above) the directory you run from is loaded automatically; expor
 
 ## Usage
 
-```bash
-eventbreaker analyze path/to/YourConsumer.java
-```
-
-### Run it in your repo
-
-Inside your own Maven or Gradle checkout, point EventBreaker at a listener — or scan the whole repo — with no
-extra setup. For a listener in `<module>/src/main/java`, it asks that module's own build for the real classpath
-(`mvn dependency:build-classpath`, or a bundled Gradle init script run through your `./gradlew`), caches it until a
-build file changes, and runs the scenarios against your real classes. Build the module once first
-(`mvn compile`, or Gradle compiles it for you); multi-module Maven projects may need `mvn install -DskipTests`
-at the root. Reports land in `./eventbreaker-reports/`.
+Build the module that contains the listener once (`mvn compile`; multi-module Maven projects may need
+`mvn install -DskipTests` at the root; Gradle compiles it for you). EventBreaker then asks that module's own build
+for the classpath and caches it until a build file changes.
 
 ```bash
-cd ~/src/fineract
-eventbreaker scan .                                                   # list every listener method
-eventbreaker scan . --only LoginAttemptEventListener.onAuthenticationFailure
+cd ~/src/your-service
+
+eventbreaker scan .                                       # list every listener method in the repo
+eventbreaker scan . --only OrderListener.onOrderPlaced    # analyze one listener method
+eventbreaker scan . --only 1,3                            # ... or pick by number from the list
+eventbreaker scan . --all                                 # ... or all of them
 eventbreaker analyze path/to/OrderListener.java --method onOrderPlaced
 ```
 
-`--classpath a.jar:b.jar` (or `--classpath @cp.txt`) overrides the detected classpath.
-
-### Example
-
-```bash
-cd ~/fineract-1.15.0
-eventbreaker scan . --only LoginAttemptEventListener.onAuthenticationFailure
-```
-
-**Pipeline steps:**
-
-1. Static analysis — extracts consumer structure (no LLM, instant)
-2. Risk identification — Nemotron Ultra identifies risks + TestConfig for each
-3. Feasibility check — Python validates TestConfig against analysis (no LLM, instant)
-4. Execution — harness assembled from TestConfig, built with Maven, run in JVM or sandbox
-5. Diagnosis — Nemotron Super interprets observations and produces grounded findings
-6. Report — saved to `eventbreaker-report.md`
-
----
-
-## What It Detects
-
-EventBreaker identifies risks specific to each consumer's code — not from a fixed checklist. Example scenarios Nemotron has identified in practice:
-
-| Scenario type | What it proves |
+| Option | Meaning |
 |---|---|
-| `IDEMPOTENCY_VIOLATION` | All dep methods called 2× on duplicate delivery — double charging, double publishing |
-| `PARTIAL_PROCESSING` | Make dep X throw → observe which downstream deps were skipped entirely |
-| `SILENT_DATA_LOSS` | Make a terminal dep throw → check if consumer propagates or swallows |
-| `DOWNSTREAM_FAILURE` | Inject fault mid-execution → observe partial commit + skipped steps |
-| `RACE_CONDITION` | Two threads deliver simultaneously → observe interleaved execution counts |
-| `MISSING_TRANSACTION_BOUNDARY` | Observe call ordering — is begin always followed by commit? |
+| `--only` | listener methods to analyze, by number or `Class.method` |
+| `--all` | analyze every listener found |
+| `--method` | (`analyze`) which method of the class, if it has several listeners |
+| `--classpath a.jar:b.jar` / `@cp.txt` | use this classpath instead of detecting it |
+| `--fresh` | ignore cached model answers and ask again |
 
-Risks that require return-value control (null checks, specific values) or real infrastructure (network partitions, OS faults) are correctly classified as **theoretical** with a clear explanation — not silently skipped.
+Reports are written to the tested project, wherever you run the command from:
 
----
+```
+<your project>/eventbreaker-reports/
+└── OrderListener.onOrderPlaced/
+    ├── latest.md                  ← always the newest run
+    └── 2026-10-17_14-06-23.md     ← earlier runs, kept
+```
 
-## Consumer Compatibility
+The full path is printed at the end of each run.
 
-EventBreaker runs the listener against its project's real compiled classes and dependency jars, so there is
-nothing to annotate or stub. The module must be built first (`mvn compile`, or Gradle builds it for you).
+![Listener methods found by eventbreaker scan](docs/images/scan-list.png)
 
-| Pattern | Supported |
+### What it tests
+
+| Scenario | What is measured | Typical bug found |
+|---|---|---|
+| Duplicate delivery | the same event delivered twice | double charge, duplicate message sent |
+| Concurrent delivery | two copies delivered in parallel | lost update, broken lockout counter |
+| Dependency failure | a dependency call throws (once, or every time) | failure swallowed and acknowledged, work lost |
+| Slow dependency | a dependency call is delayed, so concurrent copies overlap | widens the window for race conditions |
+
+### Severity rules
+
+| Measured situation | Severity |
 |---|---|
-| Constructor injection | ✅ |
-| Field injection (Spring `@Autowired` style) | ✅ via reflection |
-| Package-private fields | ✅ via `setAccessible` |
-| 4+ dependencies | ✅ |
-| Generic typed dependencies (`Repository<Product>`) | ✅ |
-| Final classes, records, Lombok-generated code | ✅ (inline mock maker, project's own compiled class) |
-| Extra listener parameters (Kafka `Acknowledgment`) | ✅ recorded like dependencies |
-| Conditional logic, early returns, casts | ✅ via path setup (Nemotron Super picks fake return values) |
-| Safe / idempotent consumers | ✅ correctly reported as no risk |
+| A dependency failed, the listener swallowed it, and a write went missing or failed | **HIGH** (work silently lost) |
+| A dependency failed after a side effect completed, and the listener threw | **HIGH** for brokers (redelivery repeats it), else **MEDIUM** |
+| A duplicate repeated a side effect on money, security or an external message | **HIGH** (**MEDIUM** for other side effects, **LOW** in-process) |
+| A duplicate repeated only a refresh | **LOW** |
+| Concurrent runs can interfere on calls that ran | **HIGH** for money / security, else **MEDIUM** |
+| Only reads or idempotent writes changed | no finding (listed as harmless) |
 
 ---
 
-## Project Structure
+## Tech stack
 
-```
-EventBreaker/
-├── src/main/java/com/eventbreaker/
-│   └── analyzer/                      JavaParser-based static analyzer (fat JAR built by mvn package)
-├── src/test/resources/
-│   ├── real-world/                    Kill Bill + Fineract listeners, expected risks, run inventory
-│   └── analyzer/                      Parser test inputs
-├── eventbreaker/                      Python package
-│   ├── cli/main.py                    Typer CLI — 6-step pipeline
-│   ├── analyzer/bridge.py             Java JAR → Python bridge (JAR shipped as package data)
-│   ├── classpath/resolver.py          Auto classpath from the listener's Maven/Gradle module
-│   ├── agent/nemotron.py              Nemotron Ultra risk identification + TestConfig
-│   ├── agent/path_setup.py            Nemotron Super path setup (fake return values)
-│   ├── scenarios/
-│   │   ├── models.py                  ChaosScenario, TestConfig, FaultInjection
-│   │   ├── executor.py                Parameter-driven Java harness assembly + Maven build
-│   │   └── experiment.py              Pure Python feasibility validator
-│   ├── sandbox/executor.py            Nebius ConTree SDK wrapper
-│   ├── diagnosis/analyzer.py          Nemotron Super diagnosis
-│   ├── report/reporter.py             Markdown report generator
-│   └── models/                        Pydantic models
-│       ├── consumer.py                ConsumerAnalysis + sub-models
-│       └── observation.py             ObservationEntry, ObservationResult, ReliabilityFinding
-├── .env.example                       Environment variable template
-└── pyproject.toml                     Python package config + dependencies
-```
+| Layer | Technology |
+|---|---|
+| AI models | NVIDIA **Nemotron-3-Ultra-550B** (planning, review) and **Nemotron-3-Super-120B** (path setup, labels, text) |
+| Inference | **Nebius Token Factory** (OpenAI-compatible API) |
+| Isolated execution | **Nebius sandbox** via ConTree SDK (Alpine + OpenJDK 21) |
+| Static analysis | Java 21, JavaParser, Jackson (packaged as one JAR) |
+| Test execution | Mockito 5 (inline mock maker), Maven; classpath from Maven or Gradle |
+| CLI | Python 3.12+, Typer, Rich, Pydantic v2, OpenAI SDK |
+| Tests | pytest, JUnit 5 |
 
 ---
 
-## Hackathon Track
+## Evaluation
 
-**Coding and Agentic Engineering** — a developer tool that uses multiple NVIDIA Nemotron agents to write, execute, and diagnose reliability tests for Java event consumers, powered end-to-end by Nebius Token Factory.
+EventBreaker was run on unchanged listeners from three open-source products: Apache Fineract (core banking),
+Kill Bill (subscription billing) and Eclipse hawkbit (IoT device updates). Before each run, the expected risks were written
+down by hand, including negative controls where a finding would be a false positive. A risk counts only if a run
+measured it.
+
+| | Tuning set | Unseen set |
+|---|---|---|
+| Products · transports | Fineract, Kill Bill · Kafka, Spring events, Kill Bill bus | Kill Bill, hawkbit · Kill Bill bus, RabbitMQ |
+| Listener methods | 9 | 11 |
+| Expected risks found | 10 / 14 (7 at the expected severity, 3 rated higher) | 0 detectable (risky line not reached) |
+| False positives | 0 | 1 |
+| Negative controls held | 3 / 3 | 4 / 4 |
+| Same result when every model answer is re-asked | 7 / 9 listeners | n/a |
+
+The tuning set is where prompts and rules were developed; the unseen set was never used for tuning. On unseen code
+the *judgement* held: where a run reached the risky line, the verdict matched the expectation in every case but one.
+What did not carry over is *reach*, i.e. driving unfamiliar code to the risky line (see Limitations).
+
+Examples of measured findings (tuning set):
+
+- **Fineract `KafkaRemoteMessageListener` (HIGH):** a failed batch step is logged and swallowed, and the Kafka
+  offset is still acknowledged. The work is lost and never redelivered.
+- **Fineract `LoginAttemptEventListener` (HIGH):** two simultaneous failed logins read the same counter and both
+  write it back. One attempt is lost, which weakens the account lockout.
+- **Kill Bill `OverdueListener` (HIGH):** if looking up parent/child accounts fails, the error is swallowed and
+  those accounts' overdue state is never refreshed.
+
+### Limitations
+
+- The run must **reach** the risky line. Code that needs list values, event subtypes, checked exceptions or generic
+  registries can stop early; the report then says "not reached" instead of guessing.
+- Each listener method is analyzed on its own; bugs that span several methods are out of scope.
+- Dependencies are faked, so EventBreaker tests the listener's own handling, not the database or broker.
+
+---
+
+## Project structure
+
+```
+eventbreaker/
+├── cli/main.py               analyze / scan commands, pipeline
+├── analyzer/bridge.py        calls the Java static analyzer (src/main/java/com/eventbreaker/analyzer)
+├── classpath/resolver.py     classpath from the listener's Maven / Gradle module
+├── agent/                    nemotron.py (risks) · path_setup.py · llm.py · usage.py (token log)
+├── scenarios/                models.py (TestConfig) · coverage.py · executor.py (harness) · experiment.py
+├── sandbox/executor.py       Nebius sandbox run
+├── diagnosis/                classify.py (voted labels) · rubric.py (severity) · analyzer.py · reviewer.py
+└── report/reporter.py        Markdown report
+src/test/resources/real-world/  listeners used for evaluation + EXPECTED / RESULTS
+tests/                          pytest suite (run with `pytest`)
+```
+
+## License
+
+[MIT](LICENSE). Listener sources under `src/test/resources/real-world/` keep their original licenses (Apache-2.0).
+
+## Acknowledgements
+
+Built for the **Nebius × NVIDIA Global AI Hackathon 2026**. Evaluation listeners from
+[Apache Fineract](https://github.com/apache/fineract), [Kill Bill](https://github.com/killbill/killbill) and
+[Eclipse hawkbit](https://github.com/eclipse-hawkbit/hawkbit).

@@ -60,15 +60,6 @@
                     </execution>
                 </executions>
             </plugin>
-
-            <plugin>
-                <groupId>org.codehaus.mojo</groupId>
-                <artifactId>exec-maven-plugin</artifactId>
-                <version>3.2.0</version>
-                <configuration>
-                    <mainClass>com.eventbreaker.analyzer.AnalyzerMain</mainClass>
-                </configuration>
-            </plugin>
         </plugins>
     </build>
 

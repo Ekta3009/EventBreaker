@@ -149,9 +149,14 @@ class TestGeneratedHarness:
         assert '__ebDeps.put("acknowledgment", acknowledgment);' in src
         assert '"onMessage", event, acknowledgment)' in src
 
-    def test_event_boolean_getters_return_true(self, analyze):
+    def test_event_booleans_come_from_the_default_answer(self, analyze):
+        # No hard-coded when(event.isX()) stubs: they would override a path setup's "event.isX → false".
         src = harness(analyze("ConditionalConsumer"), "ConditionalConsumer")
-        assert re.search(r"when\(event\.is\w+\(\)\)\.thenReturn\(true\);", src)
+        assert not re.search(r"when\(event\.", src)
+        from eventbreaker.scenarios.executor import _INSTANTIATE_HELPER as helper
+        # The fakes' default answer: a path-setup value first, then true for booleans.
+        assert helper.index("if (RETURNS.containsKey(path)) return convert(") < helper.index(
+            "if (rt == boolean.class || rt == Boolean.class) return true;")
 
 
 # ── Output parsing ───────────────────────────────────────────────────────────

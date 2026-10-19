@@ -12,7 +12,10 @@ from pathlib import Path
 from eventbreaker.classpath.resolver import project_root
 from eventbreaker.models.consumer import ConsumerAnalysis, DependencyInfo
 from eventbreaker.models.observation import ObservationEntry, ObservationResult
-from eventbreaker.sandbox.executor import SandboxExecutor
+from eventbreaker.sandbox.executor import BYTEBUDDY_ANY_JAVA as _BYTEBUDDY_ANY_JAVA, SandboxExecutor
+
+# Local runs get the same limit as a sandbox run.
+LOCAL_TIMEOUT_SECONDS = 180
 from eventbreaker.scenarios.models import ChaosScenario, TestConfig
 
 
@@ -141,8 +144,7 @@ CONSUMER_INSTANTIATION
         // ── Create the event ───────────────────────────────────────────────
         // Numeric getters return 1 and boolean getters return true, so guard
         // clauses like `if (event.getAmount() <= 0) return;` don't short-circuit.
-        EVENT_CLASS event = (EVENT_CLASS) mock(eventbreaker.generated.__EBInstantiate.typeFor(EVENT_RAW.class, "event"),
-            eventbreaker.generated.__EBInstantiate.settings(EVENT_RAW.class, "event"));
+EVENT_DECLARATION
 
         // ── Reset counters — exclude stubbing-phase invocations ────────────
         // when(...).thenReturn(...) triggers one invocation on the stub target.
@@ -216,6 +218,11 @@ DEP_MAP_ENTRIES
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+
+# A value-typed event (event_is_value) is declared with the plain values instead, after the overrides.
+_EVENT_MOCK = """\
+        EVENT_CLASS event = (EVENT_CLASS) mock(eventbreaker.generated.__EBInstantiate.typeFor(EVENT_RAW.class, "event"),
+            eventbreaker.generated.__EBInstantiate.settings(EVENT_RAW.class, "event"));"""
 
 _INSTANTIATE_HELPER = """\
 package eventbreaker.generated;
@@ -1115,16 +1122,32 @@ class ScenarioExecutor:
                     executionError=f"Sandbox execution failed: {e}",
                 )
         else:
-            run = subprocess.run(
-                ["java", "-cp", os.pathsep.join([str(jar), *map(str, self.classpath)]),
-                 "eventbreaker.generated.EventBreakerExecution"],
-                capture_output=True,
-                text=True,
-                cwd=project_dir,
-            )
-            output = run.stdout + "\n" + run.stderr
+            output = _run_local(jar, self.classpath, project_dir)
+            if output is None:
+                # Same limit as the sandbox: a listener that blocks (e.g. real startup code on fakes) is an error.
+                return ObservationResult(
+                    scenario=scenario.scenarioType,
+                    status="ERROR",
+                    executionError=f"The listener did not finish within {LOCAL_TIMEOUT_SECONDS}s (it blocked).",
+                )
 
         return _parse_output(output, scenario)
+
+
+def _run_local(jar: Path, classpath: list[Path], project_dir: Path) -> str | None:
+    """Run the harness on the local JVM; its output, or None when it exceeds LOCAL_TIMEOUT_SECONDS."""
+    try:
+        run = subprocess.run(
+            ["java", _BYTEBUDDY_ANY_JAVA, "-cp", os.pathsep.join([str(jar), *map(str, classpath)]),
+             "eventbreaker.generated.EventBreakerExecution"],
+            capture_output=True,
+            text=True,
+            cwd=project_dir,
+            timeout=LOCAL_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    return run.stdout + "\n" + run.stderr
 
 
 # ── Code generator ────────────────────────────────────────────────────────────
@@ -1205,6 +1228,10 @@ def _generate_execution(
         f'eventbreaker.generated.__EBInstantiate.param("{p.name}", {p.type.strip()}.class);'
         for p in extra_params if _is_value_param(p)
     ]
+    if event_is_value(analysis):
+        etype = analysis.eventType.split("<")[0].strip()
+        value_param_lines.insert(0, f"        {etype} event = ({_BOXED.get(etype, etype)}) "
+                                    f'eventbreaker.generated.__EBInstantiate.param("event", {etype}.class);')
     for d in recorders:
         dtype = d.type.split("<")[0].strip()
         mock_decl_lines.append(
@@ -1276,6 +1303,7 @@ def _generate_execution(
         .replace("EXTRA_IMPORTS", extra_imports)
         .replace("MOCK_DECLARATIONS", mock_declarations)
         .replace("CONSUMER_INSTANTIATION", consumer_instantiation)
+        .replace("EVENT_DECLARATION", "" if event_is_value(analysis) else _EVENT_MOCK)
         .replace("EVENT_CLASS", analysis.eventType)
         .replace("EVENT_RAW", analysis.eventType.split("<")[0].strip())
         .replace("DEP_MAP_ENTRIES", dep_map_entries)
@@ -1423,7 +1451,8 @@ def inherited_source(consumer_file: Path, max_chars: int = 12000) -> str:
 
 def value_params(analysis: ConsumerAnalysis) -> list[DependencyInfo]:
     """Plain-value listener parameters (e.g. hawkbit's @Header String type), settable as "param.<name>"."""
-    return [p for p in _listener_arguments(analysis)[0] if _is_value_param(p)]
+    event = [DependencyInfo(name="event", type=analysis.eventType.strip())] if event_is_value(analysis) else []
+    return event + [p for p in _listener_arguments(analysis)[0] if _is_value_param(p)]
 
 
 _REAL_STATE_TYPES = {
@@ -1452,6 +1481,13 @@ def _is_value_param(p: DependencyInfo) -> bool:
     return p.type.strip() in _VALUE_PARAM_TYPES
 
 
+def event_is_value(analysis: ConsumerAnalysis) -> bool:
+    """The event itself is a plain value (a Kafka `String` / `byte[]` payload): Mockito cannot fake it, so the
+    harness passes a value instead, settable by path setup as "param.event"."""
+    raw = analysis.eventType.split("<")[0].strip()
+    return raw in _VALUE_PARAM_TYPES or raw == "byte[]"
+
+
 def _listener_arguments(analysis: ConsumerAnalysis) -> tuple[list[DependencyInfo], str]:
     """Non-event listener parameters, and the call's argument list.
 
@@ -1460,6 +1496,8 @@ def _listener_arguments(analysis: ConsumerAnalysis) -> tuple[list[DependencyInfo
     parameter is named after itself (prefixed if it clashes with a field). Plain values
     (_is_value_param) become values, everything else a recorder fake.
     """
+    if not analysis.parameters:  # `@EventListener(X.class) void m()`: called with no arguments
+        return [], ""
     taken = {d.name for d in analysis.dependencies} | {"event", "consumer"}
     extra: list[DependencyInfo] = []
     args: list[str] = []
@@ -1529,8 +1567,8 @@ def _qualify(type_name: str, consumer_file: Path) -> str:
 
 def _consumer_call(analysis: ConsumerAnalysis, call_args: str) -> str:
     """The Java expression that invokes the listener method once (reflectively: it may be package-private)."""
-    return (f'eventbreaker.generated.__EBInstantiate.call(__ebConsumer, "{analysis.methodName}", '
-            f"{call_args})")
+    args = f", {call_args}" if call_args else ""
+    return f'eventbreaker.generated.__EBInstantiate.call(__ebConsumer, "{analysis.methodName}"{args})'
 
 
 def _build_call_pattern(
@@ -1618,11 +1656,10 @@ def _parse_output(output: str, scenario: ChaosScenario) -> ObservationResult:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _read_package(java_file: Path) -> str | None:
-    for line in java_file.read_text(errors="replace").splitlines()[:20]:
-        m = re.match(r"^\s*package\s+([\w.]+)\s*;", line)
-        if m:
-            return m.group(1)
-    return None
+    """The file's package. Licence headers can be any length (DHIS2: 29 lines), so comments are skipped, not counted."""
+    source = re.sub(r"/\*.*?\*/|//[^\n]*", " ", java_file.read_text(errors="replace"), flags=re.S)
+    m = re.search(r"^\s*package\s+([\w.]+)\s*;", source, flags=re.M)
+    return m.group(1) if m else None
 
 
 def _extract_build_error(output: str) -> str:

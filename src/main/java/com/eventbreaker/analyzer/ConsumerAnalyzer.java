@@ -15,7 +15,12 @@ import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.AnnotationExpr;
+import com.github.javaparser.ast.expr.ArrayInitializerExpr;
 import com.github.javaparser.ast.expr.AssignExpr;
+import com.github.javaparser.ast.expr.ClassExpr;
+import com.github.javaparser.ast.expr.Expression;
+import com.github.javaparser.ast.expr.NormalAnnotationExpr;
+import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
@@ -30,6 +35,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Optional;
 import java.util.Set;
 
 public class ConsumerAnalyzer {
@@ -225,6 +231,14 @@ public class ConsumerAnalyzer {
 
     private String extractEventType(MethodDeclaration method) {
 
+        // No parameter: `@EventListener(SomeEvent.class) void m()` — the event type is in the annotation.
+        // Without one there is no event at all (a lifecycle hook), which the caller skips.
+        if (method.getParameters().isEmpty()) {
+            return annotatedEventClass(method).orElseThrow(() ->
+                    new IllegalArgumentException(
+                            "Listener method " + method.getNameAsString() + " has no event parameter"));
+        }
+
         // The event is the @Payload parameter, else the first
         // parameter that is not framework-supplied (ack, channel, @Header ...).
         Parameter eventParam =
@@ -244,6 +258,32 @@ public class ConsumerAnalyzer {
                         );
 
         return unwrapPayloadType(eventParam.getType());
+    }
+
+    /** First class literal in the listener annotation's value / classes: X.class, {X.class, Y.class}, classes = X.class. */
+    private static Optional<String> annotatedEventClass(MethodDeclaration method) {
+        for (AnnotationExpr a : method.getAnnotations()) {
+            if (!LISTENER_ANNOTATIONS.contains(simpleName(a))) {
+                continue;
+            }
+            List<Expression> values = new ArrayList<>();
+            if (a instanceof SingleMemberAnnotationExpr single) {
+                values.add(single.getMemberValue());
+            } else if (a instanceof NormalAnnotationExpr normal) {
+                normal.getPairs().stream()
+                        .filter(p -> p.getNameAsString().equals("value") || p.getNameAsString().equals("classes"))
+                        .forEach(p -> values.add(p.getValue()));
+            }
+            for (Expression v : values) {
+                List<Expression> items = v instanceof ArrayInitializerExpr arr ? arr.getValues() : List.of(v);
+                for (Expression item : items) {
+                    if (item instanceof ClassExpr c) {
+                        return Optional.of(c.getType().asString());
+                    }
+                }
+            }
+        }
+        return Optional.empty();
     }
 
     private boolean isFrameworkParam(Parameter param) {

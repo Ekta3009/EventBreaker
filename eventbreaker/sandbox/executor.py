@@ -22,6 +22,10 @@ _JAR_PATH = "/app/eventbreaker.jar"
 # Total sandbox timeout: ~30s to install JRE + a few seconds to run the JAR.
 _TIMEOUT_SECONDS = 180
 
+# Mockito's bundled Byte Buddy refuses class files newer than the Java versions it knows (e.g. a Java 25 project);
+# this documented switch lets it instrument them. It changes nothing for older class files.
+BYTEBUDDY_ANY_JAVA = "-Dnet.bytebuddy.experimental=true"
+
 # Per-HTTP-request timeout. The SDK default (10s) is too short to upload
 # an execution JAR (~9 MB) on an ordinary home connection.
 _TRANSPORT_TIMEOUT_SECONDS = 120.0
@@ -38,7 +42,7 @@ class SandboxExecutor:
         return sandbox.run(
             shell=(
                 f"apk add --no-cache {package} >/dev/null 2>&1 "
-                f"&& java -jar {_JAR_PATH}"
+                f"&& java {BYTEBUDDY_ANY_JAVA} -jar {_JAR_PATH}"
             ),
             files={_JAR_PATH: jar_path},
             timeout=_TIMEOUT_SECONDS,

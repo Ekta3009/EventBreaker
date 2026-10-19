@@ -190,7 +190,10 @@ def _prompt(
     params = value_params(analysis)
     param_lines = (
         "Other listener parameters (plain values; set one with target \"param.<name>\", default as for fakes):\n"
-        + "\n".join(f"  param.{p.name}: {p.type}" for p in params) + "\n"
+        + "\n".join(f"  param.{p.name}: {p.type}"
+                    + (" (the message payload itself: give the text the listener parses, e.g. its JSON)"
+                       if p.name == "event" else "")
+                    for p in params) + "\n"
     ) if params else ""
     statics = [f.rsplit(".", 1)[-1] for f in static_helpers(source_code)]
     static_lines = (

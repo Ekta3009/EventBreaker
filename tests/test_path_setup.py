@@ -95,7 +95,7 @@ HEADERS = ConsumerAnalysis(
 def test_plain_listener_parameters_are_settable_as_param_targets():
     from eventbreaker.scenarios.executor import _listener_arguments, value_params
     assert [(p.name, p.type) for p in value_params(HEADERS)] == [("type", "String"), ("tenant", "String")]
-    assert _listener_arguments(HEADERS)[1] == "event, type, tenant"
+    assert _listener_arguments(HEADERS)[1] == "event, __eb_type, __eb_tenant"
     values = _parse('[{"target": "param.type", "returns": "STRING:EVENT"}, {"target": "param.ghost.x", "returns": "1"}]',
                     HEADERS, "")
     assert ("param.type", "STRING:EVENT") in [(v.target, v.returns) for v in values]
@@ -139,3 +139,24 @@ def test_targets_written_with_arguments_are_normalised():
               {"target": "repo.find(event.getId()).getStatus()", "returns": "ENUM:ACTIVE"}]"""
     assert [v.target for v in _parse(raw, a, "class L {}")] == [
         "event.getMessageProperties.getHeaders.get", "repo.find.getStatus"]
+
+
+def test_retry_feedback_lists_exact_default_answer_names():
+    run = ObservationResult(
+        scenario="B", consumerThrew=True, consumerException="AmqpRejectAndDontRequeueException: Tenant t is soft deleted!",
+        defaultAnswers=["SystemManagementHolder.getInstance = a fake SystemManagement",
+                        "SystemManagementHolder.getInstance.isTenantSoftDeleted = true"])
+    text = reach_feedback([ReturnValue(target="SystemManagementHolder.isTenantSoftDeleted", returns="false")],
+                          run, ["controllerManagement.findOrRegisterTargetIfItDoesNotExist"])
+    assert "EXACT override target names" in text
+    assert "  SystemManagementHolder.getInstance.isTenantSoftDeleted = true" in text
+
+
+def test_merge_keeps_first_attempt_values_retry_wins():
+    from eventbreaker.agent.path_setup import merge_setups
+    first = [ReturnValue(target="param.type", returns="STRING:EVENT"),
+             ReturnValue(target="holder.isDeleted", returns="true")]
+    retry = [ReturnValue(target="holder.getInstance.isDeleted", returns="false"),
+             ReturnValue(target="holder.isDeleted", returns="false")]
+    assert [(v.target, v.returns) for v in merge_setups(first, retry)] == [
+        ("param.type", "STRING:EVENT"), ("holder.getInstance.isDeleted", "false"), ("holder.isDeleted", "false")]

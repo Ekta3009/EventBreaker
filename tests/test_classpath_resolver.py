@@ -85,3 +85,13 @@ def test_maven_overrides_project_exclude_properties(tmp_path, monkeypatch):
     monkeypatch.setattr(resolver, "_run", fake_run)
     assert resolver._maven(Module(tmp_path, "maven", tmp_path)) == [tmp_path / "target/classes", jar]
     assert "-DexcludeGroupIds=" in seen["cmd"] and "-DincludeScope=runtime" in seen["cmd"]
+
+
+def test_non_executable_wrapper_is_skipped(tmp_path):
+    from eventbreaker.classpath.resolver import _wrapper
+    w = tmp_path / "mvnw"
+    w.write_text("#!/bin/sh\n")
+    w.chmod(0o644)
+    assert _wrapper(tmp_path, "mvnw") is None      # checked in without +x → system mvn
+    w.chmod(0o755)
+    assert _wrapper(tmp_path, "mvnw") == str(w)

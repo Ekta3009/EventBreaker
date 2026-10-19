@@ -1,7 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 
-from eventbreaker.classpath.resolver import project_root
+from eventbreaker.classpath.resolver import find_module, project_root
 from eventbreaker.models.consumer import ConsumerAnalysis
 from eventbreaker.diagnosis.analyzer import KIND_LABELS
 from eventbreaker.models.observation import ObservationEntry, ObservationResult, ReliabilityFinding
@@ -110,7 +110,7 @@ def generate(
         sections.append(
             "\n**Consumer outcome:** "
             + ("threw — the failure propagates (a broker redelivers the message; an in-process "
-               "event's publisher sees the exception)"
+               "event's publisher sees the exception; a Guava event bus logs it and drops the event)"
                if result.consumerThrew else
                "completed normally — the event is treated as processed (a broker message is acknowledged)")
             + "  \n"
@@ -230,14 +230,28 @@ def reports_dir(listener: Path) -> Path:
     return (root if root else Path.cwd()) / REPORTS_DIR_NAME
 
 
-def save(report: str, analysis: ConsumerAnalysis, output_dir: Path) -> Path:
+SOURCE_MARKER = ".source"
+
+
+def save(report: str, analysis: ConsumerAnalysis, output_dir: Path, source: Path | None = None) -> Path:
     """Write the report to <dir>/<Class>.<method>/latest.md and keep a dated copy beside it.
 
     latest.md is always the newest run; <YYYY-MM-DD_HH-MM-SS>.md files keep the history.
+    When `source` is given, the folder remembers which listener file it belongs to; a different
+    file with the same Class.method (two modules of one project) gets <Class>.<method>@<module>.
     Returns the path of latest.md.
     """
-    folder = output_dir / f"{analysis.className}.{analysis.methodName}"
+    name = f"{analysis.className}.{analysis.methodName}"
+    folder = output_dir / name
+    if source is not None:
+        source = source.resolve()
+        marker = folder / SOURCE_MARKER
+        if marker.exists() and marker.read_text(encoding="utf-8").strip() != str(source):
+            module = find_module(source)
+            folder = output_dir / f"{name}@{module.dir.name if module else source.parent.name}"
     folder.mkdir(parents=True, exist_ok=True)
+    if source is not None:
+        (folder / SOURCE_MARKER).write_text(str(source), encoding="utf-8")
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     dated = folder / f"{stamp}.md"
     n = 2

@@ -148,9 +148,11 @@ def _gradle_root(module_dir: Path) -> Path:
 
 
 def _wrapper(start: Path, name: str) -> str | None:
-    """The project's own build wrapper (./gradlew, ./mvnw) at or above start."""
+    """The project's own build wrapper (./gradlew, ./mvnw) at or above start.
+
+    A wrapper checked in without the execute bit is skipped (system build tool instead)."""
     for d in (start, *start.parents):
-        if (d / name).is_file():
+        if (d / name).is_file() and os.access(d / name, os.X_OK):
             return str(d / name)
     return None
 

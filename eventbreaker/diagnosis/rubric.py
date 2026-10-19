@@ -7,14 +7,18 @@ and — for concurrent scenarios — the voted interference answer. Same inputs,
 | Situation (measured)                                                      | Severity                     |
 |---------------------------------------------------------------------------|------------------------------|
 | Failure, listener did not throw, a write / side effect went missing or failed | HIGH (work silently lost) |
+| … but the failure run made an extra write the normal run did not (retry queue, error topic, failure record) | NONE (recovery path) |
 | Failure, listener threw, a SIDE_EFFECT completed before the failure       | HIGH if broker, else MEDIUM  |
+| … but the listener is @Transactional and the exception rolls it back      | only EXTERNAL_MESSAGE side effects count (a rollback cannot unsend) |
+| Failure, listener threw on a Guava bus (logged, dropped), writes missing  | MEDIUM (work lost, not silent) |
 | Failure, listener threw, only READ / REFRESH / IDEMPOTENT_WRITE completed | NONE                         |
-| Duplicate, extra SIDE_EFFECT                                              | HIGH if MONEY/SECURITY/EXTERNAL_MESSAGE, else MEDIUM; LOW if in-process |
+| Duplicate, extra SIDE_EFFECT                                              | HIGH if MONEY/SECURITY/EXTERNAL_MESSAGE, else MEDIUM; LOW if in-process or Guava bus |
 | Duplicate, extra REFRESH (no extra SIDE_EFFECT)                           | LOW (extra work, same result)|
 | Duplicate, extra calls only READ / IDEMPOTENT_WRITE                       | NONE                         |
 | Race, the runs can interfere (on calls that actually ran)                 | HIGH if an involved call is MONEY/SECURITY, else MEDIUM |
 | Race, the voted calls never ran in this scenario                          | NONE (not measured)          |
 | Race, the runs cannot interfere                                           | NONE (repeated work is the duplicate scenario's finding) |
+| Race, Guava subscriber without @AllowConcurrentEvents                     | NONE (the bus never runs it concurrently) |
 | Changes covered by no finding                                             | listed as harmless changes   |
 """
 from dataclasses import dataclass, field
@@ -53,16 +57,19 @@ def assess(
     transport: str,
     outcome: str,
     interference: Interference | None = None,
+    serialized: bool = False,
+    transactional: str = "",
 ) -> Assessment:
     tc = scenario.testConfig
     if tc is None or not changes and not result.consumerThrew:
         return Assessment([], [c.describe() for c in changes])
     if tc.callPattern == "SINGLE" and tc.faultInjections:
-        drafts = _failure(scenario, result, changes, labels, transport)
+        drafts = _failure(scenario, result, changes, labels, transport, transactional)
     elif tc.callPattern == "DUPLICATE":
         drafts = _repeated(changes, labels, transport)
     elif tc.callPattern == "CONCURRENT":
-        drafts = _race(result, changes, labels, interference) if interference and interference.interferes else []
+        drafts = (_race(result, changes, labels, interference)
+                  if interference and interference.interferes and not serialized else [])
     else:
         drafts = []
     covered = {e for d in drafts for e in d.evidence}
@@ -75,7 +82,7 @@ def _label(labels: dict[str, Label], target: str) -> Label:
     return labels.get(target) or Label("SIDE_EFFECT", "DATA", "unclassified", "0/0")
 
 
-def _failure(scenario, result, changes, labels, transport) -> list[Draft]:
+def _failure(scenario, result, changes, labels, transport, transactional="") -> list[Draft]:
     faulted = {f"{fi.dep}.{fi.method}" for fi in scenario.testConfig.faultInjections}
     threw = [c for c in changes if c.kind == "THREW"]
     root = next((c.target for c in threw if c.target in faulted), threw[0].target if threw else changes[0].target)
@@ -85,15 +92,38 @@ def _failure(scenario, result, changes, labels, transport) -> list[Draft]:
         lost = [c for c in changes if c.kind in ("MISSING", "THREW") and _label(labels, c.target).effect in _WRITES]
         if not lost:
             return []
+        # The failure path wrote something the normal run did not (a retry queue, an error topic, a
+        # failure record): the failure is handed on, not silently lost. Only voted labels count.
+        lost_targets = {c.target for c in lost} | faulted
+        recovery = [c for c in changes if c.kind == "EXTRA" and c.target not in lost_targets
+                    and c.target in labels and labels[c.target].effect in ("SIDE_EFFECT", "IDEMPOTENT_WRITE")]
+        if recovery:
+            return []
         names = ", ".join(sorted({c.target for c in lost}))
         return [Draft("failure", "HIGH", root,
                       f"The listener did not throw, so this work was silently lost: {names}.", evidence)]
+
+    if transport == "guava-bus":
+        # The bus logs the exception and drops the event: nothing retries, so writes that did not
+        # happen are lost — visible in the log, hence MEDIUM rather than HIGH.
+        lost = [c for c in changes if c.kind in ("MISSING", "THREW") and _label(labels, c.target).effect in _WRITES]
+        if not lost:
+            return []
+        names = ", ".join(sorted({c.target for c in lost}))
+        return [Draft("failure", "MEDIUM", root,
+                      f"The listener threw; the Guava event bus logs the exception and drops the event "
+                      f"(no retry), so this work is lost: {names}.", evidence)]
 
     # The listener threw: did a side effect complete before the failure?
     seq = result.callSequence
     failed_calls = {c.target for c in threw}
     first_fail = next((i for i, call in enumerate(seq) if call in failed_calls), len(seq))
     completed = sorted({call for call in seq[:first_fail] if _label(labels, call).effect == "SIDE_EFFECT"})
+    # A @Transactional listener that throws rolls back its transactional work (Spring: RuntimeException
+    # by default, checked exceptions only with rollbackFor). Only messages already sent stay done.
+    rolled_back = transactional == "any" or (transactional == "unchecked" and not result.consumerExceptionChecked)
+    if rolled_back:
+        completed = [c for c in completed if _label(labels, c).impact == "EXTERNAL_MESSAGE"]
     if not completed:
         return []
     severity = "HIGH" if transport == "broker" else "MEDIUM"
@@ -115,7 +145,7 @@ def _repeated(changes, labels, transport) -> list[Draft]:
                       [c.describe() for c in refresh])]
     worst = min(side, key=lambda c: _IMPACT_ORDER.index(_label(labels, c.target).impact))
     impact = _label(labels, worst.target).impact
-    if transport == "in-process":
+    if transport in ("in-process", "guava-bus"):
         severity, why = "LOW", "an in-process event is not redelivered, so it only runs twice if published twice"
     elif impact in _SERIOUS_IMPACT:
         severity, why = "HIGH", f"a side effect with {impact} impact was done twice"

@@ -84,6 +84,29 @@ def test_side_effect_after_the_failure_point_does_not_count():
     assert go(sc("SINGLE", "orders.find"), r).drafts == []
 
 
+def test_thrown_failure_in_a_transaction_rolls_back_all_but_sent_messages():
+    seq = ["orders.find", "ledger.append", "mail.send", "orders.save"]
+    r = run(E(target="orders.find", callCount=1), E(target="ledger.append", callCount=1),
+            E(target="mail.send", callCount=1), E(target="orders.save", callCount=1, threw=True), threw=True, seq=seq)
+    s = sc("SINGLE", "orders.save")
+    args = (s, r, measured_changes(r, BASELINE), LABELS, "in-process", listener_outcome(r))
+    [d] = assess(*args, transactional="unchecked").drafts
+    assert "mail.send" in d.basis and "ledger.append" not in d.basis   # a rollback cannot unsend
+    quiet = run(*r.observations, threw=True, seq=seq[:2] + seq[3:])
+    assert assess(s, quiet, measured_changes(quiet, BASELINE), LABELS, "in-process",
+                  listener_outcome(quiet), transactional="unchecked").drafts == []
+
+
+def test_checked_exception_commits_unless_rollback_for_is_given():
+    r = run(E(target="orders.find", callCount=1), E(target="ledger.append", callCount=1),
+            E(target="mail.send", callCount=1, threw=True), threw=True,
+            seq=["orders.find", "ledger.append", "mail.send"])
+    r.consumerExceptionChecked = True
+    args = (sc("SINGLE", "mail.send"), r, measured_changes(r, BASELINE), LABELS, "broker", listener_outcome(r))
+    assert assess(*args, transactional="unchecked").drafts[0].severity == "HIGH"   # Spring commits
+    assert assess(*args, transactional="any").drafts == []
+
+
 # ── Duplicate delivery ───────────────────────────────────────────────────────
 
 DUP = run(E(target="orders.find", callCount=2), E(target="ledger.append", callCount=2), E(target="mail.send", callCount=2))
@@ -180,3 +203,46 @@ def test_race_keeps_only_the_voted_calls_that_ran():
     i = Interference(True, ["billing.charge", "ledger.append"], "x", "4/5")
     [d] = go(sc("CONCURRENT"), DUP, interference=i).drafts
     assert d.affectedMethod == "ledger.append" and d.severity == "HIGH"
+
+
+# ── Plain Guava event bus (no retry, logged + dropped, one call at a time) ─────
+
+def test_guava_bus_failure_that_propagates_loses_the_work_medium():
+    r = run(E(target="orders.find", callCount=1, threw=True), E(target="ledger.append", callCount=0),
+            E(target="mail.send", callCount=0), threw=True)
+    [d] = go(sc("SINGLE", "orders.find"), r, "guava-bus").drafts
+    assert (d.kind, d.severity) == ("failure", "MEDIUM")
+    assert "drops the event" in d.basis and "ledger.append" in d.basis
+    assert go(sc("SINGLE", "orders.find"), r, "broker").drafts == []    # a broker retries instead
+
+
+def test_guava_bus_duplicate_side_effect_is_low():
+    [d] = go(sc("DUPLICATE"), DUP, "guava-bus").drafts
+    assert d.severity == "LOW"
+
+
+def test_guava_subscriber_without_allow_concurrent_events_has_no_race_finding():
+    i = Interference(True, ["orders.find", "ledger.append"], "read then append", "3/3")
+    args = (sc("CONCURRENT"), DUP, measured_changes(DUP, BASELINE), LABELS, "guava-bus", listener_outcome(DUP), i)
+    assert assess(*args, serialized=True).drafts == []
+    assert assess(*args, serialized=False).drafts[0].kind == "concurrent"   # @AllowConcurrentEvents
+
+
+# ── Recovery path: the failure is handed on (retry queue / error topic), not lost ──
+
+def test_swallowed_failure_with_an_extra_write_on_the_failure_path_is_recovery():
+    labels = dict(LABELS, **{"retries.getQueue.schedule": Label("SIDE_EFFECT", "DATA")})
+    r = run(E(target="orders.find", callCount=1), E(target="ledger.append", callCount=1),
+            E(target="mail.send", callCount=1, threw=True), E(target="retries.getQueue.schedule", callCount=1))
+    a = assess(sc("SINGLE", "mail.send"), r, measured_changes(r, BASELINE), labels, "broker", listener_outcome(r))
+    assert a.drafts == [] and any("retries.getQueue.schedule" in h for h in a.harmless)
+
+
+def test_extra_read_or_unlabelled_call_on_the_failure_path_is_not_recovery():
+    labels = dict(LABELS, **{"cfg.getRetry.isEnabled": Label("READ", "MINOR")})
+    r = run(E(target="orders.find", callCount=1), E(target="ledger.append", callCount=1),
+            E(target="mail.send", callCount=1, threw=True), E(target="cfg.getRetry.isEnabled", callCount=1),
+            E(target="unknown.call", callCount=1))
+    [d] = assess(sc("SINGLE", "mail.send"), r, measured_changes(r, BASELINE), labels, "broker",
+                 listener_outcome(r)).drafts
+    assert d.severity == "HIGH"

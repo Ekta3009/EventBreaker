@@ -1,4 +1,7 @@
 import os
+import re
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import typer
@@ -17,7 +20,7 @@ from eventbreaker.analyzer.bridge import analyze, scan
 from eventbreaker.agent.nemotron import identify_risks
 from eventbreaker.classpath.resolver import ClasspathError, find_module, resolve
 from eventbreaker.agent.path_setup import (
-    deeper_setup, forget_plan, not_reached, plan_path, reach_feedback, reusable_setup, target_calls,
+    deeper_setup, forget_plan, merge_setups, not_reached, plan_path, reach_feedback, reusable_setup, target_calls,
 )
 from eventbreaker.diagnosis.analyzer import KIND_LABELS, diagnose, merge_findings
 from eventbreaker.diagnosis.classify import label_calls
@@ -141,6 +144,10 @@ def analyze_consumer(
     # --classpath wins; otherwise ask the listener's own build.
     # Resolved before any Nemotron call so a build problem costs nothing.
     jars = _parse_classpath(classpath) if classpath else _auto_classpath(file)
+    if analysis.listenerAnnotation == "Subscribe":
+        analysis.subscribeBus = "persistent" if _on_classpath(jars, _PERSISTENT_BUS) else "guava"
+        analysis.allowConcurrentEvents = _method_annotated(file, analysis.methodName, "AllowConcurrentEvents")
+    analysis.transactionalRollback = _transactional_rollback(file, analysis.methodName, analysis.className)
 
     # ── Step 2: Nemotron risk identification ──────────────────────────────────
     if not os.environ.get("NEBIUS_API_KEY"):
@@ -266,8 +273,17 @@ def analyze_consumer(
             with console.status(f"[bold green]Revising path setup: {scenario.scenarioType}..."):
                 retry = plan_path(analysis, source_code, scenario, feedback=feedback, inherited=inherited)
             if retry and retry != values:
+                first, first_missing = values, missing
                 values = retry
                 missing = missing_for(scenario, values)
+                if missing:
+                    # Retries often fix only what the feedback named and drop earlier values
+                    # (the message type, the tenant): keep the first attempt's, the retry's win.
+                    merged = merge_setups(first, retry)
+                    if merged not in (first, retry):
+                        merged_missing = missing_for(scenario, merged)
+                        if len(merged_missing) < min(len(missing), len(first_missing)):
+                            values, missing = merged, merged_missing
             if missing:
                 forget_plan(analysis, source_code, scenario, feedback, inherited)
         scenario.testConfig.returnValues = values
@@ -289,18 +305,24 @@ def analyze_consumer(
             scenario.testConfig.returnValues = values
             show_setup(scenario, values, " (deeper setup from another scenario)")
 
-    for scenario, plan in feasible:
-        targets = target_calls(scenario)
-        with console.status(
-            f"[bold green]Executing: {scenario.scenarioType} ({exec_mode})..."
-        ):
+    # Scenarios are independent runs: execute several at once, report them in order.
+    workers = max(1, int(os.environ.get("EVENTBREAKER_PARALLEL", "4")))
+    with console.status(
+        f"[bold green]Executing {len(feasible)} scenario(s), {workers} at a time ({exec_mode})..."
+    ), ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(executor.execute, scenario, analysis, file) for scenario, _ in feasible]
+        outcomes = []
+        for future in futures:
             try:
-                result = executor.execute(scenario, analysis, file)
-            except Exception as e:
-                console.print(
-                    f"[bold red]  Error executing {scenario.scenarioType}:[/bold red] {e}"
-                )
-                continue
+                outcomes.append(future.result())
+            except Exception as e:   # reported per scenario below
+                outcomes.append(e)
+
+    for (scenario, plan), result in zip(feasible, outcomes):
+        targets = target_calls(scenario)
+        if isinstance(result, Exception):
+            console.print(f"[bold red]  Error executing {scenario.scenarioType}:[/bold red] {result}")
+            continue
 
         # A run that never called the scenario's target proves nothing about it.
         if result.status == "REPRODUCED":
@@ -416,7 +438,7 @@ def analyze_consumer(
             and baselines[_setup_key(sc)].status == "REPRODUCED"
         },
     )
-    report_path = reporter.save(report_md, analysis, reporter.reports_dir(file))
+    report_path = reporter.save(report_md, analysis, reporter.reports_dir(file), source=file)
     console.print(
         f"\n[bold green]✓ Report saved →[/bold green] [yellow]{report_path}[/yellow]\n"
         f"[dim]  Open it: open -a \"IntelliJ IDEA\" \"{report_path}\"  (or any Markdown viewer)[/dim]\n"
@@ -583,6 +605,72 @@ def _auto_classpath(file: Path) -> list[Path]:
     console.print(f"[bold green]✓ Classpath:[/bold green] {len(jars)} entries from {module.tool} "
                   f"([dim]{module.dir}[/dim])\n")
     return jars
+
+
+# Kill Bill's bus persists events and retries a subscriber that throws; plain Guava does not.
+_PERSISTENT_BUS = "org/killbill/bus/api/PersistentBus.class"
+
+
+def _on_classpath(jars: list[Path], class_file: str) -> bool:
+    """True if a jar or class directory on the classpath contains this .class entry."""
+    for j in jars:
+        if j.is_dir():
+            if (j / class_file).is_file():
+                return True
+        elif j.suffix == ".jar" and zipfile.is_zipfile(j):
+            with zipfile.ZipFile(j) as z:
+                try:
+                    z.getinfo(class_file)
+                    return True
+                except KeyError:
+                    pass
+    return False
+
+
+def _method_annotated(file: Path, method: str, annotation: str) -> bool:
+    """True if a declaration of `method` in the file carries @annotation (annotations right above it)."""
+    source = re.sub(r"//[^\n]*|/\*.*?\*/", " ", file.read_text(errors="replace"), flags=re.S)
+    for m in re.finditer(rf"\b{re.escape(method)}\s*\(", source):
+        head = source[:m.start()]
+        cut = max(head.rfind(";"), head.rfind("}"), head.rfind("{"))
+        if re.search(rf"@{re.escape(annotation)}\b", head[cut + 1:]):
+            return True
+    return False
+
+
+def _annotation_heads(source: str, decl: str) -> list[str]:
+    """The modifiers + annotations right above each match of the regex `decl` (comments already stripped)."""
+    heads = []
+    for m in re.finditer(decl, source):
+        head = source[:m.start()]
+        # Annotation arguments may hold { } (rollbackFor = {A.class}): blank parenthesised text before cutting.
+        masked = head
+        for _ in range(3):
+            masked = re.sub(r"\([^()]*\)", lambda p: "(" + " " * (len(p.group()) - 2) + ")", masked)
+        cut = max(masked.rfind(";"), masked.rfind("}"), masked.rfind("{"))
+        heads.append(head[cut + 1:])
+    return heads
+
+
+def _transactional_rollback(file: Path, method: str, class_name: str) -> str:
+    """How a @Transactional on the listener method (else its class) rolls back when the listener throws.
+
+    "unchecked": Spring / Jakarta default, rolls back on RuntimeException only (a checked exception commits);
+    "any": rollbackFor / rollbackOn given (treated as covering the exception thrown);
+    "": no transaction, or propagation NOT_SUPPORTED / NEVER, or noRollbackFor / dontRollbackOn (assume no rollback).
+    """
+    source = re.sub(r"//[^\n]*|/\*.*?\*/", " ", file.read_text(errors="replace"), flags=re.S)
+    simple = class_name.rsplit(".", 1)[-1]
+    for decl in (rf"\b{re.escape(method)}\s*\(", rf"\b(class|interface)\s+{re.escape(simple)}\b"):
+        for head in _annotation_heads(source, decl):
+            m = re.search(r"@(?:[\w.]+\.)?Transactional\b(\s*\((?:[^()]|\([^()]*\))*\))?", head)
+            if not m:
+                continue
+            args = m.group(1) or ""
+            if re.search(r"NOT_SUPPORTED|NEVER|noRollbackFor|dontRollbackOn", args):
+                return ""
+            return "any" if re.search(r"rollbackFor|rollbackOn", args) else "unchecked"
+    return ""
 
 
 def _parse_classpath(value: str | None) -> list[Path]:

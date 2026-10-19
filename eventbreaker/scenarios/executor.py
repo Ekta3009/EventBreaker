@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 
@@ -140,8 +141,8 @@ CONSUMER_INSTANTIATION
         // ── Create the event ───────────────────────────────────────────────
         // Numeric getters return 1 and boolean getters return true, so guard
         // clauses like `if (event.getAmount() <= 0) return;` don't short-circuit.
-        EVENT_CLASS event = (EVENT_CLASS) mock(eventbreaker.generated.__EBInstantiate.typeFor(EVENT_CLASS.class, "event"),
-            eventbreaker.generated.__EBInstantiate.settings(EVENT_CLASS.class, "event"));
+        EVENT_CLASS event = (EVENT_CLASS) mock(eventbreaker.generated.__EBInstantiate.typeFor(EVENT_RAW.class, "event"),
+            eventbreaker.generated.__EBInstantiate.settings(EVENT_RAW.class, "event"));
 
         // ── Reset counters — exclude stubbing-phase invocations ────────────
         // when(...).thenReturn(...) triggers one invocation on the stub target.
@@ -161,6 +162,7 @@ STATIC_HELPERS
         // doThrow/doAnswer setup above fires invocation listeners — clear so
         // callSequence only contains actual scenario-time calls.
         callSequence.clear();
+        eventbreaker.generated.__EBInstantiate.startRecording(callSequence::add);
 
         // ── Execute scenario ───────────────────────────────────────────────
         AtomicBoolean consumerThrew = new AtomicBoolean(false);
@@ -188,6 +190,13 @@ DEP_MAP_ENTRIES
                 __ebObservations.add(__ebObs);
             }
         }
+        for (Map.Entry<String, AtomicInteger> __ebN : eventbreaker.generated.__EBInstantiate.NESTED.entrySet()) {
+            ObjectNode __ebObs = __ebMapper.createObjectNode();
+            __ebObs.put("target", __ebN.getKey());
+            __ebObs.put("callCount", __ebN.getValue().get());
+            __ebObs.put("threw", eventbreaker.generated.__EBInstantiate.NESTED_THREW.containsKey(__ebN.getKey()));
+            __ebObservations.add(__ebObs);
+        }
 
         ObjectNode __ebResult = __ebMapper.createObjectNode();
         __ebResult.put("scenario", "SCENARIO_TYPE");
@@ -197,6 +206,7 @@ DEP_MAP_ENTRIES
         __ebResult.set("callSequence", __ebSeq);
         __ebResult.set("observations", __ebObservations);
 
+        eventbreaker.generated.__EBInstantiate.printDefaults();
         System.out.println(
             "EVENTBREAKER_RESULT:" + __ebMapper.writeValueAsString(__ebResult)
         );
@@ -434,7 +444,80 @@ public final class __EBInstantiate {
         return inv -> answer(inv, path + "." + inv.getMethod().getName());
     }
 
+    /**
+     * path -> what a fake answered when nothing overrode it, in call order (capped). Printed after
+     * the run so a path-setup retry can name the exact target instead of guessing it from source.
+     */
+    public static final Map<String, String> DEFAULTS = java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>());
+
+    private static void recordDefault(String path, Object value) {
+        if (RETURNS.containsKey(path) || DEFAULTS.size() >= 60) return;
+        String shown;
+        if (value == null) shown = "null";
+        else if (value instanceof String str) shown = '"' + str + '"';
+        else if (value instanceof Boolean || value instanceof Number || value instanceof Enum<?>) shown = String.valueOf(value);
+        else if (value instanceof java.util.Collection<?> c) shown = "a list of " + c.size();
+        else if (value.getClass().isArray()) shown = "an array of " + java.lang.reflect.Array.getLength(value);
+        else if (value instanceof java.util.Optional<?> o) shown = o.isPresent() ? "Optional with a fake" : "empty Optional";
+        else shown = "a fake " + (Mockito.mockingDetails(value).isMock()
+                ? Mockito.mockingDetails(value).getMockCreationSettings().getTypeToMock().getSimpleName()
+                : value.getClass().getSimpleName());
+        DEFAULTS.putIfAbsent(path, shown);
+    }
+
+    public static void printDefaults() {
+        synchronized (DEFAULTS) {
+            DEFAULTS.forEach((path, value) -> System.out.println("EB_DEFAULT " + path + " = " + value));
+        }
+    }
+
     private static Object answer(InvocationOnMock inv, String path) throws Throwable {
+        boolean nested = isNested(path, inv.getMethod().getName());
+        Object value;
+        try {
+            value = answerUnrecorded(inv, path);
+        } catch (Throwable t) {
+            if (nested) recordNested(path, true);
+            throw t;
+        }
+        if (nested) recordNested(path, false);
+        if (inv.getMethod().getReturnType() != void.class) recordDefault(path, value);
+        return value;
+    }
+
+    /**
+     * Calls on fakes that a dependency returned ("queueService.getQueue.recordFuture"): counted and
+     * put in the call order like calls on the dependencies themselves, so work done through a
+     * returned object (a retry queue, a builder that sends) is observed too.
+     */
+    public static final Set<String> ROOTS = ConcurrentHashMap.newKeySet();
+
+    /** int getters of HTTP responses (java.net.http, Spring, Apache, HttpURLConnection). */
+    private static final Set<String> HTTP_STATUS_GETTERS = Set.of(
+        "statusCode", "getStatusCode", "getStatusCodeValue", "getRawStatusCode", "rawStatusCode", "getResponseCode");
+    public static final Map<String, AtomicInteger> NESTED = new ConcurrentHashMap<>();
+    public static final Map<String, AtomicInteger> NESTED_THREW = new ConcurrentHashMap<>();
+    public static volatile java.util.function.Consumer<String> SEQUENCE = s -> {};
+
+    public static void startRecording(java.util.function.Consumer<String> sequence) {
+        NESTED.clear();
+        NESTED_THREW.clear();
+        SEQUENCE = sequence;
+    }
+
+    private static boolean isNested(String path, String method) {
+        if (method.equals("toString") || method.equals("hashCode") || method.equals("equals")) return false;
+        int dot = path.indexOf('.');
+        return dot > 0 && path.indexOf('.', dot + 1) > 0 && ROOTS.contains(path.substring(0, dot));
+    }
+
+    private static void recordNested(String path, boolean threw) {
+        NESTED.computeIfAbsent(path, k -> new AtomicInteger()).incrementAndGet();
+        if (threw) NESTED_THREW.computeIfAbsent(path, k -> new AtomicInteger()).incrementAndGet();
+        SEQUENCE.accept(path);
+    }
+
+    private static Object answerUnrecorded(InvocationOnMock inv, String path) throws Throwable {
         String fault = FAULTS.get(path);
         if (fault != null) {
             int n = CALLS.computeIfAbsent(path, k -> new AtomicInteger()).incrementAndGet();
@@ -465,6 +548,8 @@ public final class __EBInstantiate {
             }
         }
         if (rt == boolean.class || rt == Boolean.class) return true;
+        // A fake HTTP response looks successful, so the fault-free run takes the normal path.
+        if ((rt == int.class || rt == Integer.class) && HTTP_STATUS_GETTERS.contains(m.getName())) return 200;
         if (rt == int.class || rt == Integer.class) return 1;
         if (rt == long.class || rt == Long.class) return 1L;
         if (rt == double.class || rt == Double.class) return 1.0;
@@ -624,12 +709,11 @@ public final class __EBInstantiate {
         Class<?> boxed = t == boolean.class ? Boolean.class : t == int.class ? Integer.class
                 : t == long.class ? Long.class : t == double.class ? Double.class : t;
         if (RETURNS.containsKey(path)) return convert(RETURNS.get(path), boxed, path);
-        if (boxed == Boolean.class) return true;
-        if (boxed == Integer.class) return 1;
-        if (boxed == Long.class) return 1L;
-        if (boxed == Double.class) return 1d;
-        if (t == java.math.BigDecimal.class) return java.math.BigDecimal.ONE;
-        return valueFor(t, path);
+        Object value = boxed == Boolean.class ? (Object) true : boxed == Integer.class ? (Object) 1
+                : boxed == Long.class ? (Object) 1L : boxed == Double.class ? (Object) 1d
+                : t == java.math.BigDecimal.class ? java.math.BigDecimal.ONE : valueFor(t, path);
+        recordDefault(path, value);
+        return value;
     }
 
     private static Object valueFor(Class<?> t, String path) {
@@ -842,6 +926,10 @@ def _classpath_dependencies(classpath: list[Path]) -> str:
     )
 
 
+_DIR_LOCKS: dict[str, threading.Lock] = {}
+_DIR_LOCKS_GUARD = threading.Lock()
+
+
 class ScenarioExecutor:
     """Builds and runs one scenario harness per call.
 
@@ -879,7 +967,15 @@ class ScenarioExecutor:
             ).encode()
         ).hexdigest()[:16]
         cache_dir = Path.home() / ".eventbreaker" / "cache" / cache_key
-        project_dir = cache_dir / "scenario"
+        # Scenarios run in parallel: two with identical code share this directory.
+        with _DIR_LOCKS_GUARD:
+            lock = _DIR_LOCKS.setdefault(cache_key, threading.Lock())
+        with lock:
+            return self._execute_in(cache_dir / "scenario", scenario, analysis, consumer_file)
+
+    def _execute_in(
+        self, project_dir: Path, scenario: ChaosScenario, analysis: ConsumerAnalysis, consumer_file: Path,
+    ) -> ObservationResult:
 
         freshly_created = not (project_dir / "pom.xml").exists()
         if freshly_created:
@@ -1067,7 +1163,7 @@ def _generate_execution(
         if imp.startswith("import ")
     }
     pkg_types: set[str] = set()
-    pkg_types.add(analysis.eventType)
+    pkg_types.add(analysis.eventType.split("<")[0].strip())
     for dep in analysis.dependencies:
         pkg_types.add(dep.type.split("<")[0].strip())
     for vi in analysis.variableInitializations:
@@ -1081,12 +1177,14 @@ def _generate_execution(
         "void", "boolean", "int", "long", "double", "float", "byte", "char",
         "String", "Integer", "Long", "Double", "Float", "Boolean", "Object",
         "List", "Map", "Set", "Collection", "Optional",
-        "Exception", "RuntimeException",
+        "Exception", "RuntimeException", "var",
     }
     extra_pkg_imports = [
         f"import {consumer_pkg}.{t};"
         for t in sorted(pkg_types)
         if t and t not in already_imported and t not in _skip and consumer_pkg
+        and (available_classes is None
+             or _import_available(f"import {consumer_pkg}.{t};", available_classes))
     ]
 
     extra_imports = "\n".join(consumer_imports + extra_pkg_imports)
@@ -1094,33 +1192,42 @@ def _generate_execution(
     # Listener parameters other than the event (e.g. Kafka's Acknowledgment)
     # get recorder fakes too, so calls on them are observed.
     extra_params, call_args = _listener_arguments(analysis)
-    recorders = list(analysis.dependencies) + [p for p in extra_params if not _is_value_param(p)]
+    # JDK atomics are the listener's own state (e.g. a coalescing flag initialised inline): a fake
+    # would answer compareAndSet with a default and change the logic, so the real field stays.
+    deps = [d for d in analysis.dependencies if not _is_real_state(d)]
+    recorders = [d for d in deps if not _is_value_param(d)] + [
+        p for p in extra_params if not _is_value_param(p)]
+    value_deps = [d for d in deps if _is_value_param(d)]
 
     mock_decl_lines = ["        Map<String, Integer> threwCounts = new LinkedHashMap<>();"]
     value_param_lines = [
-        f"        {p.type.strip()} {p.name} = ({_BOXED.get(p.type.strip(), p.type.strip())}) "
+        f"        {p.type.strip()} {_var(p.name)} = ({_BOXED.get(p.type.strip(), p.type.strip())}) "
         f'eventbreaker.generated.__EBInstantiate.param("{p.name}", {p.type.strip()}.class);'
         for p in extra_params if _is_value_param(p)
     ]
     for d in recorders:
         dtype = d.type.split("<")[0].strip()
         mock_decl_lines.append(
-            f"        {d.type} {d.name} = ({d.type}) mock(eventbreaker.generated.__EBInstantiate.typeFor({dtype}.class, \"{d.name}\"), "
+            f"        Object {_var(d.name)} = mock(eventbreaker.generated.__EBInstantiate.typeFor({dtype}.class, \"{d.name}\"), "
             f'eventbreaker.generated.__EBInstantiate.settings({dtype}.class, "{d.name}")\n'
-            f'            .invocationListeners(report -> {{\n'
-            f'                String __ebMn = ((org.mockito.invocation.Invocation) report.getInvocation()).getMethod().getName();\n'
+            f'            .invocationListeners(__ebReport -> {{\n'
+            f'                String __ebMn = ((org.mockito.invocation.Invocation) __ebReport.getInvocation()).getMethod().getName();\n'
             f'                callSequence.add("{d.name}." + __ebMn);\n'
-            f'                if (report.threwException()) threwCounts.merge("{d.name}." + __ebMn, 1, Integer::sum);\n'
+            f'                if (__ebReport.threwException()) threwCounts.merge("{d.name}." + __ebMn, 1, Integer::sum);\n'
             f"            }}));"
         )
-    mock_declarations = "\n".join(mock_decl_lines)
 
     dep_map_entries = "\n".join(
-        f'        __ebDeps.put("{d.name}", {d.name});'
+        f'        __ebDeps.put("{d.name}", {_var(d.name)});'
         for d in recorders
     )
+    if recorders:
+        mock_decl_lines.append(
+            "        eventbreaker.generated.__EBInstantiate.ROOTS.addAll(java.util.List.of("
+            + ", ".join(f'"{d.name}"' for d in recorders) + "));")
+    mock_declarations = "\n".join(mock_decl_lines)
 
-    dep_names_csv = ", ".join(d.name for d in recorders)
+    dep_names_csv = ", ".join(_var(d.name) for d in recorders)
     reset_invocations = (
         f"        threwCounts.clear();\n"
         f"        callSequence.clear();\n"
@@ -1134,12 +1241,19 @@ def _generate_execution(
     # Object + Class.forName: the consumer class may be package-private.
     fqn = f"{consumer_pkg}.{analysis.className}" if consumer_pkg else analysis.className
     lines = [
-        f"        Object consumer = "
+        f"        Object __ebConsumer = "
         f'eventbreaker.generated.__EBInstantiate.create(Class.forName("{fqn}"){ctor_names});'
     ]
+    # Value-typed fields (@Value String/Boolean/…) get a plain value like value parameters
+    # ("param.<field>"); Mockito cannot fake String or boxed types.
     lines += [
-        f'        eventbreaker.generated.__EBInstantiate.inject(consumer, "{d.name}", {d.name});'
-        for d in analysis.dependencies
+        f'        Object {_var(d.name)} = eventbreaker.generated.__EBInstantiate.param('
+        f'"{d.name}", {d.type.strip()}.class);'
+        for d in value_deps
+    ]
+    lines += [
+        f'        eventbreaker.generated.__EBInstantiate.inject(__ebConsumer, "{d.name}", {_var(d.name)});'
+        for d in deps
     ]
     consumer_instantiation = "\n".join(lines)
 
@@ -1148,7 +1262,7 @@ def _generate_execution(
         f"        try {{\n"
         f"            {_consumer_call(analysis, call_args)};\n"
         f"        }} catch (Exception __eb_ex) {{\n"
-        f"            consumerThrew.set(true);\n            System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex);\n"
+        f"            consumerThrew.set(true);\n            System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex); if (!(__eb_ex instanceof RuntimeException)) System.err.println(\"EB_CONSUMER_EXCEPTION_CHECKED\");\n"
         f"        }}"
     )
 
@@ -1163,6 +1277,7 @@ def _generate_execution(
         .replace("MOCK_DECLARATIONS", mock_declarations)
         .replace("CONSUMER_INSTANTIATION", consumer_instantiation)
         .replace("EVENT_CLASS", analysis.eventType)
+        .replace("EVENT_RAW", analysis.eventType.split("<")[0].strip())
         .replace("DEP_MAP_ENTRIES", dep_map_entries)
         .replace("RESET_INVOCATIONS", reset_invocations)
         .replace("FAULT_INJECTIONS", fault_injections)
@@ -1201,7 +1316,9 @@ def cast_targets(analysis: ConsumerAnalysis, consumer_file: Path) -> dict[str, l
     source = consumer_file.read_text(encoding="utf-8")
     code = re.sub(r'"(?:\\.|[^"\\])*"|//[^\n]*|/\*.*?\*/', " ", source, flags=re.S)
     event_name = next(
-        (p.split()[-1] for p in analysis.parameters if analysis.eventType in p.split()[:-1]), "event")
+        (p.split()[-1] for p in analysis.parameters
+         if "".join(t for t in p.split()[:-1] if t != "final" and not t.startswith("@"))
+         == analysis.eventType.replace(" ", "")), "event")
     roots = {d.name: d.name for d in analysis.dependencies}
     roots.update({name: name for _, name in constructor_params(source, analysis.className)})
     roots[event_name] = "event"
@@ -1309,6 +1426,28 @@ def value_params(analysis: ConsumerAnalysis) -> list[DependencyInfo]:
     return [p for p in _listener_arguments(analysis)[0] if _is_value_param(p)]
 
 
+_REAL_STATE_TYPES = {
+    "AtomicBoolean", "AtomicInteger", "AtomicLong", "AtomicReference", "AtomicIntegerArray",
+    "AtomicLongArray", "AtomicReferenceArray", "LongAdder", "DoubleAdder",
+    "CountDownLatch", "Semaphore", "CyclicBarrier", "Phaser",
+    "ReentrantLock", "ReentrantReadWriteLock", "StampedLock",
+}
+
+
+def _is_real_state(d: DependencyInfo) -> bool:
+    """A JDK atomic / latch / lock field: the listener's own state, kept real and never faked."""
+    raw = d.type.split("<")[0].strip()
+    for pkg in ("java.util.concurrent.atomic.", "java.util.concurrent.locks.", "java.util.concurrent."):
+        raw = raw.removeprefix(pkg)
+    return raw in _REAL_STATE_TYPES
+
+
+def _var(name: str) -> str:
+    """Java local for a listener field/parameter: prefixed so it never clashes with the harness's own
+    locals (event, consumer, report, callSequence, …) or with another listener name."""
+    return f"__eb_{name}"
+
+
 def _is_value_param(p: DependencyInfo) -> bool:
     return p.type.strip() in _VALUE_PARAM_TYPES
 
@@ -1338,7 +1477,7 @@ def _listener_arguments(analysis: ConsumerAnalysis) -> tuple[list[DependencyInfo
         name = pname if pname not in taken else f"param_{pname}"
         taken.add(name)
         extra.append(DependencyInfo(name=name, type=ptype))
-        args.append(name)
+        args.append(_var(name))
     if not event_used:  # e.g. ConsumerRecord<K, V>: not yet supported, fall back
         return [], "event"
     return extra, ", ".join(args)
@@ -1390,7 +1529,7 @@ def _qualify(type_name: str, consumer_file: Path) -> str:
 
 def _consumer_call(analysis: ConsumerAnalysis, call_args: str) -> str:
     """The Java expression that invokes the listener method once (reflectively: it may be package-private)."""
-    return (f'eventbreaker.generated.__EBInstantiate.call(consumer, "{analysis.methodName}", '
+    return (f'eventbreaker.generated.__EBInstantiate.call(__ebConsumer, "{analysis.methodName}", '
             f"{call_args})")
 
 
@@ -1404,21 +1543,21 @@ def _build_call_pattern(
             f"        try {{\n"
             f"            {call};\n"
             f"        }} catch (Exception __eb_ex) {{\n"
-            f"            consumerThrew.set(true);\n            System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex);\n"
+            f"            consumerThrew.set(true);\n            System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex); if (!(__eb_ex instanceof RuntimeException)) System.err.println(\"EB_CONSUMER_EXCEPTION_CHECKED\");\n"
             f"        }}"
         )
     if test_config.callPattern == "DUPLICATE":
         return (
-            f"        try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex); }}\n"
-            f"        try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex); }}"
+            f"        try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex); if (!(__eb_ex instanceof RuntimeException)) System.err.println(\"EB_CONSUMER_EXCEPTION_CHECKED\"); }}\n"
+            f"        try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex); if (!(__eb_ex instanceof RuntimeException)) System.err.println(\"EB_CONSUMER_EXCEPTION_CHECKED\"); }}"
         )
     if test_config.callPattern == "CONCURRENT":
         return (
             f"        Thread __eb_t1 = new Thread(() -> {{\n"
-            f"            try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex); }}\n"
+            f"            try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex); if (!(__eb_ex instanceof RuntimeException)) System.err.println(\"EB_CONSUMER_EXCEPTION_CHECKED\"); }}\n"
             f"        }});\n"
             f"        Thread __eb_t2 = new Thread(() -> {{\n"
-            f"            try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex); }}\n"
+            f"            try {{ {call}; }} catch (Exception __eb_ex) {{ consumerThrew.set(true); System.err.println(\"EB_CONSUMER_EXCEPTION \" + __eb_ex); if (!(__eb_ex instanceof RuntimeException)) System.err.println(\"EB_CONSUMER_EXCEPTION_CHECKED\"); }}\n"
             f"        }});\n"
             f"        __eb_t1.start(); __eb_t2.start();\n"
             f"        __eb_t1.join(); __eb_t2.join();"
@@ -1454,6 +1593,9 @@ def _parse_output(output: str, scenario: ChaosScenario) -> ObservationResult:
                      if l.strip().startswith("EB_CONSUMER_EXCEPTION ")),
                     None,
                 ),
+                consumerExceptionChecked="EB_CONSUMER_EXCEPTION_CHECKED" in output,
+                defaultAnswers=[l.strip()[len("EB_DEFAULT "):] for l in output.splitlines()
+                                if l.strip().startswith("EB_DEFAULT ")],
             )
 
     # The harness reports its own crash (before the listener ran, or while collecting results).

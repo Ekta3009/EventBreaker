@@ -58,3 +58,16 @@ def test_reports_go_to_the_project_root(tmp_path, monkeypatch):
     loose = tmp_path / "loose.java"
     loose.write_text("class L {}")
     assert reports_dir(loose) == elsewhere / "eventbreaker-reports"
+
+
+def test_same_class_method_in_two_modules_gets_separate_folders(tmp_path):
+    from eventbreaker.models.consumer import ConsumerAnalysis
+    from eventbreaker.report.reporter import save
+    a = ConsumerAnalysis(className="SmsNotificationListener", methodName="process", eventType="E")
+    sms, mail = tmp_path / "sms" / "L.java", tmp_path / "mail" / "L.java"
+    first = save("sms", a, tmp_path / "out", source=sms)
+    second = save("mail", a, tmp_path / "out", source=mail)
+    again = save("sms 2", a, tmp_path / "out", source=sms)
+    assert first == again and first.read_text() == "sms 2"   # same file → same folder
+    assert second != first and second.read_text() == "mail"  # other file → its own folder
+    assert second.parent.name == "SmsNotificationListener.process@mail"

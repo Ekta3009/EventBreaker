@@ -31,7 +31,9 @@ a one-element array/list of fakes for arrays and collections, and otherwise a fa
 DECLARED return type (so a cast to a concrete subclass fails with ClassCastException).
 Your job: list the minimal return-value overrides needed so that, for the given event, execution reaches the
 TARGET call. Read the source carefully: string equality checks, enum comparisons, null checks, casts to
-concrete classes, early returns.
+concrete classes, early returns. Also choose values that make the run a NORMAL, SUCCESSFUL one, before and after
+the target (e.g. an HTTP status of 200, a "success"/"active" state, "deleted"/"locked"/"cancelled" checks false),
+so a fault-free run takes the ordinary path rather than an error or fallback branch.
 Target syntax: "<dep>.<method>" for a dependency call, or a getter path starting at a dependency or "event",
 e.g. "event.getTagDefinition.getName" (method names only, no parentheses or arguments).
 Value vocabulary: true | false | <number> | STRING:<text> | ENUM:<CONSTANT_NAME> | MOCK:<ConcreteClassSimpleName> | NULL
@@ -94,6 +96,12 @@ def deeper_setup(
     return max(deeper, key=lambda vb: (len(_called(vb[1])), -len(vb[0])))[0] if deeper else None
 
 
+def merge_setups(first: list[ReturnValue], retry: list[ReturnValue]) -> list[ReturnValue]:
+    """The first attempt's overrides plus the retry's; the retry wins where both set the same target."""
+    retried = {v.target for v in retry}
+    return [v for v in first if v.target not in retried] + list(retry)
+
+
 def reach_feedback(values: list[ReturnValue], result: ObservationResult, missing: list[str]) -> str:
     """What happened with the previous setup — sent back to Nemotron for one retry."""
     tried = ", ".join(f"{v.target} → {v.returns}" for v in values) or "(no overrides)"
@@ -109,7 +117,13 @@ def reach_feedback(values: list[ReturnValue], result: ObservationResult, missing
         f"Calls that happened, in order: {calls}\n"
         f"{stop}\n"
         f"Never called: {', '.join(missing)}\n"
-        "Find what stopped execution before the target (string/enum checks on the event, null checks, "
+        + (
+            "Values the fakes answered by default, in call order, under their EXACT override target names "
+            "(override one by copying its name):\n"
+            + "\n".join(f"  {d}" for d in result.defaultAnswers) + "\n"
+            if result.defaultAnswers else ""
+        )
+        + "Find what stopped execution before the target (string/enum checks on the event, null checks, "
         "casts, early returns) and return a COMPLETE corrected list of overrides."
     )
 

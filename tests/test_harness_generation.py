@@ -74,13 +74,13 @@ class TestListenerArguments:
                              parameters=["@Payload Msg msg", "Acknowledgment ack"])
         extra, args = _listener_arguments(a)
         assert [(d.name, d.type) for d in extra] == [("ack", "Acknowledgment")]
-        assert args == "event, ack"
+        assert args == "event, __eb_ack"
 
     def test_param_named_like_a_field_is_renamed(self):
         a = ConsumerAnalysis(className="C", methodName="on", eventType="Msg",
                              dependencies=[DependencyInfo(name="ack", type="Ack")],
                              parameters=["Msg msg", "Acknowledgment ack"])
-        assert _listener_arguments(a)[1] == "event, param_ack"
+        assert _listener_arguments(a)[1] == "event, __eb_param_ack"
 
     def test_event_type_not_among_params_falls_back(self):
         a = ConsumerAnalysis(className="C", methodName="on", eventType="Msg",
@@ -90,7 +90,7 @@ class TestListenerArguments:
 
 class TestCallPatterns:
     A = ConsumerAnalysis(className="C", methodName="onEvent", eventType="Ev")
-    CALL = '__EBInstantiate.call(consumer, "onEvent", event)'
+    CALL = '__EBInstantiate.call(__ebConsumer, "onEvent", event)'
 
     def count(self, pattern):
         return _build_call_pattern(self.A, TestConfig(callPattern=pattern)).count(self.CALL)
@@ -127,15 +127,15 @@ class TestGeneratedHarness:
         assert ('__EBInstantiate.create(Class.forName('
                 '"org.killbill.billing.overdue.listener.OverdueListener"), ') in src
         assert '"asyncPoster"' in src.split("__EBInstantiate.create(")[1].split(";")[0]  # named constructor fakes
-        assert '__EBInstantiate.inject(consumer, "asyncPoster", asyncPoster);' in src
-        assert '__EBInstantiate.call(consumer, "handlePaymentInfoEvent", event)' in src
+        assert '__EBInstantiate.inject(__ebConsumer, "asyncPoster", __eb_asyncPoster);' in src
+        assert '__EBInstantiate.call(__ebConsumer, "handlePaymentInfoEvent", event)' in src
 
     def test_every_dependency_is_a_recorder(self, analyze):
         analysis = analyze("OverdueListener", "handlePaymentInfoEvent")
         src = harness(analysis, "OverdueListener")
         for d in analysis.dependencies:
             assert f'__EBInstantiate.settings({d.type.split("<")[0]}.class, "{d.name}")' in src
-            assert f'__ebDeps.put("{d.name}", {d.name});' in src
+            assert f'__ebDeps.put("{d.name}", __eb_{d.name});' in src
 
     def test_fault_and_path_setup_reach_the_harness(self, analyze):
         src = harness(analyze("OverdueListener", "handlePaymentInfoEvent"), "OverdueListener",
@@ -146,8 +146,8 @@ class TestGeneratedHarness:
 
     def test_acknowledgment_param_is_recorded_and_passed(self, analyze):
         src = harness(analyze("KafkaRemoteMessageListener"), "KafkaRemoteMessageListener")
-        assert '__ebDeps.put("acknowledgment", acknowledgment);' in src
-        assert '"onMessage", event, acknowledgment)' in src
+        assert '__ebDeps.put("acknowledgment", __eb_acknowledgment);' in src
+        assert '"onMessage", event, __eb_acknowledgment)' in src
 
     def test_event_booleans_come_from_the_default_answer(self, analyze):
         # No hard-coded when(event.isX()) stubs: they would override a path setup's "event.isX → false".
@@ -225,8 +225,8 @@ def test_plain_parameters_are_values_read_after_the_path_setup_overrides(tmp_pat
     tc = TestConfig(callPattern="SINGLE", returnValues=[ReturnValue(target="param.type", returns="STRING:EVENT")])
     src = _generate_execution(analysis, src_file, tc, "TEST")
     put = src.index('RETURNS.put("param.type", "STRING:EVENT");')
-    read = src.index('String type = (String) eventbreaker.generated.__EBInstantiate.param("type", String.class);')
-    assert put < read < src.index('"onMessage", event, type)')
+    read = src.index('String __eb_type = (String) eventbreaker.generated.__EBInstantiate.param("type", String.class);')
+    assert put < read < src.index('"onMessage", event, __eb_type)')
     assert 'mock(String.class' not in src and '__ebDeps.put("type"' not in src
 
 
@@ -346,3 +346,81 @@ def test_primitive_arrays_bytes_and_nested_classes():
     assert "if (rt.isArray()) {" in helper                                   # byte[] body: one element, not null
     assert "rt == byte[].class ? text.getBytes(" in helper                   # STRING:<json> sets a byte[] body
     assert helper.count("load(name)") == 2 and 'n.substring(0, dot) + "$"' in helper   # statics + casts
+
+
+def test_default_answers_are_printed_and_parsed():
+    from eventbreaker.scenarios.executor import _EXECUTION_TEMPLATE as t, _parse_output
+    assert t.index("printDefaults();") < t.index('"EVENTBREAKER_RESULT:"')
+    out = ('EB_DEFAULT event.getType = ""\nEB_DEFAULT repo.find = a fake Order\n'
+           'EVENTBREAKER_RESULT:{"scenario":"B","consumerThrew":false,"observations":[]}')
+    r = _parse_output(out, ChaosScenario(scenarioType="B", reason="r", expectedConcern="c"))
+    assert r.defaultAnswers == ['event.getType = ""', "repo.find = a fake Order"]
+
+
+def test_helper_has_no_accidental_java_text_blocks():
+    # A Python escape slip can turn "\"" into """ (a Java text block) and break every build.
+    from eventbreaker.scenarios.executor import _INSTANTIATE_HELPER as helper, _EXECUTION_TEMPLATE as t
+    assert '"""' not in helper and '"""' not in t
+
+
+def test_names_and_types_from_unseen_repos_compile_shape(tmp_path):
+    """Run 14 (Digit-Core, Graylog): generic event, same-package type arguments, fields named like
+    harness locals (consumer, report), a @Value String field, `var` locals, java.lang types."""
+    from eventbreaker.models.consumer import ConsumerAnalysis, DependencyInfo, VariableInitializationInfo
+    from eventbreaker.scenarios.executor import _generate_execution
+    src_file = tmp_path / "L.java"
+    src_file.write_text("package org.acme;\nimport java.util.HashMap;\nclass L {}\n")
+    analysis = ConsumerAnalysis(
+        className="L", methodName="listen", eventType="HashMap<String,Object>",
+        parameters=["final HashMap<String, Object> record"],
+        dependencies=[DependencyInfo(name="cache", type="LoadingCache<String,Optional<CertBinding>>"),
+                      DependencyInfo(name="consumer", type="KafkaConsumer<byte[],byte[]>"),
+                      DependencyInfo(name="report", type="Report"),
+                      DependencyInfo(name="subject", type="String")],
+        variableInitializations=[VariableInitializationInfo(variableType="var"),
+                                 VariableInitializationInfo(variableType="StringBuilder")],
+    )
+    available = {"org/acme/L", "org/acme/Report", "org/acme/CertBinding"}
+    src = _generate_execution(analysis, src_file, None, "TEST", available)
+    assert "import org.acme.HashMap" not in src and "HashMap<String,Object>.class" not in src
+    assert "typeFor(HashMap.class" in src
+    assert "import org.acme.var;" not in src and "import org.acme.StringBuilder;" not in src
+    assert "import org.acme.Report;" in src                               # real same-package class kept
+    assert "Object __eb_cache = mock(" in src and "Optional<CertBinding>" not in src
+    assert "Object __eb_consumer = mock(" in src and "Object __ebConsumer = " in src
+    assert "__ebReport ->" in src and "Object __eb_report = mock(" in src
+    assert 'Object __eb_subject = eventbreaker.generated.__EBInstantiate.param("subject", String.class);' in src
+    assert "mock(eventbreaker.generated.__EBInstantiate.typeFor(String.class" not in src
+
+
+def test_jdk_atomic_fields_stay_real(tmp_path):
+    """A coalescing flag (`AtomicBoolean x = new AtomicBoolean(false)`) must keep its real logic."""
+    from eventbreaker.models.consumer import ConsumerAnalysis, DependencyInfo
+    from eventbreaker.scenarios.executor import _generate_execution
+    src_file = tmp_path / "U.java"
+    src_file.write_text("package org.acme;\nclass U {}\n")
+    analysis = ConsumerAnalysis(
+        className="U", methodName="on", eventType="E",
+        dependencies=[DependencyInfo(name="scheduler", type="ScheduledExecutorService"),
+                      DependencyInfo(name="reloadScheduled", type="AtomicBoolean"),
+                      DependencyInfo(name="state", type="java.util.concurrent.atomic.AtomicReference<State>"),
+                      DependencyInfo(name="pausedLatch", type="CountDownLatch")],
+    )
+    src = _generate_execution(analysis, src_file, None, "TEST")
+    assert "Object __eb_scheduler = mock(" in src
+    assert "__eb_reloadScheduled" not in src and "__eb_state" not in src and "__eb_pausedLatch" not in src
+
+
+def test_calls_on_returned_fakes_are_recorded(tmp_path):
+    """queueService.getQueue(..).record(..): the call on the returned fake is observed and in order."""
+    from eventbreaker.models.consumer import ConsumerAnalysis, DependencyInfo
+    from eventbreaker.scenarios.executor import _INSTANTIATE_HELPER, _generate_execution
+    src_file = tmp_path / "Q.java"
+    src_file.write_text("package org.acme;\nclass Q {}\n")
+    analysis = ConsumerAnalysis(className="Q", methodName="on", eventType="E",
+                                dependencies=[DependencyInfo(name="queueService", type="QueueService")])
+    src = _generate_execution(analysis, src_file, None, "TEST")
+    assert '__EBInstantiate.ROOTS.addAll(java.util.List.of("queueService"));' in src
+    assert "__EBInstantiate.startRecording(callSequence::add);" in src
+    assert "__EBInstantiate.NESTED.entrySet()" in src
+    assert "recordNested(path, true)" in _INSTANTIATE_HELPER and "SEQUENCE.accept(path)" in _INSTANTIATE_HELPER

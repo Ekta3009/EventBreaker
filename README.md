@@ -35,6 +35,9 @@ EventBreaker finds these bugs in your existing code, with no annotations or test
 
 Supported listeners: `@KafkaListener`, `@RabbitListener` / `@RabbitHandler`, `@JmsListener`, `@SqsListener`,
 `@StreamListener`, Spring `@EventListener` / `@TransactionalEventListener`, Guava / Kill Bill `@Subscribe`.
+Severity follows each transport's delivery rules: a broker redelivers after a thrown exception; a Guava
+`EventBus` logs it and drops the event, and never runs a subscriber twice at once unless it is marked
+`@AllowConcurrentEvents`; Kill Bill's persistent bus retries.
 
 ---
 

@@ -41,3 +41,10 @@ class ConsumerAnalysis(BaseModel):
     variableInitializations: list[VariableInitializationInfo] = []
     otherListenerMethods: list[str] = []   # listener methods in the class not analysed this run
     listenerAnnotation: str = ""           # e.g. KafkaListener, EventListener, Subscribe
+    # @Subscribe only, set from the classpath/source: "persistent" (Kill Bill's retrying bus)
+    # or "guava" (plain Guava EventBus: no retry, one call at a time unless @AllowConcurrentEvents).
+    subscribeBus: str = ""
+    allowConcurrentEvents: bool = False
+    # @Transactional on the listener method or class, set from the source: "unchecked" (rolls back on
+    # RuntimeException), "any" (rollbackFor given), or "" (no transaction / no rollback assumed).
+    transactionalRollback: str = ""

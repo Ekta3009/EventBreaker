@@ -35,6 +35,12 @@ TRANSPORT_TEXT = {
         "twice. Concurrent runs are still real (two requests at once). An exception thrown by the listener "
         "propagates to the code that published the event; one the listener swallows is simply lost."
     ),
+    "guava-bus": (
+        "in-process Guava EventBus (@Subscribe): no broker and no redelivery — the same event only runs "
+        "twice if it is posted twice. An exception thrown by the subscriber is logged by the bus and the "
+        "event is dropped (no retry), so work after the failure is lost. The bus calls this subscriber "
+        "one event at a time unless it is annotated @AllowConcurrentEvents."
+    ),
     "event-bus": (
         "event bus (@Subscribe): delivery guarantees depend on the bus — some persist and retry events, "
         "some are in-memory. Judge from the source; do not assume broker-style redelivery."
@@ -51,7 +57,7 @@ def transport(analysis: ConsumerAnalysis) -> str:
     if a in _IN_PROCESS:
         return "in-process"
     if a in _BUS:
-        return "event-bus"
+        return "guava-bus" if analysis.subscribeBus == "guava" else "event-bus"
     return "unknown"
 
 
@@ -193,8 +199,11 @@ def diagnose(
         check_interference(analysis, source_code, scenario, fresh=fresh)
         if tc is not None and tc.callPattern == "CONCURRENT" and changes else None
     )
-    assessment = assess(scenario, result, changes, labels, transport(analysis),
-                        listener_outcome(result), interference)
+    delivery = transport(analysis)
+    assessment = assess(scenario, result, changes, labels, delivery,
+                        listener_outcome(result), interference,
+                        serialized=delivery == "guava-bus" and not analysis.allowConcurrentEvents,
+                        transactional=analysis.transactionalRollback)
     if not assessment.drafts:
         return Diagnosis([], assessment.harmless)
 

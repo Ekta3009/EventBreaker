@@ -16,7 +16,9 @@ class ObservationResult(BaseModel):
     consumerThrew: bool = False
     callSequence: list[str] = []
     consumerException: str | None = None   # first exception the consumer threw, if any
+    consumerExceptionChecked: bool = False # it was a checked exception (Spring commits instead of rolling back)
     notReached: list[str] = []             # targets the scenario was about but never called
+    defaultAnswers: list[str] = []         # "path = value" a fake answered with no override (for path-setup retries)
 
 
 class ReliabilityFinding(BaseModel):

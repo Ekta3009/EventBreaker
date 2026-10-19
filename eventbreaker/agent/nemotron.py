@@ -56,8 +56,8 @@ faultInjections rules — CRITICAL:
   - dep:    MUST be one of the exact field names listed under "Dependency field names"
   - method: MUST be one of the exact method names listed under "Methods per dependency"
   - fault:  MUST be exactly THROW, THROW_ONCE, or DELAY
-  - THROW:      method always throws RuntimeException
-  - THROW_ONCE: method throws once, succeeds on retry
+  - THROW:      method always throws (the method's declared checked exception if it has one, else RuntimeException)
+  - THROW_ONCE: method throws once (same exception type), succeeds on retry
   - DELAY:      method sleeps before completing
 
 observeOrdering: set true ONLY if the risk is about call ORDER (e.g. commit before begin).
@@ -171,6 +171,22 @@ Return a JSON array of 2-4 reliability scenarios with testConfig for each.\
 """
 
 
+def _last_object_array(text: str) -> list | None:
+    """The last `[ {...}, ... ]` in text that is valid JSON by itself, or None."""
+    decoder = json.JSONDecoder()
+    found = None
+    for i, ch in enumerate(text):
+        if ch != "[":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
+            found = value
+    return found
+
+
 def _parse(raw: str, analysis: ConsumerAnalysis) -> list[ChaosScenario]:
     cleaned = re.sub(r"```(?:json)?\s*", "", raw).strip().rstrip("`").strip()
 
@@ -184,9 +200,13 @@ def _parse(raw: str, analysis: ConsumerAnalysis) -> list[ChaosScenario]:
     try:
         data = json.loads(cleaned[start:end])
     except json.JSONDecodeError as e:
-        raise ValueError(
-            f"Nemotron returned invalid JSON: {e}\nRaw response:\n{raw}"
-        )
+        # Reasoning text before the answer can hold brackets (code, lists): take the last
+        # array of objects that decodes on its own.
+        data = _last_object_array(cleaned)
+        if data is None:
+            raise ValueError(
+                f"Nemotron returned invalid JSON: {e}\nRaw response:\n{raw}"
+            )
 
     dep_names = {d.name for d in analysis.dependencies}
     dep_methods: dict[str, set[str]] = {}

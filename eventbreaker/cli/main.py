@@ -148,6 +148,9 @@ def analyze_consumer(
         analysis.subscribeBus = "persistent" if _on_classpath(jars, _PERSISTENT_BUS) else "guava"
         analysis.allowConcurrentEvents = _method_annotated(file, analysis.methodName, "AllowConcurrentEvents")
     analysis.transactionalRollback = _transactional_rollback(file, analysis.methodName, analysis.className)
+    analysis.detachedDelivery = _detached_delivery(file, analysis)
+    if analysis.listenerAnnotation == "KafkaListener":
+        analysis.kafkaErrorHandling = _kafka_error_handling(file, analysis.methodName, jars)
 
     # ── Step 2: Nemotron risk identification ──────────────────────────────────
     if not os.environ.get("NEBIUS_API_KEY"):
@@ -671,6 +674,68 @@ def _transactional_rollback(file: Path, method: str, class_name: str) -> str:
                 return ""
             return "any" if re.search(r"rollbackFor|rollbackOn", args) else "unchecked"
     return ""
+
+
+def _detached_delivery(file: Path, analysis) -> bool:
+    """True when a thrown exception never reaches the publisher: @Async (method or class), or a
+    @TransactionalEventListener in any phase but BEFORE_COMMIT (the default AFTER_COMMIT runs after the commit)."""
+    source = re.sub(r"//[^\n]*|/\*.*?\*/", " ", file.read_text(errors="replace"), flags=re.S)
+    simple = analysis.className.rsplit(".", 1)[-1]
+    method_heads = _annotation_heads(source, rf"\b{re.escape(analysis.methodName)}\s*\(")
+    class_heads = _annotation_heads(source, rf"\b(class|interface)\s+{re.escape(simple)}\b")
+    if any(re.search(r"@(?:[\w.]+\.)?Async\b", h) for h in method_heads + class_heads):
+        return True
+    if analysis.listenerAnnotation == "TransactionalEventListener":
+        return not any("BEFORE_COMMIT" in h for h in method_heads)
+    return False
+
+
+# Spring Kafka error handling a project can wire up instead of the default (retry ~10×, log, skip).
+_KAFKA_ERROR_HANDLING = (
+    "CommonErrorHandler", "DefaultErrorHandler", "DeadLetterPublishingRecoverer", "SeekToCurrentErrorHandler",
+    "KafkaListenerErrorHandler", "RetryableTopic", "setCommonErrorHandler", "setErrorHandler",
+)
+# Package roots too broad to identify one organisation by their first two segments.
+_SHARED_ROOTS = {"apache", "eclipse", "springframework", "google", "github", "jboss", "hibernate"}
+
+
+def _kafka_error_handling(file: Path, method: str, jars: list[Path]) -> str:
+    """"configured" if the listener, the repository's sources, or the compiled classes of the project and its own
+    organisation's libraries (e.g. Digit's tracer) wire a Kafka error handler / dead-letter topic; else "default"."""
+    markers = _KAFKA_ERROR_HANDLING
+    source = re.sub(r"//[^\n]*|/\*.*?\*/", " ", file.read_text(errors="replace"), flags=re.S)
+    if any("errorHandler" in h or "RetryableTopic" in h for h in _annotation_heads(source, rf"\b{re.escape(method)}\s*\(")):
+        return "configured"
+    root = next((d for d in (file.parent, *file.parents) if (d / ".git").exists()), file.parent)
+    for java in root.rglob("*.java"):
+        if "/src/test/" in str(java) or "/eventbreaker-reports/" in str(java):
+            continue
+        text = java.read_text(errors="replace")
+        if "kafka" in text and any(m in text for m in markers):
+            return "configured"
+    pkg = re.search(r"^\s*package\s+([\w.]+)\s*;", source, flags=re.M)
+    parts = pkg.group(1).split(".") if pkg else []
+    prefix = "/".join(parts[:3] if len(parts) > 1 and parts[1] in _SHARED_ROOTS else parts[:2])
+    byte_markers = [m.encode() for m in markers]
+    for entry in jars:
+        own = entry.is_dir() or str(entry).startswith(str(root)) or (
+            prefix and "/repository/" in str(entry) and str(entry).split("/repository/", 1)[1].startswith(prefix + "/"))
+        if not own:
+            continue
+        if _classes_mention(entry, byte_markers):
+            return "configured"
+    return "default"
+
+
+def _classes_mention(entry: Path, markers: list[bytes]) -> bool:
+    """Any .class file in a classpath directory or jar whose bytes contain one of the markers."""
+    if entry.is_dir():
+        return any(any(m in c.read_bytes() for m in markers) for c in entry.rglob("*.class"))
+    try:
+        with zipfile.ZipFile(entry) as z:
+            return any(n.endswith(".class") and any(m in z.read(n) for m in markers) for n in z.namelist())
+    except (zipfile.BadZipFile, OSError):
+        return False
 
 
 def _parse_classpath(value: str | None) -> list[Path]:

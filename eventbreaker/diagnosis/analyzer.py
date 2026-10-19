@@ -35,6 +35,17 @@ TRANSPORT_TEXT = {
         "twice. Concurrent runs are still real (two requests at once). An exception thrown by the listener "
         "propagates to the code that published the event; one the listener swallows is simply lost."
     ),
+    "broker-drops": (
+        "Kafka with Spring Kafka's default error handling (no error handler or dead-letter topic configured in this "
+        "project): a message is redelivered after a consumer rebalance, so duplicate delivery is normal; an exception "
+        "thrown by the listener is retried about 10 times, then the record is logged and skipped — its work is lost; "
+        "an exception the listener swallows means the message is acknowledged and the work is lost."
+    ),
+    "in-process-detached": (
+        "in-process Spring event delivered detached from the publisher (@Async, or a @TransactionalEventListener that "
+        "runs after the transaction): no broker and no redelivery. An exception thrown by the listener does NOT reach "
+        "the publishing code — Spring logs it and the event's work is lost, exactly as if it were swallowed."
+    ),
     "guava-bus": (
         "in-process Guava EventBus (@Subscribe): no broker and no redelivery — the same event only runs "
         "twice if it is posted twice. An exception thrown by the subscriber is logged by the bus and the "
@@ -50,12 +61,12 @@ TRANSPORT_TEXT = {
 
 
 def transport(analysis: ConsumerAnalysis) -> str:
-    """broker | in-process | event-bus | unknown, from the listener's annotation."""
+    """broker | broker-drops | in-process | in-process-detached | guava-bus | event-bus | unknown."""
     a = analysis.listenerAnnotation
     if a in _BROKER:
-        return "broker"
+        return "broker-drops" if a == "KafkaListener" and analysis.kafkaErrorHandling == "default" else "broker"
     if a in _IN_PROCESS:
-        return "in-process"
+        return "in-process-detached" if analysis.detachedDelivery else "in-process"
     if a in _BUS:
         return "guava-bus" if analysis.subscribeBus == "guava" else "event-bus"
     return "unknown"

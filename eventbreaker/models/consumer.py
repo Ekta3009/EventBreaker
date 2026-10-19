@@ -48,3 +48,9 @@ class ConsumerAnalysis(BaseModel):
     # @Transactional on the listener method or class, set from the source: "unchecked" (rolls back on
     # RuntimeException), "any" (rollbackFor given), or "" (no transaction / no rollback assumed).
     transactionalRollback: str = ""
+    # Spring listener whose exceptions never reach the publisher (set from the source): @Async, or a
+    # @TransactionalEventListener in an after-commit/rollback/completion phase — a thrown exception is logged and dropped.
+    detachedDelivery: bool = False
+    # @KafkaListener only: "configured" when the project (or its own platform library) wires a Kafka error handler /
+    # dead-letter topic, "default" when it does not — Spring Kafka then retries ~10 times, logs and skips the record.
+    kafkaErrorHandling: str = ""

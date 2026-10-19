@@ -11,6 +11,8 @@ and — for concurrent scenarios — the voted interference answer. Same inputs,
 | Failure, listener threw, a SIDE_EFFECT completed before the failure       | HIGH if broker, else MEDIUM  |
 | … but the listener is @Transactional and the exception rolls it back      | only EXTERNAL_MESSAGE side effects count (a rollback cannot unsend) |
 | Failure, listener threw on a Guava bus (logged, dropped), writes missing  | MEDIUM (work lost, not silent) |
+| … same for a detached Spring listener (@Async, after-commit transactional) | MEDIUM (work lost, not silent) |
+| Failure, Kafka listener with default error handling threw, no side effect done, writes missing | MEDIUM (retried ~10×, then skipped) |
 | Failure, listener threw, only READ / REFRESH / IDEMPOTENT_WRITE completed | NONE                         |
 | Duplicate, extra SIDE_EFFECT                                              | HIGH if MONEY/SECURITY/EXTERNAL_MESSAGE, else MEDIUM; LOW if in-process or Guava bus |
 | Duplicate, extra REFRESH (no extra SIDE_EFFECT)                           | LOW (extra work, same result)|
@@ -111,16 +113,17 @@ def _failure(scenario, result, changes, labels, transport, transactional="") -> 
         return [Draft("failure", "HIGH", root,
                       f"The listener did not throw, so this work was silently lost: {names}.", evidence)]
 
-    if transport == "guava-bus":
-        # The bus logs the exception and drops the event: nothing retries, so writes that did not
-        # happen are lost — visible in the log, hence MEDIUM rather than HIGH.
-        lost = [c for c in changes if c.kind in ("MISSING", "THREW") and _matters(labels, c.target, _WRITES)]
+    lost = [c for c in changes if c.kind in ("MISSING", "THREW") and _matters(labels, c.target, _WRITES)]
+    names = ", ".join(sorted({c.target for c in lost}))
+    if transport in ("guava-bus", "in-process-detached"):
+        # The exception never reaches a caller that could retry: the bus / Spring logs it and the event
+        # is dropped, so writes that did not happen are lost — visible in the log, hence MEDIUM, not HIGH.
         if not lost:
             return []
-        names = ", ".join(sorted({c.target for c in lost}))
-        return [Draft("failure", "MEDIUM", root,
-                      f"The listener threw; the Guava event bus logs the exception and drops the event "
-                      f"(no retry), so this work is lost: {names}.", evidence)]
+        who = ("the Guava event bus logs the exception and drops the event" if transport == "guava-bus" else
+               "Spring logs the exception of a detached listener (@Async / after-commit) and nothing retries")
+        return [Draft("failure", "MEDIUM", root, f"The listener threw; {who}, so this work is lost: {names}.",
+                      evidence)]
 
     # The listener threw: did a side effect complete before the failure?
     seq = result.callSequence
@@ -133,9 +136,15 @@ def _failure(scenario, result, changes, labels, transport, transactional="") -> 
     if rolled_back:
         completed = [c for c in completed if _label(labels, c).impact == "EXTERNAL_MESSAGE"]
     if not completed:
+        if transport == "broker-drops" and lost:
+            return [Draft("failure", "MEDIUM", root,
+                          f"The listener threw; with no Kafka error handler or dead-letter topic configured, the record "
+                          f"is retried about 10 times and then logged and skipped, so this work is lost if the failure "
+                          f"persists: {names}.", evidence)]
         return []
-    severity = "HIGH" if transport == "broker" else "MEDIUM"
-    why = ("a broker redelivers the message and repeats it" if transport == "broker"
+    broker = transport in ("broker", "broker-drops")
+    severity = "HIGH" if broker else "MEDIUM"
+    why = ("a broker redelivers the message and repeats it" if broker
            else "the failure is visible but this work stays done")
     return [Draft("failure", severity, root,
                   f"The listener threw after a side effect had completed ({', '.join(completed)}): {why}.",
@@ -153,7 +162,7 @@ def _repeated(changes, labels, transport) -> list[Draft]:
                       [c.describe() for c in refresh])]
     worst = min(side, key=lambda c: _IMPACT_ORDER.index(_label(labels, c.target).impact))
     impact = _label(labels, worst.target).impact
-    if transport in ("in-process", "guava-bus"):
+    if transport in ("in-process", "in-process-detached", "guava-bus"):
         severity, why = "LOW", "an in-process event is not redelivered, so it only runs twice if published twice"
     elif impact in _SERIOUS_IMPACT:
         severity, why = "HIGH", f"a side effect with {impact} impact was done twice"

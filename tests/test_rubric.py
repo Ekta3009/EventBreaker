@@ -266,3 +266,32 @@ def test_extra_read_or_unlabelled_call_on_the_failure_path_is_not_recovery():
     [d] = assess(sc("SINGLE", "mail.send"), r, measured_changes(r, BASELINE), labels, "broker",
                  listener_outcome(r)).drafts
     assert d.severity == "HIGH"
+
+
+# ── T5: deliveries where a thrown exception is lost ──────────────────────────
+
+def test_detached_spring_listener_that_throws_loses_the_work_medium():
+    r = run(E(target="orders.find", callCount=1), E(target="ledger.append", callCount=1, threw=True),
+            E(target="mail.send", callCount=0), threw=True, seq=["orders.find", "ledger.append"])
+    [d] = go(sc("SINGLE", "ledger.append"), r, "in-process-detached").drafts
+    assert d.severity == "MEDIUM" and "detached" in d.basis and "mail.send" in d.basis
+    assert go(sc("SINGLE", "ledger.append"), r, "in-process").drafts == []   # synchronous: the publisher sees it
+
+
+def test_detached_duplicate_is_low_like_any_in_process_event():
+    assert go(sc("DUPLICATE"), DUP, "in-process-detached").drafts[0].severity == "LOW"
+
+
+def test_kafka_default_error_handling_drops_after_retries_medium():
+    r = run(E(target="orders.find", callCount=1), E(target="ledger.append", callCount=1, threw=True),
+            E(target="mail.send", callCount=0), threw=True, seq=["orders.find", "ledger.append"])
+    [d] = go(sc("SINGLE", "ledger.append"), r, "broker-drops").drafts
+    assert d.severity == "MEDIUM" and "retried about 10 times" in d.basis
+    assert go(sc("SINGLE", "ledger.append"), r, "broker").drafts == []        # configured handler / DLT
+
+
+def test_kafka_default_error_handling_after_a_side_effect_is_still_high():
+    r = run(E(target="orders.find", callCount=1), E(target="ledger.append", callCount=1),
+            E(target="mail.send", callCount=1, threw=True), threw=True,
+            seq=["orders.find", "ledger.append", "mail.send"])
+    assert go(sc("SINGLE", "mail.send"), r, "broker-drops").drafts[0].severity == "HIGH"

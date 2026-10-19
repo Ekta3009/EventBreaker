@@ -60,6 +60,11 @@ public class ConsumerAnalyzer {
             "Subscribe"
     );
 
+    // Logging APIs (SLF4J, Log4j 2, JUL, Commons Logging, JBoss): never a dependency to fake.
+    private static final Set<String> LOGGER_TYPES = Set.of(
+            "Logger", "Log", "XLogger", "ExtendedLogger"
+    );
+
     // Listener parameters supplied by the messaging framework, never the event itself.
     private static final Set<String> FRAMEWORK_PARAM_TYPES = Set.of(
             "Acknowledgment",
@@ -261,6 +266,12 @@ public class ConsumerAnalyzer {
     }
 
     /** First class literal in the listener annotation's value / classes: X.class, {X.class, Y.class}, classes = X.class. */
+    /** `org.slf4j.Logger` / `Logger` → "Logger" (no type arguments). */
+    private static String simpleTypeName(Type type) {
+        String name = type.isClassOrInterfaceType() ? type.asClassOrInterfaceType().getNameAsString() : type.asString();
+        return name.substring(name.lastIndexOf('.') + 1);
+    }
+
     private static Optional<String> annotatedEventClass(MethodDeclaration method) {
         for (AnnotationExpr a : method.getAnnotations()) {
             if (!LISTENER_ANNOTATIONS.contains(simpleName(a))) {
@@ -324,6 +335,9 @@ public class ConsumerAnalyzer {
                 .stream()
                 // Static fields (loggers, constants, caches) are never injected dependencies.
                 .filter(field -> !field.isStatic())
+                // Nor is a logger kept in an instance field (`private Logger log = LoggerFactory.getLogger(...)`):
+                // the constructor already made a real one; faking it would make log calls look like side effects.
+                .filter(field -> !LOGGER_TYPES.contains(simpleTypeName(field.getElementType())))
                 .forEach(field -> {
 
                     String type =

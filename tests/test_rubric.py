@@ -119,10 +119,30 @@ def test_duplicate_money_side_effect_is_high_on_broker():
     assert not any("orders.find" in e for e in d.evidence)
 
 
-def test_duplicate_minor_side_effect_is_medium():
+def test_duplicate_minor_side_effect_is_harmless():
+    """MINOR impact = caches, logs, metrics (the label prompt's definition): counted twice, nothing to report."""
     base = run(E(target="stats.bump", callCount=1))
-    [d] = go(sc("DUPLICATE"), run(E(target="stats.bump", callCount=2)), baseline=base).drafts
-    assert d.severity == "MEDIUM"
+    a = go(sc("DUPLICATE"), run(E(target="stats.bump", callCount=2)), baseline=base)
+    assert a.drafts == [] and a.harmless == ["stats.bump: called 2× (baseline 1×) — extra"]
+
+
+def test_minor_work_never_drives_a_failure_finding():
+    # Threw after only a metric was bumped: nothing that matters stays done.
+    r = run(E(target="stats.bump", callCount=1), E(target="mail.send", callCount=1, threw=True), threw=True,
+            seq=["stats.bump", "mail.send"])
+    assert go(sc("SINGLE", "mail.send"), r, baseline=run(E(target="stats.bump", callCount=1),
+                                                        E(target="mail.send", callCount=1))).drafts == []
+    # Swallowed failure whose only "lost" work is a metric: no finding.
+    r = run(E(target="orders.find", callCount=1, threw=True), E(target="stats.bump", callCount=0))
+    base = run(E(target="orders.find", callCount=1), E(target="stats.bump", callCount=1))
+    assert go(sc("SINGLE", "orders.find"), r, baseline=base).drafts == []
+
+
+def test_a_metric_on_the_failure_path_is_not_a_recovery():
+    r = run(E(target="orders.find", callCount=1), E(target="ledger.append", callCount=1, threw=True),
+            E(target="mail.send", callCount=0), E(target="stats.bump", callCount=1))
+    [d] = go(sc("SINGLE", "ledger.append"), r).drafts
+    assert d.severity == "HIGH" and "silently lost" in d.basis
 
 
 def test_duplicate_on_in_process_listener_is_low():

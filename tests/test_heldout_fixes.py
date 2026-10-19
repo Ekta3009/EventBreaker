@@ -79,3 +79,21 @@ def test_sandbox_command_passes_the_bytebuddy_flag():
     import inspect
     from eventbreaker.sandbox import executor as sandbox
     assert "java {BYTEBUDDY_ANY_JAVA} -jar" in inspect.getsource(sandbox.SandboxExecutor._run_once)
+
+
+# T7: a logger in an instance field is the listener's own real object, never a faked dependency.
+
+def test_instance_logger_field_is_not_a_dependency(tmp_path):
+    from eventbreaker.analyzer import bridge
+    f = tmp_path / "Importer.java"
+    f.write_text(
+        "package org.acme;\n"
+        "public class Importer {\n"
+        "    private org.slf4j.Logger logger = org.slf4j.LoggerFactory.getLogger(getClass());\n"
+        "    private final Log log2 = null;\n"
+        "    @Autowired private Client client;\n"
+        "    @KafkaListener(topics = \"t\")\n"
+        "    public void listen(String raw) { logger.debug(raw); client.index(raw); }\n"
+        "}\n")
+    a = bridge.analyze(f, "listen")
+    assert [d.name for d in a.dependencies] == ["client"]

@@ -8,6 +8,7 @@ import hashlib
 import os
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -86,7 +87,7 @@ def resolve(module: Module) -> list[Path]:
 
 _MAVEN_EXCLUDE_PROPERTIES = ("excludeGroupIds", "excludeArtifactIds", "excludeClassifiers", "excludeTypes")
 # Bump when the resolver commands change, so cached classpaths are resolved again.
-_RESOLVER_VERSION = "2"
+_RESOLVER_VERSION = "3"
 
 
 def _maven(module: Module) -> list[Path]:
@@ -95,10 +96,24 @@ def _maven(module: Module) -> list[Path]:
         raise ClasspathError(
             f"{module.dir.name} is not compiled yet — run `mvn compile` in {module.dir} first."
         )
+    jars = _maven_build_classpath(module, module.dir / "pom.xml")
+    if not jars:
+        # The module may configure maven-dependency-plugin for its own use (Syncope core/starter:
+        # includeGroupIds=org.webjars to unpack Swagger UI). That configuration filters every goal
+        # of the plugin and cannot be overridden on the command line, so build-classpath comes back
+        # empty. Ask again with a copy of the pom without those filters (the project is not touched).
+        with tempfile.TemporaryDirectory() as tmp:
+            unfiltered = _pom_without_dependency_filters(module.dir / "pom.xml", Path(tmp))
+            if unfiltered:
+                jars = _maven_build_classpath(module, unfiltered)
+    return [classes] + jars
+
+
+def _maven_build_classpath(module: Module, pom: Path) -> list[Path]:
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "cp.txt"
         _run(
-            [_wrapper(module.dir, "mvnw") or "mvn", "-q", "--batch-mode", "-f", str(module.dir / "pom.xml"),
+            [_wrapper(module.dir, "mvnw") or "mvn", "-q", "--batch-mode", "-f", str(pom),
              # Runtime scope (compile + runtime), like Gradle's runtimeClasspath: test-scope
              # Mockito/JUnit would clash with the harness's own.
              "dependency:build-classpath", "-DincludeScope=runtime", f"-Dmdep.outputFile={out}",
@@ -109,8 +124,51 @@ def _maven(module: Module) -> list[Path]:
             module.dir,
             hint="If it depends on sibling modules, run `mvn install -DskipTests` at the project root first.",
         )
-        jars = _split(out.read_text()) if out.exists() else []
-    return [classes] + jars
+        return _split(out.read_text()) if out.exists() else []
+
+
+_POM_NS = "http://maven.apache.org/POM/4.0.0"
+# maven-dependency-plugin parameters that narrow which dependencies a goal sees.
+_DEPENDENCY_FILTERS = ("scope", "includeScope", "excludeScope") + tuple(
+    f"{kind}{what}" for kind in ("include", "exclude")
+    for what in ("GroupIds", "ArtifactIds", "Classifiers", "Types")
+)
+
+
+def _pom_without_dependency_filters(pom: Path, tmp: Path) -> Path | None:
+    """A copy of the pom in tmp with maven-dependency-plugin's dependency filters removed, the
+    parent still found at its original place. None if the pom has no such filters."""
+    ET.register_namespace("", _POM_NS)
+    tree = ET.parse(pom)
+    root = tree.getroot()
+    ns = {"m": _POM_NS} if root.tag.startswith("{") else {}
+    q = (lambda tag: f"m:{tag}") if ns else (lambda tag: tag)
+    removed = False
+    for plugin in root.iterfind(f".//{q('plugin')}", ns):
+        if (plugin.findtext(q("artifactId"), "", ns) or "").strip() != "maven-dependency-plugin":
+            continue
+        for config in [plugin.find(q("configuration"), ns),
+                       *(e.find(q("configuration"), ns) for e in plugin.iterfind(f".//{q('execution')}", ns))]:
+            if config is None:
+                continue
+            for child in list(config):
+                if child.tag.split("}")[-1] in _DEPENDENCY_FILTERS:
+                    config.remove(child)
+                    removed = True
+    if not removed:
+        return None
+    parent = root.find(q("parent"), ns)
+    if parent is not None:
+        rel = parent.find(q("relativePath"), ns)
+        target = (pom.parent / (rel.text.strip() if rel is not None and rel.text else "../pom.xml")).resolve()
+        if target.is_dir():
+            target = target / "pom.xml"
+        if rel is None:
+            rel = ET.SubElement(parent, f"{{{_POM_NS}}}relativePath" if ns else "relativePath")
+        rel.text = os.path.relpath(target, tmp)
+    copy = tmp / "pom.xml"
+    tree.write(copy, xml_declaration=True, encoding="UTF-8")
+    return copy
 
 
 def _gradle(module: Module) -> list[Path]:

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from eventbreaker.classpath.resolver import project_root
 from eventbreaker.models.consumer import ConsumerAnalysis, DependencyInfo
-from eventbreaker.models.observation import ObservationEntry, ObservationResult
+from eventbreaker.models.observation import BUILD_DETAIL_MARKER, ObservationEntry, ObservationResult
 from eventbreaker.sandbox.executor import BYTEBUDDY_ANY_JAVA as _BYTEBUDDY_ANY_JAVA, SandboxExecutor
 
 # Local runs get the same limit as a sandbox run.
@@ -837,7 +837,7 @@ def _as_jar(entry: Path) -> Path:
 
 
 # Bump when _sandbox_jar's selection logic changes, so cached jars are rebuilt.
-_SANDBOX_JAR_VERSION = 2
+_SANDBOX_JAR_VERSION = 3
 
 
 def _sandbox_jar(fat_jar: Path, classpath: list[Path], roots: tuple[str, ...] = ()) -> Path:
@@ -857,61 +857,168 @@ def _sandbox_jar(fat_jar: Path, classpath: list[Path], roots: tuple[str, ...] = 
     # Classes loaded only by name are not reachable from the fat JAR's bytecode, so
     # copy their class files (plus nested classes) next to it as extra jdeps targets.
     roots_dir = Path(tempfile.mkdtemp(prefix="eb-roots-"))
-    prefixes = tuple(r.replace(".", "/") for r in roots)
-    for jar in classpath:
-        if not prefixes or not jar.is_file():
-            continue
-        with zipfile.ZipFile(jar) as src:
-            for name in src.namelist():
-                if name.endswith(".class") and any(
-                    name == f"{pre}.class" or name.startswith(f"{pre}$") for pre in prefixes
-                ):
-                    target = roots_dir / name
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(src.read(name))
-
-    scan = subprocess.run(
-        ["jdeps", "-verbose:class", "-R", "--multi-release", "21", "--ignore-missing-deps",
-         "-cp", os.pathsep.join(map(str, classpath)), str(fat_jar), str(roots_dir)],
-        capture_output=True, text=True,
-    )
-    shutil.rmtree(roots_dir, ignore_errors=True)
-    edges: dict[str, set[str]] = {}
-    for line in scan.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[1] == "->" and line.startswith("   "):
-            edges.setdefault(parts[0], set()).add(parts[2])
+    _copy_classes(classpath, set(roots), roots_dir)
 
     with zipfile.ZipFile(fat_jar) as fat:
         bundled = {
             n[:-6].replace("/", ".") for n in fat.namelist() if n.endswith(".class")
         }
+    jars = [j for j in classpath if j.is_file()]
+    services = {j: _jar_services(j) for j in jars}
+    on_classpath = set().union(*(_jar_class_names(j) for j in jars)) if jars else set()
 
     # Walk from everything already in the fat JAR — plus classes the harness only
     # loads by name (the consumer, via Class.forName) — to the classes they need.
-    needed: set[str] = {r for r in roots if r not in bundled}
-    frontier = list(bundled) + list(needed)
-    while frontier:
-        cls = frontier.pop()
-        for dep in edges.get(cls, ()):
-            if dep not in bundled and dep not in needed:
-                needed.add(dep)
-                frontier.append(dep)
+    # Implementations found through META-INF/services (log4j-core's Provider for
+    # log4j-api) never appear in bytecode: those named for a service the walk
+    # reached become roots too, and the walk repeats.
+    providers: set[str] = set()
+    edges: dict[str, set[str]] = {}
+    while True:
+        scanned = _jdeps_edges(fat_jar, classpath, [roots_dir])
+        if scanned is None and edges:
+            break                      # keep the last good walk rather than an empty one
+        edges = scanned or {}
+        needed: set[str] = {r for r in (*roots, *providers) if r not in bundled}
+        frontier = list(bundled) + list(needed)
+        while frontier:
+            cls = frontier.pop()
+            for dep in edges.get(cls, ()):
+                if dep not in bundled and dep not in needed:
+                    needed.add(dep)
+                    frontier.append(dep)
+        reached = needed | bundled
+        found = {
+            impl for j in jars for iface, impls in services[j].items()
+            if iface in reached and iface in on_classpath for impl in impls
+            if impl in on_classpath and impl not in bundled
+        }
+        if found <= providers:
+            break
+        providers |= found
+        _copy_classes(classpath, providers, roots_dir)
+    shutil.rmtree(roots_dir, ignore_errors=True)
 
     wanted = {c.replace(".", "/") + ".class" for c in needed}
     with zipfile.ZipFile(fat_jar) as fat, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
-        for item in fat.infolist():
-            dst.writestr(item, fat.read(item.filename))
         written = set(fat.namelist())
-        for jar in classpath:
-            if not jar.is_file():
-                continue
+        merged = {n: fat.read(n) for n in written if n.startswith("META-INF/services/") and not n.endswith("/")}
+        for item in fat.infolist():
+            if item.filename not in merged:
+                dst.writestr(item, fat.read(item.filename))
+        for jar in jars:
             with zipfile.ZipFile(jar) as src:
-                for name in src.namelist():
+                names = src.namelist()
+                classes = _class_entries(names)
+                used = any(n in wanted for n in classes)
+                for name, entry in classes.items():
                     if name in wanted and name not in written:
+                        dst.writestr(name, src.read(entry))
+                        written.add(name)
+                for name in names:
+                    if name.endswith("/"):
+                        continue
+                    if name.startswith("META-INF/services/"):
+                        # Service files are merged, so every jar's providers stay visible.
+                        if used:
+                            merged[name] = merged.get(name, b"").rstrip(b"\n") + b"\n" + src.read(name)
+                        continue
+                    if name in written or name.endswith(".class"):
+                        continue
+                    # Resources (plugin indexes, properties) of every jar the run uses.
+                    if used and not name.startswith("META-INF/versions/") and not _SKIPPED_RESOURCE.search(name) \
+                            and name != "META-INF/MANIFEST.MF":
                         dst.writestr(name, src.read(name))
                         written.add(name)
+        for name, data in merged.items():
+            dst.writestr(name, data.lstrip(b"\n"))
     return out
+
+
+# Signed-jar files (copied into a merged jar they would fail its verification) and native
+# libraries that cannot load in the Linux sandbox.
+_SKIPPED_RESOURCE = re.compile(r"^META-INF/[^/]+\.(SF|RSA|DSA|EC)$|\.(dll|dylib|jnilib)$", re.I)
+
+
+def _jdeps_edges(fat_jar: Path, classpath: list[Path], extra_targets: list[Path]) -> dict[str, set[str]] | None:
+    """Class → classes it references, for the fat JAR and the extra targets (recursively over the classpath).
+
+    None when jdeps fails.
+    """
+    scan = subprocess.run(
+        # -filter:none: jdeps drops same-package references by default (log4j's StackLocatorUtil → StackLocator).
+        ["jdeps", "-verbose:class", "-filter:none", "-R", "--multi-release", "21", "--ignore-missing-deps",
+         "-cp", os.pathsep.join(map(str, classpath)), str(fat_jar), *map(str, extra_targets)],
+        capture_output=True, text=True,
+    )
+    if scan.returncode != 0:
+        return None
+    edges: dict[str, set[str]] = {}
+    for line in scan.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == "->" and line.startswith("   "):
+            # Multi-release classes are printed with their version: "9/org.acme.Foo".
+            edges.setdefault(_unversioned(parts[0]), set()).add(_unversioned(parts[2]))
+    return edges
+
+
+def _unversioned(name: str) -> str:
+    return re.sub(r"^\d+/", "", name)
+
+
+def _copy_classes(classpath: list[Path], classes: set[str], target: Path) -> None:
+    """Class files of these classes (and their nested classes) from the classpath jars, as extra jdeps roots."""
+    prefixes = tuple(c.replace(".", "/") for c in classes)
+    for jar in classpath:
+        if not jar.is_file():
+            continue
+        with zipfile.ZipFile(jar) as z:
+            for name, entry in _class_entries(z.namelist()).items():
+                if any(name == f"{pre}.class" or name.startswith(f"{pre}$") for pre in prefixes):
+                    out = target / name
+                    if not out.exists():
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        out.write_bytes(z.read(entry))
+
+
+def _jar_class_names(jar: Path) -> set[str]:
+    with zipfile.ZipFile(jar) as z:
+        return {n[:-6].replace("/", ".") for n in _class_entries(z.namelist())}
+
+
+# The sandbox runs Java 21 or newer, so a multi-release jar's class versions up to 21 apply.
+_SANDBOX_MIN_JAVA = 21
+_VERSIONED = re.compile(r"META-INF/versions/(\d+)/(.+\.class)$")
+
+
+def _class_entries(names: list[str]) -> dict[str, str]:
+    """Class file name → jar entry to read. In a multi-release jar the newest version up to
+    _SANDBOX_MIN_JAVA wins; some classes (log4j-api's StackLocator) exist only there."""
+    entries: dict[str, str] = {}
+    best: dict[str, int] = {}
+    for n in names:
+        if not n.endswith(".class") or n.endswith("module-info.class"):
+            continue
+        m = _VERSIONED.match(n)
+        if m:
+            version, plain = int(m.group(1)), m.group(2)
+            if version <= _SANDBOX_MIN_JAVA and version > best.get(plain, 0):
+                entries[plain], best[plain] = n, version
+        elif not n.startswith("META-INF/") and n not in best:
+            entries[n] = n
+    return entries
+
+
+def _jar_services(jar: Path) -> dict[str, list[str]]:
+    """Service interface → implementation classes this jar declares (META-INF/services/<interface>)."""
+    found: dict[str, list[str]] = {}
+    with zipfile.ZipFile(jar) as z:
+        for n in z.namelist():
+            if n.startswith("META-INF/services/") and not n.endswith("/"):
+                lines = z.read(n).decode("utf-8", "replace").splitlines()
+                impls = [l.split("#")[0].strip() for l in lines]
+                found[n[len("META-INF/services/"):]] = [i for i in impls if i]
+    return found
 
 
 def _classpath_dependencies(classpath: list[Path]) -> str:
@@ -1645,15 +1752,25 @@ def _parse_output(output: str, scenario: ChaosScenario) -> ObservationResult:
         observations=[],
         rawOutput=output,
         executionError=(
-            f"The harness crashed: {crash}" if crash else
-            "No EVENTBREAKER_RESULT found. "
-            "The build or execution may have failed — check rawOutput."
+            f"The harness crashed: {crash}" if crash else _no_result_message(output)
         ),
     )
 
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _no_result_message(output: str) -> str:
+    """The run ended without a result line: say what that usually means and show the listener's last output."""
+    noise = ("WARNING:", "Mockito is currently self-attaching", "OpenJDK 64-Bit Server VM warning")
+    tail = [l for l in output.splitlines() if l.strip() and not l.startswith(noise)][-6:]
+    return (
+        "The listener ran but never finished its scenario: it usually blocked (waiting on something a fake "
+        f"never provides) until the {LOCAL_TIMEOUT_SECONDS} s limit, or the JVM was stopped."
+        + ("\nLast output:\n" + "\n".join(tail) if tail else " It printed nothing.")
+    )
+
+
 
 def _read_package(java_file: Path) -> str | None:
     """The file's package. Licence headers can be any length (DHIS2: 29 lines), so comments are skipped, not counted."""
@@ -1681,20 +1798,22 @@ def _extract_build_error(output: str) -> str:
     if missing_symbols:
         unique = list(dict.fromkeys(error_lines))[:10]
         detail = "\n".join(unique)
+        names = list(dict.fromkeys(re.findall(r"symbol:\s+(?:class|interface|enum|variable|method)\s+(\w+)", output)))
+        missing = (", ".join(f"`{n}`" for n in names[:5]) + (" are" if len(names) > 1 else " is")
+                   if names else "Some types the listener uses are")
         return (
-            "Build failed: the consumer references types that EventBreaker "
-            "could not find on the classpath.\n\n"
-            "Tip: build the listener's module first (mvn compile / ./gradlew classes), "
-            "or pass the missing jars with --classpath.\n\n"
-            f"Compiler errors:\n{detail}"
+            f"Could not build a test harness: {missing} not on the listener's classpath.\n"
+            "Build the listener's module first (mvn compile / ./gradlew classes), "
+            "or pass the missing jars with --classpath."
+            f"{BUILD_DETAIL_MARKER}{detail}"
         )
 
     if error_lines:
-        return "Build failed:\n" + "\n".join(error_lines[:10])
+        return f"Could not build a test harness.{BUILD_DETAIL_MARKER}" + "\n".join(error_lines[:10])
 
     # Fallback: last non-empty lines of output
     last = [l for l in output.splitlines() if l.strip()][-8:]
-    return "Build failed:\n" + "\n".join(last)
+    return f"Could not build a test harness.{BUILD_DETAIL_MARKER}" + "\n".join(last)
 
 
 def _jar_exists(project_dir: Path) -> bool:

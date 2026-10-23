@@ -25,7 +25,7 @@ from eventbreaker.agent.path_setup import (
 from eventbreaker.diagnosis.analyzer import KIND_LABELS, diagnose, merge_findings
 from eventbreaker.diagnosis.classify import label_calls
 from eventbreaker.diagnosis.reviewer import review
-from eventbreaker.models.observation import ObservationResult, ReliabilityFinding
+from eventbreaker.models.observation import BUILD_DETAIL_MARKER, ObservationResult, ReliabilityFinding
 from eventbreaker.report import reporter
 from eventbreaker.scenarios.models import ChaosScenario, TestConfig
 from eventbreaker.scenarios.executor import ScenarioExecutor, inherited_source
@@ -321,6 +321,7 @@ def analyze_consumer(
             except Exception as e:   # reported per scenario below
                 outcomes.append(e)
 
+    shown_errors: set[str] = set()
     for (scenario, plan), result in zip(feasible, outcomes):
         targets = target_calls(scenario)
         if isinstance(result, Exception):
@@ -341,7 +342,7 @@ def analyze_consumer(
             + (f" (never called {', '.join(result.notReached)})" if result.notReached else "")
             + f"[/bold {colour}]"
         )
-        _print_observations(result, analysis)
+        _print_observations(result, analysis, shown_errors)
         executions.append((scenario, result))
 
     if not executions:
@@ -767,11 +768,18 @@ def _print_theoretical(
     ))
 
 
-def _print_observations(result: ObservationResult, analysis=None) -> None:
+def _print_observations(result: ObservationResult, analysis=None, shown_errors: set[str] | None = None) -> None:
     if result.executionError:
+        # Terminal: the summary only, once per listener; the compiler output stays in the report.
+        summary = result.executionError.split(BUILD_DETAIL_MARKER)[0]
+        if shown_errors is not None and summary in shown_errors:
+            console.print("[dim]  (same error as above)[/dim]")
+            return
+        if shown_errors is not None:
+            shown_errors.add(summary)
         console.print(
             Panel(
-                result.executionError,
+                summary,
                 title="[bold red]Execution Error[/bold red]",
                 border_style="red",
             )

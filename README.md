@@ -33,11 +33,24 @@ EventBreaker finds these bugs in your existing code, with no annotations or test
 - **Measures** each scenario against a fault-free baseline run.
 - **Reports** only what it measured, with the evidence, a severity set by fixed rules, and a suggested fix.
 
-Supported listeners: `@KafkaListener`, `@RabbitListener` / `@RabbitHandler`, `@JmsListener`, `@SqsListener`,
-`@StreamListener`, Spring `@EventListener` / `@TransactionalEventListener`, Guava / Kill Bill `@Subscribe`.
-Severity follows each transport's delivery rules: a broker redelivers after a thrown exception; a Guava
-`EventBus` logs it and drops the event, and never runs a subscriber twice at once unless it is marked
-`@AllowConcurrentEvents`; Kill Bill's persistent bus retries.
+### Supported listeners
+
+Evaluated on 61 listener methods from 9 open-source products (see [Evaluation](#evaluation)):
+
+| Listener kind | Evaluated methods | Products |
+|---|---|---|
+| Spring `@EventListener` / `@TransactionalEventListener` (7 of them `@Async` or after-commit) | 23 | Fineract, Apache Syncope, DHIS2 |
+| Guava / Kill Bill `@Subscribe` | 22 | Kill Bill, Graylog |
+| `@KafkaListener` | 14 | Fineract, DIGIT, Mifos Payment Hub, Sunbird-RC |
+| `@RabbitListener` / `@RabbitHandler` | 1 | Eclipse hawkbit |
+| `@JmsListener` | 1 | DHIS2 |
+
+`@SqsListener` and `@StreamListener` methods are recognized and analyzed the same way, but have not been evaluated yet.
+
+Severity follows each transport's delivery rules: a broker redelivers after a thrown exception (Kafka with no error
+handler retries about 10 times, then skips the record); a Guava `EventBus` logs it and drops the event, and never runs
+a subscriber twice at once unless it is marked `@AllowConcurrentEvents`; Kill Bill's persistent bus retries; an
+`@Async` or after-commit Spring listener's exception is logged and dropped.
 
 ---
 
@@ -193,12 +206,21 @@ and Nemotron Ultra reviews it.
 
 ### Install
 
+From the release (the wheel already contains the static analyzer JAR):
+
+```bash
+pipx install https://github.com/Ekta3009/EventBreaker/releases/download/v0.1.1/eventbreaker-0.1.1-py3-none-any.whl
+# or, in a virtual environment: pip install <the same URL>
+eventbreaker --version
+```
+
+From source:
+
 ```bash
 git clone https://github.com/Ekta3009/EventBreaker
 cd EventBreaker
 mvn package -q                     # builds the static analyzer JAR, packaged with the CLI
 pipx install .                     # or: python -m venv .venv && .venv/bin/pip install -e ".[dev]"
-eventbreaker --version
 ```
 
 ### Configure
@@ -216,6 +238,25 @@ EOF
 | `NEBIUS_PROJECT_ID` | no | if set, listener code runs in a Nebius sandbox; if unset, on the local JVM |
 
 A `.env` in (or above) the directory you run from is loaded automatically; exported variables work too.
+
+### Try it in 5 minutes
+
+Run it on a real Kafka listener in [Mifos Payment Hub](https://github.com/openMF/paymenthub-ee-bulk-processor)
+(Apache-2.0) that starts an international payment, at the exact commit we tested. Needs JDK 21.
+
+```bash
+git clone https://github.com/openMF/paymenthub-ee-bulk-processor
+cd paymenthub-ee-bulk-processor
+git checkout 06ff677
+eventbreaker scan .                                          # lists 2 listener methods
+eventbreaker scan . --only Consumers.listenTopicGsma         # Gradle compiles the module on the first run
+```
+
+Expected: a **HIGH** finding. Delivered twice, the listener starts the payment workflow
+(`zeebeProcessStarter.startZeebeWorkflow`) twice, because there is no idempotency key. Two **MEDIUM** findings follow: a
+failing workflow start or a malformed message is retried about 10 times, then skipped, because no error handler is
+configured. The second listener, `listenTopicSlcb`, only logs, and should give no findings. Model answers can vary a
+little between runs; the report shows the evidence behind every finding.
 
 ---
 
@@ -256,6 +297,23 @@ The full path is printed at the end of each run.
 
 ![Listener methods found by eventbreaker scan](docs/images/scan-list.png)
 
+### What to expect on your own code
+
+EventBreaker has to compile a test harness against your listener and drive it to the risky line. On a codebase it has
+never seen, that does not always work:
+
+- **The harness may not build**, usually because a class the listener uses is not on the module's classpath. You see
+  `Could not build a test harness: X is not on the listener's classpath`. Build the module first, or pass the missing
+  jars with `--classpath`.
+- **The risky line may not be reached.** For example, a flag set in the constructor from configuration makes the
+  listener return early. The scenario is marked **not reached**.
+- **A listener may block** (it waits on something the fakes never provide). It is stopped after 180 s and marked as an
+  error.
+
+In all three cases the report says what happened and makes **no finding** for that scenario. EventBreaker never
+reports a risk it did not measure. How often this happened on new code is in [Evaluation](#evaluation): on first
+contact with the held-out products, 4 of 22 listeners ran; after general fixes, 20 of 22 did.
+
 ### What it tests
 
 | Scenario | What is measured | Typical bug found |
@@ -284,7 +342,7 @@ The full path is printed at the end of each run.
 |---|---|
 | AI models | NVIDIA **Nemotron-3-Ultra-550B** (planning, review) and **Nemotron-3-Super-120B** (path setup, labels, text) |
 | Inference | **Nebius Token Factory** (OpenAI-compatible API) |
-| Isolated execution | **Nebius sandbox** via ConTree SDK (Alpine + OpenJDK 21) |
+| Isolated execution | **Nebius sandbox** via ConTree SDK (Alpine + OpenJDK 21 or 25, chosen from the listener's bytecode version) |
 | Static analysis | Java 21, JavaParser, Jackson (packaged as one JAR) |
 | Test execution | Mockito 5 (inline mock maker), Maven; classpath from Maven or Gradle |
 | CLI | Python 3.12+, Typer, Rich, Pydantic v2, OpenAI SDK |
@@ -294,38 +352,66 @@ The full path is printed at the end of each run.
 
 ## Evaluation
 
-EventBreaker was run on unchanged listeners from three open-source products: Apache Fineract (core banking),
-Kill Bill (subscription billing) and Eclipse hawkbit (IoT device updates). Before each run, the expected risks were written
-down by hand, including negative controls where a finding would be a false positive. A risk counts only if a run
-measured it.
+EventBreaker was run on **61 unchanged listener methods from 9 open-source products** (banking, billing, payments,
+identity, health data, IoT, logging). Before the first run on each product, the expected risks were written down by
+hand from the source, including **negative controls**: places where a finding would be a false positive. A risk counts
+only if a run measured it. Expected severities were never used to tune prompts or rules.
 
-| | Tuning set | Unseen set |
-|---|---|---|
-| Products · transports | Fineract, Kill Bill · Kafka, Spring events, Kill Bill bus | Kill Bill, hawkbit · Kill Bill bus, RabbitMQ |
-| Listener methods | 9 | 11 |
-| Expected risks found | 10 / 14 (7 at the expected severity, 3 rated higher) | 0 detectable (risky line not reached) |
-| False positives | 0 | 1 |
-| Negative controls held | 3 / 3 | 4 / 4 |
-| Same result when every model answer is re-asked | 7 / 9 listeners | n/a |
+### Real bugs it found
 
-The tuning set is where prompts and rules were developed; the unseen set was never used for tuning. On unseen code
-the *judgement* held: where a run reached the risky line, the verdict matched the expectation in every case but one.
-What did not carry over is *reach*, i.e. driving unfamiliar code to the risky line (see Limitations).
-
-Examples of measured findings (tuning set):
-
-- **Fineract `KafkaRemoteMessageListener` (HIGH):** a failed batch step is logged and swallowed, and the Kafka
+- **Mifos Payment Hub `Consumers.listenTopicGsma` (HIGH):** a redelivered Kafka message starts a second international
+  remittance workflow with a fresh transaction id, so the money moves twice; there is no idempotency key. Measured in the
+  Nebius sandbox on the final run.
+- **Apache Fineract `KafkaRemoteMessageListener` (HIGH):** a failed batch step is logged and swallowed, and the Kafka
   offset is still acknowledged. The work is lost and never redelivered.
-- **Fineract `LoginAttemptEventListener` (HIGH):** two simultaneous failed logins read the same counter and both
-  write it back. One attempt is lost, which weakens the account lockout.
-- **Kill Bill `OverdueListener` (HIGH):** if looking up parent/child accounts fails, the error is swallowed and
-  those accounts' overdue state is never refreshed.
+- **DIGIT `AuditLogsConsumer` (HIGH):** a failure while generating audit records is caught and logged, with no retry or
+  dead-letter topic, so the change is never audited.
+- **Fineract `LoginAttemptEventListener` (HIGH):** two simultaneous failed logins read the same counter and both write
+  it back. One attempt is lost, which weakens the account lockout.
+- **Apache Syncope `ElasticsearchIndexManager` / DHIS2 `FileResourceEventListener` (MEDIUM):** both run after the
+  transaction commits, where Spring only logs an exception. A failed index update leaves search results stale; a failed
+  upload leaves a file record with no content. Nothing retries either.
+
+### Results in three groups
+
+The products were added in three rounds. Each round found gaps in the tool, mostly in *reach* (driving unfamiliar code
+to the risky line). Those gaps were fixed in general ways (payload types, delivery rules per transport, checked
+exceptions), and the round was measured again. So only the **first contact** with each round is a blind result; the
+later columns show what the fixes changed.
+
+| Set | Products · transports | Methods | First contact | After fixes |
+|---|---|---|---|---|
+| Tuning | Fineract, Kill Bill · Kafka, Spring events, Kill Bill bus | 9 | — (the tool was developed here) | **12 / 14** found (8 exact, 4 rated higher) · negative controls 3 / 3 |
+| Development | Kill Bill, hawkbit, DIGIT, Graylog · Kill Bill bus, RabbitMQ, Kafka, Guava | 30 | **0 / 26** found (reach) | **20 / 26** found (5 exact, 15 rated higher) · negative controls 20 / 22 run · 2 false positives |
+| Held-out | Apache Syncope, DHIS2, Mifos Payment Hub, Sunbird-RC · Spring events (incl. `@Async`, after-commit), Kafka, JMS | 22 | **0 / 26** found (4 of 22 harnesses ran) | **14 / 26** found (8 exact, 6 rated higher) · negative controls 13 / 17 run · 6 false positives · 20 of 22 harnesses ran |
+
+<sub>Held-out "after fixes" is the final run in the Nebius sandbox. It found two crashes in the tool (sandbox packaging
+dropped log4j's runtime files; one Maven module's own plugin settings hid its dependencies); both were fixed and the two
+affected listeners re-run. Tuning and development were last measured on the local JVM (Oct 17–19), before the fixes
+that came from the held-out round.</sub>
+
+What the numbers say:
+
+- **Judgement carries over; reach does not, at first.** On first contact, almost every miss was a run that never got to
+  the risky line. Where a run did get there, the verdict usually matched. After general reach fixes, 20 of 26 expected
+  risks are found in the development set and 14 of 26 in the held-out set, where reach is still the main gap.
+- **Severity is often one level high.** The rubric rates a repeated money or external-message side effect HIGH, even
+  where the system is designed for repeats (documented at-least-once webhooks, for example).
+- **Negative controls mostly hold.** The remaining false positives come from two sources: concurrency votes on
+  harmless in-memory code (two cache invalidations "racing"), and recovery the tool cannot see (a failed flush whose
+  buffer is kept for the next one).
 
 ### Limitations
 
-- The run must **reach** the risky line. Code that needs list values, event subtypes, checked exceptions or generic
-  registries can stop early; the report then says "not reached" instead of guessing.
-- Each listener method is analyzed on its own; bugs that span several methods are out of scope.
+- The run must **reach** the risky line. Logic behind runtime-registered handlers, flags set in the constructor from
+  configuration, or event subtypes can stop it early; the report then says "not reached" instead of guessing.
+- Concurrency verdicts are a vote (5 votes) and can flip between runs on harmless in-memory code.
+- Only objects passed **into** the listener are faked. A listener that builds its own objects with `new` runs them for
+  real (Syncope's WA startup listener runs Apereo CAS's configuration check, which never finishes on fakes), and a
+  constructor that reads configuration (a number or an on/off flag) gets no value: the listener fails to start or returns
+  early. The report shows "error" or "not reached" for these, never a guess.
+- Each listener method is analyzed on its own; bugs that span several methods or several different messages (for
+  example a field overwritten by one message and read by the next) are out of scope.
 - Dependencies are faked, so EventBreaker tests the listener's own handling, not the database or broker.
 
 ---

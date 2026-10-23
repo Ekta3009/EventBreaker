@@ -4,7 +4,7 @@ from pathlib import Path
 from eventbreaker.classpath.resolver import find_module, project_root
 from eventbreaker.models.consumer import ConsumerAnalysis
 from eventbreaker.diagnosis.analyzer import KIND_LABELS
-from eventbreaker.models.observation import ObservationEntry, ObservationResult, ReliabilityFinding
+from eventbreaker.models.observation import BUILD_DETAIL_MARKER, ObservationEntry, ObservationResult, ReliabilityFinding
 from eventbreaker.scenarios.experiment import ExperimentPlan
 from eventbreaker.scenarios.models import ChaosScenario, describe_test  # noqa: F401 (used by the CLI)
 
@@ -105,7 +105,10 @@ def generate(
             )
         sections.append(f"**Why:** {scenario.reason}\n")
         if result.executionError:
-            sections.append(f"\n**Error:** {result.executionError}\n")
+            summary, _, detail = result.executionError.partition(BUILD_DETAIL_MARKER)
+            sections.append(f"\n**Error:** {summary}\n")
+            if detail:
+                sections.append(f"\n<details><summary>Compiler errors</summary>\n\n```text\n{detail}\n```\n</details>\n")
             continue
         sections.append(
             "\n**Consumer outcome:** "

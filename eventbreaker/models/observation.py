@@ -1,5 +1,8 @@
 from pydantic import BaseModel
 
+# Separates a build error's one-line summary (shown in the terminal) from the compiler output (kept in the report).
+BUILD_DETAIL_MARKER = "\n\nCompiler errors:\n"
+
 
 class ObservationEntry(BaseModel):
     target: str       # e.g., "paymentClient.charge"

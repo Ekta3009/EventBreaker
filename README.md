@@ -87,8 +87,6 @@ flowchart LR
 
 <sub>Green = NVIDIA Nemotron via Nebius Token Factory · Blue = deterministic code · Red = Nebius sandbox (or local JVM)</sub>
 
-<sub>Green = NVIDIA Nemotron via Nebius Token Factory · Blue = deterministic code · Red = Nebius sandbox (or local JVM)</sub>
-
 **How one scenario is measured:**
 
 ```mermaid

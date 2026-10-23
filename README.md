@@ -214,7 +214,7 @@ finishes), the report says so and makes no finding. EventBreaker never reports a
 
 ## Results
 
-Tested on **61 listener methods from 9 open-source projects**. EventBreaker found **46 reliability risks that we had
+Tested on **61 listener methods from 9 open-source projects**. EventBreaker found **45 reliability risks that we had
 confirmed by reading the source code before the runs**, including these real bugs:
 
 - **Mifos Payment Hub (HIGH):** a redelivered Kafka message starts the same international payment twice.

@@ -837,7 +837,7 @@ def _as_jar(entry: Path) -> Path:
 
 
 # Bump when _sandbox_jar's selection logic changes, so cached jars are rebuilt.
-_SANDBOX_JAR_VERSION = 3
+_SANDBOX_JAR_VERSION = 4
 
 
 def _sandbox_jar(fat_jar: Path, classpath: list[Path], roots: tuple[str, ...] = ()) -> Path:
@@ -911,8 +911,11 @@ def _sandbox_jar(fat_jar: Path, classpath: list[Path], roots: tuple[str, ...] = 
                 names = src.namelist()
                 classes = _class_entries(names)
                 used = any(n in wanted for n in classes)
+                # Whole packages: libraries pick sibling classes by computed name (Caffeine's cache
+                # implementations, "…caffeine.cache.SSMSAR"), which no bytecode reference shows.
+                packages = {n.rpartition("/")[0] for n in classes if n in wanted}
                 for name, entry in classes.items():
-                    if name in wanted and name not in written:
+                    if (name in wanted or name.rpartition("/")[0] in packages) and name not in written:
                         dst.writestr(name, src.read(entry))
                         written.add(name)
                 for name in names:

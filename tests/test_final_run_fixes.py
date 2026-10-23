@@ -65,7 +65,8 @@ def test_sandbox_jar_keeps_service_providers_resources_and_same_package_classes(
         names = set(z.namelist())
         services = z.read("META-INF/services/api.Provider").decode()
     assert {"api/Helper.class", "impl/Impl.class", "impl/Names.class", "impl/config.dat"} <= names
-    assert {"impl/Unused.class", "other/Lonely.class", "other/big.dat"}.isdisjoint(names)
+    assert "impl/Unused.class" in names                     # whole package of a used class (loaded by name)
+    assert {"other/Lonely.class", "other/big.dat"}.isdisjoint(names)   # unused jar stays out
     assert "impl.Impl" in services and "api.Unrelated" in services       # merged, not overwritten
 
 

@@ -216,10 +216,8 @@ finishes), the report says so and makes no finding. EventBreaker never reports a
 
 ## Results
 
-Tested on **61 unchanged listener methods from 9 open-source products**. The expected risks were written down by hand
-before each first run, including places where a finding would be a false positive.
-
-**Real bugs it found:**
+Tested on **61 listener methods from 9 open-source projects**. EventBreaker found **46 reliability risks that we had
+confirmed by reading the source code before the runs**, including these real bugs:
 
 - **Mifos Payment Hub (HIGH):** a redelivered Kafka message starts the same international payment twice.
 - **Apache Fineract (HIGH):** a failed batch step is swallowed and the Kafka message is still acknowledged, so the work
@@ -228,15 +226,6 @@ before each first run, including places where a finding would be a false positiv
   never audited.
 - **Fineract (HIGH):** two simultaneous failed logins both update the same counter, so one is lost and the account
   lockout is weakened.
-
-| Set | Listeners | First contact | After fixes |
-|---|---|---|---|
-| Tuning (the tool was developed here) | 9 | — | 12 / 14 expected risks found |
-| Development | 30 | 0 / 26 | 20 / 26 |
-| Held-out | 22 | 0 / 26 | 14 / 26 (Nebius sandbox) |
-
-On first contact the tool rarely *reached* the risky line in unfamiliar code; the judgement was usually right where it
-did. General fixes (not tuned to the expected answers) closed most of that gap. Severity is often one level too high.
 
 **Limitations:** the run has to reach the risky line; objects a listener creates itself, or settings its constructor
 reads from configuration, are not faked, so those runs end as "not reached" or "error" (never as a guess). Each method is

@@ -195,96 +195,104 @@ and Nemotron Ultra reviews it.
 
 ## Getting started
 
-### Prerequisites
+### 1. Prerequisites
 
-| Tool | Version | Used for |
+| You need | Version | Why |
 |---|---|---|
-| Python | 3.12+ | the CLI |
-| Java (JDK) | 21+ | building and running the test harness |
-| Maven | 3.8+ | analyzer build, harness build, Maven classpaths |
-| Nebius account | Token Factory API key | Nemotron models (and optionally the sandbox) |
+| Python | 3.12+ | runs EventBreaker |
+| Java (JDK) | 21+ | compiles and runs the generated tests |
+| Maven | 3.8+ | builds the generated tests (Gradle projects can be tested too; they use their own wrapper) |
+| Nebius Token Factory API key | — | calls the NVIDIA Nemotron models ([get one](https://tokenfactory.nebius.com/)) |
 
-### Install
-
-From the release (the wheel already contains the static analyzer JAR):
+### 2. Install
 
 ```bash
 pipx install https://github.com/Ekta3009/EventBreaker/releases/download/v0.1.1/eventbreaker-0.1.1-py3-none-any.whl
-# or, in a virtual environment: pip install <the same URL>
 eventbreaker --version
 ```
 
-From source:
+No `pipx`? Run `pip install <the same URL>` inside a Python virtual environment.
+
+<details>
+<summary>Install from source (for contributors)</summary>
 
 ```bash
 git clone https://github.com/Ekta3009/EventBreaker
 cd EventBreaker
-mvn package -q                     # builds the static analyzer JAR, packaged with the CLI
-pipx install .                     # or: python -m venv .venv && .venv/bin/pip install -e ".[dev]"
+mvn package -q                          # builds the Java static analyzer that ships inside the package
+python -m venv .venv && .venv/bin/pip install -e ".[dev]"
+.venv/bin/pytest                         # run the test suite
 ```
+</details>
 
-### Configure
+### 3. Add your API key
 
 ```bash
-cat > .env <<'EOF'
-NEBIUS_API_KEY=your_key_here
-# NEBIUS_PROJECT_ID=your_project_id   # optional: run listener code in a Nebius sandbox
-EOF
+export NEBIUS_API_KEY=your_key_here
+export NEBIUS_PROJECT_ID=your_project_id    # optional: run listener code in a Nebius sandbox
 ```
 
-| Variable | Required | Effect |
-|---|---|---|
-| `NEBIUS_API_KEY` | yes | Nemotron Ultra + Super via Nebius Token Factory |
-| `NEBIUS_PROJECT_ID` | no | if set, listener code runs in a Nebius sandbox; if unset, on the local JVM |
+Without `NEBIUS_PROJECT_ID`, listener code runs on your local Java. The same two lines can also go in a `.env` file
+in the project you test (or any folder above it).
 
-A `.env` in (or above) the directory you run from is loaded automatically; exported variables work too.
-
-### Try it in 5 minutes
+### 4. Try it (5 minutes)
 
 Run it on a real Kafka listener in [Mifos Payment Hub](https://github.com/openMF/paymenthub-ee-bulk-processor)
-(Apache-2.0) that starts an international payment, at the exact commit we tested. Needs JDK 21.
+(Apache-2.0), at the exact commit we tested. The listener starts an international payment.
 
 ```bash
 git clone https://github.com/openMF/paymenthub-ee-bulk-processor
 cd paymenthub-ee-bulk-processor
 git checkout 06ff677
-eventbreaker scan .                                          # lists 2 listener methods
-eventbreaker scan . --only Consumers.listenTopicGsma         # Gradle compiles the module on the first run
+
+eventbreaker scan .                                    # lists the 2 listener methods
+eventbreaker scan . --only Consumers.listenTopicGsma   # tests one (the first run also compiles the project)
 ```
 
-Expected: a **HIGH** finding. Delivered twice, the listener starts the payment workflow
-(`zeebeProcessStarter.startZeebeWorkflow`) twice, because there is no idempotency key. Two **MEDIUM** findings follow: a
-failing workflow start or a malformed message is retried about 10 times, then skipped, because no error handler is
-configured. The second listener, `listenTopicSlcb`, only logs, and should give no findings. Model answers can vary a
-little between runs; the report shows the evidence behind every finding.
+**What you should see:** a **HIGH** finding. Delivered twice, the listener starts the payment workflow
+(`zeebeProcessStarter.startZeebeWorkflow`) twice, because there is no idempotency key. Two **MEDIUM** findings follow:
+a failing workflow start or a malformed message is retried about 10 times and then skipped, because no error handler is
+configured. The report is saved in `eventbreaker-reports/Consumers.listenTopicGsma/latest.md`. Model answers can vary a
+little between runs; every finding shows the evidence behind it.
 
 ---
 
 ## Usage
 
-Build the module that contains the listener once (`mvn compile`; multi-module Maven projects may need
-`mvn install -DskipTests` at the root; Gradle compiles it for you). EventBreaker then asks that module's own build
-for the classpath and caches it until a build file changes.
+### On your own project
+
+**Build the project once**, so the listener's compiled classes exist. EventBreaker then asks the project's own build for
+its dependencies (and remembers them until a build file changes).
+
+| Build tool | Run once |
+|---|---|
+| Maven, single module | `mvn compile` |
+| Maven, multi-module | `mvn install -DskipTests` at the root |
+| Gradle | nothing; EventBreaker compiles it |
+
+Then, from the project folder:
 
 ```bash
-cd ~/src/your-service
-
-eventbreaker scan .                                       # list every listener method in the repo
-eventbreaker scan . --only OrderListener.onOrderPlaced    # analyze one listener method
+eventbreaker scan .                                       # list every listener method
+eventbreaker scan . --only OrderListener.onOrderPlaced    # test one listener method
 eventbreaker scan . --only 1,3                            # ... or pick by number from the list
-eventbreaker scan . --all                                 # ... or all of them
-eventbreaker analyze path/to/OrderListener.java --method onOrderPlaced
+eventbreaker scan . --all                                 # ... or test all of them
 ```
+
+![Listener methods found by eventbreaker scan](docs/images/scan-list.png)
 
 | Option | Meaning |
 |---|---|
-| `--only` | listener methods to analyze, by number or `Class.method` |
-| `--all` | analyze every listener found |
-| `--method` | (`analyze`) which method of the class, if it has several listeners |
+| `--only` | listener methods to test, by number or `Class.method` |
+| `--all` | test every listener found |
 | `--classpath a.jar:b.jar` / `@cp.txt` | use this classpath instead of detecting it |
 | `--fresh` | ignore cached model answers and ask again |
 
-Reports are written to the tested project, wherever you run the command from:
+To test a single file instead: `eventbreaker analyze path/to/OrderListener.java --method onOrderPlaced`.
+
+### Reports
+
+Each run saves a Markdown report in the tested project, and prints its path at the end:
 
 ```
 <your project>/eventbreaker-reports/
@@ -292,10 +300,6 @@ Reports are written to the tested project, wherever you run the command from:
     ├── latest.md                  ← always the newest run
     └── 2026-10-17_14-06-23.md     ← earlier runs, kept
 ```
-
-The full path is printed at the end of each run.
-
-![Listener methods found by eventbreaker scan](docs/images/scan-list.png)
 
 ### What to expect on your own code
 

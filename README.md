@@ -12,6 +12,8 @@ AI-planned, measurement-backed reliability testing for Java event listeners.
 ![Nebius](https://img.shields.io/badge/Nebius-Token%20Factory%20%2B%20Sandbox-0B5FFF)
 ![License: MIT](https://img.shields.io/badge/license-MIT-yellow)
 
+**[▶ Watch the 3-minute demo](https://www.youtube.com/watch?v=SOW_-_tl2mY)**
+
 [How it works](#how-it-works) · [Example](#example) · [Getting started](#getting-started) · [Usage](#usage) ·
 [Results](#results)
 

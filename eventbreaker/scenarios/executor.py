@@ -837,7 +837,7 @@ def _as_jar(entry: Path) -> Path:
 
 
 # Bump when _sandbox_jar's selection logic changes, so cached jars are rebuilt.
-_SANDBOX_JAR_VERSION = 4
+_SANDBOX_JAR_VERSION = 7
 
 
 def _sandbox_jar(fat_jar: Path, classpath: list[Path], roots: tuple[str, ...] = ()) -> Path:
@@ -900,6 +900,7 @@ def _sandbox_jar(fat_jar: Path, classpath: list[Path], roots: tuple[str, ...] = 
     shutil.rmtree(roots_dir, ignore_errors=True)
 
     wanted = {c.replace(".", "/") + ".class" for c in needed}
+    wanted |= _package_siblings(jars, classpath, needed, bundled, on_classpath)
     with zipfile.ZipFile(fat_jar) as fat, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as dst:
         written = set(fat.namelist())
         merged = {n: fat.read(n) for n in written if n.startswith("META-INF/services/") and not n.endswith("/")}
@@ -911,11 +912,8 @@ def _sandbox_jar(fat_jar: Path, classpath: list[Path], roots: tuple[str, ...] = 
                 names = src.namelist()
                 classes = _class_entries(names)
                 used = any(n in wanted for n in classes)
-                # Whole packages: libraries pick sibling classes by computed name (Caffeine's cache
-                # implementations, "…caffeine.cache.SSMSAR"), which no bytecode reference shows.
-                packages = {n.rpartition("/")[0] for n in classes if n in wanted}
                 for name, entry in classes.items():
-                    if (name in wanted or name.rpartition("/")[0] in packages) and name not in written:
+                    if name in wanted and name not in written:
                         dst.writestr(name, src.read(entry))
                         written.add(name)
                 for name in names:
@@ -982,6 +980,66 @@ def _copy_classes(classpath: list[Path], classes: set[str], target: Path) -> Non
                     if not out.exists():
                         out.parent.mkdir(parents=True, exist_ok=True)
                         out.write_bytes(z.read(entry))
+
+
+# Constant-pool names of the calls that load a class from a computed name.
+_LOADS_BY_NAME = re.compile(rb"forName|findClass|loadClass")
+
+
+def _package_siblings(
+    jars: list[Path], classpath: list[Path], needed: set[str], bundled: set[str], on_classpath: set[str],
+) -> set[str]:
+    """Class files of the other classes in every package the walk reached (same jar) where a
+    used class loads classes by name.
+
+    Libraries pick siblings by computed name (Caffeine's cache implementations,
+    "…caffeine.cache.SSMSAR"), which no bytecode reference shows. A sibling is kept only
+    when every class it references is in the jar too: a half-included class (Spring Boot's
+    logback support without logback) breaks class loading and Mockito's fakes. Packages the
+    harness bundles itself (Mockito, ByteBuddy) are never extended.
+    """
+    present = needed | bundled
+    bundled_packages = {c.rpartition(".")[0] for c in bundled}
+    tmp = Path(tempfile.mkdtemp(prefix="eb-siblings-"))
+    candidates: set[str] = set()
+    try:
+        for jar in jars:
+            with zipfile.ZipFile(jar) as z:
+                entries = {n[:-6].replace("/", "."): e for n, e in _class_entries(z.namelist()).items()}
+                # Only packages where a used class loads classes by name: the rest add size, not reach.
+                packages = {
+                    c.rpartition(".")[0] for c, entry in entries.items()
+                    if c in needed and _LOADS_BY_NAME.search(z.read(entry))
+                } - bundled_packages
+                for c, entry in entries.items():
+                    if c.rpartition(".")[0] in packages and c not in present and c not in candidates:
+                        candidates.add(c)
+                        out = tmp / (c.replace(".", "/") + ".class")
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        out.write_bytes(z.read(entry))
+        if not candidates:
+            return set()
+        scan = subprocess.run(   # direct references only (no -R): no cascade into further packages
+            ["jdeps", "-verbose:class", "-filter:none", "--multi-release", "21", "--ignore-missing-deps",
+             "-cp", os.pathsep.join(map(str, classpath)), str(tmp)],
+            capture_output=True, text=True,
+        )
+        refs: dict[str, set[str]] = {}
+        for line in scan.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[1] == "->" and line.startswith("   "):
+                refs.setdefault(_unversioned(parts[0]), set()).add(_unversioned(parts[2]))
+        keep = set(candidates)
+        changed = True
+        while changed:   # drop siblings that reference a classpath class the jar does not have
+            changed = False
+            for c in list(keep):
+                if any(d in on_classpath and d not in present and d not in keep for d in refs.get(c, ())):
+                    keep.discard(c)
+                    changed = True
+        return {c.replace(".", "/") + ".class" for c in keep}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _jar_class_names(jar: Path) -> set[str]:

@@ -47,15 +47,18 @@ def test_sandbox_jar_keeps_service_providers_resources_and_same_package_classes(
         "api/Helper.java": "package api; class Helper { static String first(Iterable<Provider> p) {"
                            " for (Provider x : p) return x.name(); return \"none\"; } }",
     }, {"META-INF/services/api.Provider": "api.Unrelated\n"}, tmp_path)
+    other = _jar(tmp_path / "other.jar", {"other/Lonely.java": "package other; public class Lonely {}"},
+                 {"other/big.dat": "y"}, tmp_path)
     impl = _jar(tmp_path / "impl.jar", {
         "impl/Impl.java": "package impl; public class Impl implements api.Provider { public String name() {"
                           " return Names.NAME; } }",
-        "impl/Names.java": "package impl; class Names { static final String NAME = new String(\"impl\"); }",
+        "impl/Names.java": "package impl; class Names { static final String NAME = new String(\"impl\");"
+                           " static Object pick(String s) throws Exception {"
+                           " return Class.forName(\"impl.\" + s); } }",   # sibling chosen by computed name
         "impl/Unused.java": "package impl; public class Unused {}",
+        "impl/HalfIncluded.java": "package impl; public class HalfIncluded { other.Lonely l = new other.Lonely(); }",
     }, {"META-INF/services/api.Provider": "impl.Impl # the provider\n", "impl/config.dat": "x"},
-        tmp_path, [api])
-    other = _jar(tmp_path / "other.jar", {"other/Lonely.java": "package other; public class Lonely {}"},
-                 {"other/big.dat": "y"}, tmp_path)
+        tmp_path, [api, other])
     fat = _jar(tmp_path / "eventbreaker-execution.jar", {
         "app/Main.java": "package app; public class Main { public static void main(String[] a) {"
                          " System.out.println(api.Manager.name()); } }",
@@ -65,7 +68,8 @@ def test_sandbox_jar_keeps_service_providers_resources_and_same_package_classes(
         names = set(z.namelist())
         services = z.read("META-INF/services/api.Provider").decode()
     assert {"api/Helper.class", "impl/Impl.class", "impl/Names.class", "impl/config.dat"} <= names
-    assert "impl/Unused.class" in names                     # whole package of a used class (loaded by name)
+    assert "impl/Unused.class" in names                     # package of a used class that loads by name
+    assert "impl/HalfIncluded.class" not in names           # ...but not a sibling whose references are missing
     assert {"other/Lonely.class", "other/big.dat"}.isdisjoint(names)   # unused jar stays out
     assert "impl.Impl" in services and "api.Unrelated" in services       # merged, not overwritten
 

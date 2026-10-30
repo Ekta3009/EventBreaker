@@ -179,7 +179,7 @@ public void onMessage(@Payload ContextualMessage contextualMessage, Acknowledgme
 **You need:** Python 3.12+, Java 21+, Maven, and a [Nebius Token Factory](https://tokenfactory.nebius.com/) API key.
 
 ```bash
-pipx install https://github.com/Ekta3009/EventBreaker/releases/download/v0.1.1/eventbreaker-0.1.1-py3-none-any.whl
+pipx install https://github.com/Ekta3009/EventBreaker/releases/download/v0.1.2/eventbreaker-0.1.2-py3-none-any.whl
 export NEBIUS_API_KEY=your_key
 export NEBIUS_PROJECT_ID=your_project_id   # optional: run the tests in a Nebius sandbox instead of local Java
 ```
@@ -235,8 +235,20 @@ tested on its own, against fakes, not a real database or broker.
 
 ## Built with
 
-NVIDIA **Nemotron-3-Ultra-550B** and **Nemotron-3-Super-120B** via **Nebius Token Factory** · **Nebius sandbox**
+NVIDIA **Nemotron-3-Ultra-550B** and **Nemotron-3.5-Super** via **Nebius Token Factory** · **Nebius sandbox**
 (ConTree SDK) · Java 21, JavaParser, Mockito 5, Maven / Gradle · Python 3.12, Typer, Rich, Pydantic
+
+**Last-minute model change (October 30, 2026):** at about 19:26 IST (06:56 PDT) on October 30, three hours before the
+submission deadline, we received Nebius's notice that `nvidia/nemotron-3-super-120b-a12b` will be removed from Token
+Factory Serverless on November 9, 2026, before the judging period. To keep EventBreaker runnable for judges, it now uses
+Nebius's recommended replacement, `nvidia/Nemotron-3.5-Super-VL`, for the same steps (path setup, call labels, finding
+text). The new model reasons longer, so the reply limit for these calls went from 8,192 to 32,768 tokens.
+Nemotron-3-Ultra-550B is unchanged.
+
+There was no time for a full regression run. The results above were measured with Super 120B; with the new model we
+re-ran only 4 listeners from 4 projects as a check that everything still works. Three gave the same findings and
+severities; the fourth reached more code (Sunbird-RC: 8 of 8 scenarios instead of 4, finding 5 more bugs we confirmed
+in the source). Other listeners may give somewhat different results with the new model.
 
 ## License
 

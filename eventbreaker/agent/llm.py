@@ -19,7 +19,7 @@ from eventbreaker.agent import usage
 
 BASE_URL = "https://api.tokenfactory.nebius.com/v1/"
 ULTRA = "nvidia/Nemotron-3-Ultra-550b-a55b"
-SUPER = "nvidia/nemotron-3-super-120b-a12b"
+SUPER = "nvidia/Nemotron-3.5-Super-VL"
 _CACHE_DIR = Path.home() / ".eventbreaker" / "cache" / "llm"
 
 
@@ -43,7 +43,7 @@ def chat(
     if not api_key:
         raise EnvironmentError("NEBIUS_API_KEY environment variable is not set.")
     response = OpenAI(base_url=BASE_URL, api_key=api_key).chat.completions.create(
-        model=model, messages=messages, temperature=temperature, seed=seed, max_tokens=8192,
+        model=model, messages=messages, temperature=temperature, seed=seed, max_tokens=32768,
     )
     usage.record(model, getattr(response, "usage", None), purpose)
     message = response.choices[0].message

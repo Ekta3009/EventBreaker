@@ -20,7 +20,7 @@ from eventbreaker.models.observation import ObservationResult
 from eventbreaker.scenarios.executor import constructor_params, static_helpers, value_params
 from eventbreaker.scenarios.models import ChaosScenario, ReturnValue
 
-_MODEL = "nvidia/nemotron-3-super-120b-a12b"
+_MODEL = "nvidia/Nemotron-3.5-Super-VL"
 _BASE_URL = "https://api.tokenfactory.nebius.com/v1/"
 _CACHE_DIR = Path.home() / ".eventbreaker" / "cache" / "path_setup"
 
@@ -154,7 +154,7 @@ def plan_path(
                 messages=[{"role": "system", "content": _SYSTEM_PROMPT},
                           {"role": "user", "content": user}],
                 temperature=0.2,
-                max_tokens=8192,
+                max_tokens=32768,
             )
         except Exception:
             return []

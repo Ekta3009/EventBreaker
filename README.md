@@ -15,9 +15,39 @@ AI-planned, measurement-backed reliability testing for Java event listeners.
 **[▶ Watch the 3-minute demo](https://www.youtube.com/watch?v=SOW_-_tl2mY)**
 
 [How it works](#how-it-works) · [Example](#example) · [Getting started](#getting-started) · [Usage](#usage) ·
-[Results](#results)
+[Results](#results) · [Model change](#last-minute-model-change-october-30-2026)
 
 </div>
+
+---
+
+## Last-minute model change (October 30, 2026)
+
+> [!IMPORTANT]
+> **The Nemotron Super model was replaced three hours before the submission deadline, without a full regression run.**
+
+At about **19:26 IST (06:56 PDT) on October 30, 2026**, three hours before the submission deadline, we received Nebius's
+notice that `nvidia/nemotron-3-super-120b-a12b` will be removed from Token Factory Serverless on **November 9, 2026**,
+before the judging period. To keep EventBreaker runnable for judges, version 0.1.2 changes:
+
+- **Nemotron Super steps** (path setup, call labels, finding text) now use Nebius's recommended replacement,
+  `nvidia/Nemotron-3.5-Super-VL`.
+- **Reply limit** for these calls: 8,192 → 32,768 tokens. The new model reasons longer, and at 8,192 its path-setup
+  answers were cut off.
+- **Unchanged:** Nemotron-3-Ultra-550B and all deterministic code.
+
+**What was and wasn't re-tested:** there was no time for a full regression run. The [Results](#results) below and the
+demo video were measured with Super 120B. With the new model we re-ran only **4 listeners from 4 projects** as a check
+that everything still works:
+
+| Listener | Old model | New model |
+|---|---|---|
+| Apache Syncope `ElasticsearchIndexManager.entity` | 4/4 reproduced, 2 findings | same findings and severities |
+| DHIS2 `AuthenticationListener.handleAuthenticationSuccess` | 6/6 reproduced, 3 findings | same findings and severities |
+| Mifos Payment Hub `KafkaImporter.listen` | 6/6 reproduced, 5 findings | same findings and severities |
+| Sunbird-RC `CreateEntityConsumer.createEntityConsumer` | 4/8 reproduced, 3 findings | 8/8 reproduced, 8 findings (the 3 earlier ones plus 5 more we confirmed in the source) |
+
+Other listeners may give somewhat different results with the new model.
 
 ---
 
@@ -216,6 +246,8 @@ finishes), the report says so and makes no finding. EventBreaker never reports a
 
 ## Results
 
+_Measured with Nemotron-3-Super-120B before the [last-minute model change](#last-minute-model-change-october-30-2026)._
+
 Tested on **61 listener methods from 9 open-source projects**. EventBreaker found **45 reliability risks that we had
 confirmed by reading the source code before the runs**, including these real bugs:
 
@@ -237,18 +269,6 @@ tested on its own, against fakes, not a real database or broker.
 
 NVIDIA **Nemotron-3-Ultra-550B** and **Nemotron-3.5-Super** via **Nebius Token Factory** · **Nebius sandbox**
 (ConTree SDK) · Java 21, JavaParser, Mockito 5, Maven / Gradle · Python 3.12, Typer, Rich, Pydantic
-
-**Last-minute model change (October 30, 2026):** at about 19:26 IST (06:56 PDT) on October 30, three hours before the
-submission deadline, we received Nebius's notice that `nvidia/nemotron-3-super-120b-a12b` will be removed from Token
-Factory Serverless on November 9, 2026, before the judging period. To keep EventBreaker runnable for judges, it now uses
-Nebius's recommended replacement, `nvidia/Nemotron-3.5-Super-VL`, for the same steps (path setup, call labels, finding
-text). The new model reasons longer, so the reply limit for these calls went from 8,192 to 32,768 tokens.
-Nemotron-3-Ultra-550B is unchanged.
-
-There was no time for a full regression run. The results above were measured with Super 120B; with the new model we
-re-ran only 4 listeners from 4 projects as a check that everything still works. Three gave the same findings and
-severities; the fourth reached more code (Sunbird-RC: 8 of 8 scenarios instead of 4, finding 5 more bugs we confirmed
-in the source). Other listeners may give somewhat different results with the new model.
 
 ## License
 
